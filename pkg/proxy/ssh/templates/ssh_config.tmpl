@@ -1,0 +1,16 @@
+Host {{ .ProxyHostAlias }}
+	HostName {{ .ProxyHost }}
+	Port {{ .ProxyPort }}
+	User {{ .ProxyHostAlias }}
+	UserKnownHostsFile ~/.ssh/known_hosts
+	StrictHostKeyChecking yes
+
+Host * !{{ .ProxyHostAlias }}
+	ProxyCommand ssh {{ .ProxyHostAlias }} proxy-ssh %r %n %p
+
+Host *
+	User {{ .DefaultUserMarker }}
+	IdentityFile ~/.ssh/id_ed25519
+	IdentitiesOnly yes
+	UserKnownHostsFile ~/.ssh/known_hosts
+	StrictHostKeyChecking yes
