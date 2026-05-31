@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
-	"strings"
 
+	"github.com/hrntknr/secretbridge/pkg/pathutil"
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -36,7 +35,7 @@ func appendPublicKeys(auth []cryptossh.AuthMethod, signers []cryptossh.Signer) [
 func identityFileSigners(identityFiles []string) []cryptossh.Signer {
 	var signers []cryptossh.Signer
 	for _, path := range identityFiles {
-		key, err := os.ReadFile(identityPath(path))
+		key, err := os.ReadFile(pathutil.ExpandHome(path))
 		if err != nil {
 			continue
 		}
@@ -64,7 +63,7 @@ func sshAgentSigners() []cryptossh.Signer {
 func certificateSigners(signers []cryptossh.Signer, certificateFiles []string) []cryptossh.Signer {
 	var certSigners []cryptossh.Signer
 	for _, path := range certificateFiles {
-		certBytes, err := os.ReadFile(identityPath(path))
+		certBytes, err := os.ReadFile(pathutil.ExpandHome(path))
 		if err != nil {
 			continue
 		}
@@ -87,18 +86,4 @@ func certificateSigners(signers []cryptossh.Signer, certificateFiles []string) [
 		}
 	}
 	return certSigners
-}
-
-func identityPath(path string) string {
-	if path == "~" {
-		if home, err := os.UserHomeDir(); err == nil {
-			return home
-		}
-	}
-	if suffix, ok := strings.CutPrefix(path, "~/"); ok {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, suffix)
-		}
-	}
-	return path
 }

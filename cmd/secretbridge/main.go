@@ -3,14 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/hrntknr/secretbridge/pkg/pathutil"
 	"github.com/hrntknr/secretbridge/pkg/proxy"
 	proxyk8s "github.com/hrntknr/secretbridge/pkg/proxy/k8s"
 	proxyssh "github.com/hrntknr/secretbridge/pkg/proxy/ssh"
@@ -19,8 +21,10 @@ import (
 )
 
 const (
-	defaultSSHPort = 2222
-	defaultK8sPort = 6443
+	defaultConfigDir     = "secretbridge"
+	defaultConfigFile    = "config.yaml"
+	defaultSSHListenAddr = ":0"
+	defaultK8sListenAddr = ":0"
 )
 
 func main() {
@@ -48,11 +52,11 @@ func newRootCommand() *cobra.Command {
 			return run(cmd.Context(), configPath, host, logLevel, sshListen, k8sListen, args[0])
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "config.yaml", "config yaml path")
+	cmd.Flags().StringVar(&configPath, "config", defaultConfigPath(), "config yaml path")
 	cmd.Flags().StringVar(&host, "host", string(proxy.DefaultProxyHost), "host written into generated config")
-	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug, info, warn, error")
-	cmd.Flags().StringVar(&sshListen, "ssh-listen", fmt.Sprintf(":%d", defaultSSHPort), "ssh listen address")
-	cmd.Flags().StringVar(&k8sListen, "k8s-listen", fmt.Sprintf(":%d", defaultK8sPort), "k8s listen address")
+	cmd.Flags().StringVar(&logLevel, "log-level", "silent", "log level: silent, debug, info, warn, error")
+	cmd.Flags().StringVar(&sshListen, "ssh-listen", defaultSSHListenAddr, "ssh listen address")
+	cmd.Flags().StringVar(&k8sListen, "k8s-listen", defaultK8sListenAddr, "k8s listen address")
 
 	return cmd
 }
@@ -71,13 +75,27 @@ func run(ctx context.Context, configPath, host, logLevel, sshListen, k8sListen, 
 		SSH: proxyssh.New(config.SSH),
 		K8s: proxyk8s.New(config.K8s),
 	}
-	sshPort, err := listenPort(sshListen)
+
+	sshListener, err := net.Listen("tcp", sshListen)
 	if err != nil {
-		return fmt.Errorf("parse ssh listen address: %w", err)
+		return fmt.Errorf("listen ssh: %w", err)
 	}
-	k8sPort, err := listenPort(k8sListen)
+	k8sListener, err := net.Listen("tcp", k8sListen)
 	if err != nil {
-		return fmt.Errorf("parse k8s listen address: %w", err)
+		_ = sshListener.Close()
+		return fmt.Errorf("listen k8s: %w", err)
+	}
+	sshPort, err := listenerPort(sshListener)
+	if err != nil {
+		_ = sshListener.Close()
+		_ = k8sListener.Close()
+		return fmt.Errorf("resolve ssh listen port: %w", err)
+	}
+	k8sPort, err := listenerPort(k8sListener)
+	if err != nil {
+		_ = sshListener.Close()
+		_ = k8sListener.Close()
+		return fmt.Errorf("resolve k8s listen port: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -87,8 +105,8 @@ func run(ctx context.Context, configPath, host, logLevel, sshListen, k8sListen, 
 	go func() {
 		errc <- bundle.SyncConfig(ctx, proxy.ProxyHost(host), proxy.Ports{SSH: sshPort, K8s: k8sPort}, dir)
 	}()
-	go serve(ctx, errc, sshListen, bundle.SSH.Serve)
-	go serve(ctx, errc, k8sListen, bundle.K8s.Serve)
+	go serve(ctx, errc, sshListener, bundle.SSH.Serve)
+	go serve(ctx, errc, k8sListener, bundle.K8s.Serve)
 
 	select {
 	case <-ctx.Done():
@@ -102,9 +120,12 @@ func run(ctx context.Context, configPath, host, logLevel, sshListen, k8sListen, 
 func configureLogger(levelText string) error {
 	var level slog.Level
 	switch strings.ToLower(strings.TrimSpace(levelText)) {
+	case "", "silent":
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.Level(1000)})))
+		return nil
 	case "debug":
 		level = slog.LevelDebug
-	case "", "info":
+	case "info":
 		level = slog.LevelInfo
 	case "warn", "warning":
 		level = slog.LevelWarn
@@ -117,19 +138,23 @@ func configureLogger(levelText string) error {
 	return nil
 }
 
-func listenPort(addr string) (int, error) {
-	_, portText, err := net.SplitHostPort(addr)
-	if err != nil {
-		return 0, err
+func defaultConfigPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil || dir == "" {
+		return defaultConfigFile
 	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		return 0, err
+	return filepath.Join(dir, defaultConfigDir, defaultConfigFile)
+}
+
+func listenerPort(listener net.Listener) (int, error) {
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, fmt.Errorf("listener address is %T, want *net.TCPAddr", listener.Addr())
 	}
-	if port <= 0 {
+	if addr.Port <= 0 {
 		return 0, fmt.Errorf("port must be greater than 0")
 	}
-	return port, nil
+	return addr.Port, nil
 }
 
 func readConfig(path string) (proxy.Config, error) {
@@ -137,6 +162,7 @@ func readConfig(path string) (proxy.Config, error) {
 		SSH []string `yaml:"ssh"`
 		K8s []string `yaml:"k8s"`
 	}
+	path = pathutil.ExpandHome(path)
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return proxy.Config{}, fmt.Errorf("read config: %w", err)
@@ -190,13 +216,8 @@ func parseAllow(s string, want int) ([]string, error) {
 	return fields, nil
 }
 
-func serve(ctx context.Context, errc chan<- error, addr string, serve func(net.Listener) error) {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		errc <- err
-		return
-	}
-	slog.Info("listening", "addr", addr)
+func serve(ctx context.Context, errc chan<- error, listener net.Listener, serve func(net.Listener) error) {
+	slog.Info("listening", "addr", listener.Addr().String())
 	go func() {
 		<-ctx.Done()
 		_ = listener.Close()
