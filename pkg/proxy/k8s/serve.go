@@ -67,7 +67,8 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request path", http.StatusBadRequest)
 		return
 	}
-	if len(p.Targets) > 0 && !p.Targets.Allows(requestVerb(r.Method, upstreamPath), context) {
+	verb, namespace := classifyRequest(r.Method, upstreamPath)
+	if !p.Targets.Allows(verb, context, namespace) {
 		slog.Warn("rejected k8s request by policy", "context", context, "method", r.Method, "path", upstreamPath)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -125,34 +126,30 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-func requestVerb(method, path string) Verb {
+func classifyRequest(method, path string) (Verb, string) {
 	info, err := requestInfoFactory.NewRequestInfo(&http.Request{
 		Method: method,
 		URL:    &url.URL{Path: path},
 	})
-	if err == nil && info.IsResourceRequest {
-		if info.APIGroup == "authorization.k8s.io" &&
-			info.Resource == "selfsubjectaccessreviews" &&
-			info.Verb == "create" {
-			return Read
+	if err != nil || !info.IsResourceRequest {
+		if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+			return Read, ""
 		}
-		switch info.Subresource {
-		case "attach", "exec", "portforward", "proxy":
-			return ReadWrite
-		}
-		switch info.Verb {
-		case "get", "list", "watch":
-			return Read
-		default:
-			return ReadWrite
-		}
+		return ReadWrite, ""
 	}
 
-	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
-		return Read
+	if info.APIGroup == "authorization.k8s.io" && info.Resource == "selfsubjectaccessreviews" && info.Verb == "create" {
+		return Read, info.Namespace
+	}
+	switch info.Subresource {
+	case "attach", "exec", "portforward", "proxy":
+		return ReadWrite, info.Namespace
+	}
+	switch info.Verb {
+	case "get", "list", "watch":
+		return Read, info.Namespace
 	default:
-		return ReadWrite
+		return ReadWrite, info.Namespace
 	}
 }
 

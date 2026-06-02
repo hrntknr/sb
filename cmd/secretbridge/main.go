@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,10 +14,10 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/hrntknr/secretbridge/pkg/pathutil"
 	"github.com/hrntknr/secretbridge/pkg/proxy"
 	proxyk8s "github.com/hrntknr/secretbridge/pkg/proxy/k8s"
 	proxyssh "github.com/hrntknr/secretbridge/pkg/proxy/ssh"
+	"github.com/hrntknr/secretbridge/pkg/util"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
@@ -157,17 +159,32 @@ func listenerPort(listener net.Listener) (int, error) {
 	return addr.Port, nil
 }
 
+type rawConfig struct {
+	SSH []rawSSHTarget `yaml:"ssh"`
+	K8s []rawK8sTarget `yaml:"k8s"`
+}
+
+type rawSSHTarget struct {
+	Host     string   `yaml:"host"`
+	Commands []string `yaml:"commands"`
+}
+
+type rawK8sTarget struct {
+	Cluster   string `yaml:"cluster"`
+	Mode      string `yaml:"mode"`
+	Namespace string `yaml:"namespace"`
+}
+
 func readConfig(path string) (proxy.Config, error) {
-	var raw struct {
-		SSH []string `yaml:"ssh"`
-		K8s []string `yaml:"k8s"`
-	}
-	path = pathutil.ExpandHome(path)
+	path = util.ExpandHome(path)
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return proxy.Config{}, fmt.Errorf("read config: %w", err)
 	}
-	if err := yaml.Unmarshal(content, &raw); err != nil {
+	var raw rawConfig
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return proxy.Config{}, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -175,45 +192,39 @@ func readConfig(path string) (proxy.Config, error) {
 		SSH: make(proxyssh.Targets, 0, len(raw.SSH)),
 		K8s: make(proxyk8s.Targets, 0, len(raw.K8s)),
 	}
-	for _, item := range raw.SSH {
-		args, err := parseAllow(item, 1)
-		if err != nil {
-			return proxy.Config{}, fmt.Errorf("parse ssh target %q: %w", item, err)
+	for i, item := range raw.SSH {
+		if strings.TrimSpace(item.Host) == "" {
+			return proxy.Config{}, fmt.Errorf("ssh target %d: host is required", i)
 		}
-		config.SSH = append(config.SSH, args[0])
+		target := proxyssh.Target{Host: item.Host}
+		if len(item.Commands) > 0 {
+			target.Commands = item.Commands
+		} else {
+			target.Commands = []string{"*"}
+			target.Shell = true
+			target.Forward = true
+		}
+		config.SSH = append(config.SSH, target)
 	}
-	for _, item := range raw.K8s {
-		args, err := parseAllow(item, 2)
-		if err != nil {
-			return proxy.Config{}, fmt.Errorf("parse k8s target %q: %w", item, err)
+	for i, item := range raw.K8s {
+		if strings.TrimSpace(item.Cluster) == "" {
+			return proxy.Config{}, fmt.Errorf("k8s target %d: cluster is required", i)
 		}
-		verb := proxyk8s.Verb(args[0])
-		switch verb {
+		mode := proxyk8s.Verb(item.Mode)
+		switch mode {
 		case proxyk8s.Read, proxyk8s.ReadWrite:
 		default:
-			return proxy.Config{}, fmt.Errorf("parse k8s target %q: invalid verb", item)
+			return proxy.Config{}, fmt.Errorf("k8s target %d: invalid mode %q", i, item.Mode)
 		}
-		config.K8s = append(config.K8s, proxyk8s.Target{Verb: verb, Context: args[1]})
+		target := proxyk8s.Target{Mode: mode, Cluster: item.Cluster}
+		if namespace := strings.TrimSpace(item.Namespace); namespace != "" {
+			target.Namespaces = []string{namespace}
+		} else {
+			target.ClusterScope = true
+		}
+		config.K8s = append(config.K8s, target)
 	}
 	return config, nil
-}
-
-func parseAllow(s string, want int) ([]string, error) {
-	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, "allow(") || !strings.HasSuffix(s, ")") {
-		return nil, fmt.Errorf("want allow(...)")
-	}
-	fields := strings.Split(strings.TrimSuffix(strings.TrimPrefix(s, "allow("), ")"), ",")
-	if len(fields) != want {
-		return nil, fmt.Errorf("want %d args", want)
-	}
-	for i := range fields {
-		fields[i] = strings.TrimSpace(fields[i])
-		if fields[i] == "" {
-			return nil, fmt.Errorf("empty arg")
-		}
-	}
-	return fields, nil
 }
 
 func serve(ctx context.Context, errc chan<- error, listener net.Listener, serve func(net.Listener) error) {

@@ -10,6 +10,7 @@ Host * !{{ .ProxyHostAlias }}
 
 Host *
 	User {{ .DefaultUserMarker }}
+	Port {{ .DefaultPort }}
 	IdentityFile ~/.ssh/id_ed25519
 	IdentitiesOnly yes
 	UserKnownHostsFile ~/.ssh/known_hosts

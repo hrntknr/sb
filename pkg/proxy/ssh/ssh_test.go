@@ -16,8 +16,11 @@ import (
 
 const testProxyPort = 12222
 
-func TestTargetsAllowHostGlobs(t *testing.T) {
-	targets := Targets{"github.com", "*.example.net"}
+func TestCapabilityHostGlobs(t *testing.T) {
+	targets := Targets{
+		{Host: "github.com", Shell: true, Forward: true},
+		{Host: "*.example.net", Shell: true, Forward: true},
+	}
 
 	tests := []struct {
 		host string
@@ -30,9 +33,73 @@ func TestTargetsAllowHostGlobs(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := targets.Allows(tt.host); got != tt.want {
-			t.Fatalf("Allows(%q) = %v, want %v", tt.host, got, tt.want)
+		if got := !targets.Capability(tt.host).Empty(); got != tt.want {
+			t.Fatalf("Capability(%q) non-empty = %v, want %v", tt.host, got, tt.want)
 		}
+	}
+}
+
+func TestCapabilityAllowsExec(t *testing.T) {
+	targets := Targets{
+		{Host: "github.com", Commands: []string{"*"}, Shell: true, Forward: true},
+		{Host: "*", Commands: []string{"cat", "kubectl get"}},
+	}
+
+	tests := []struct {
+		host    string
+		command string
+		want    bool
+	}{
+		{"github.com", "git-upload-pack 'repo.git'", true}, // "*" allows any command
+		{"node.internal", "cat /etc/hosts", true},
+		{"node.internal", "cat", true},
+		{"node.internal", "cata /etc/hosts", false},    // first token must match exactly
+		{"node.internal", "kubectl get pods", true},    // multi-token pattern
+		{"node.internal", "kubectl delete pod", false}, // subcommand not allowed
+		{"node.internal", "kubectl", false},            // too few tokens for pattern
+		{"node.internal", "rm -rf /", false},
+		{"node.internal", "cat a && cat b", true}, // every sub-command allowed
+		{"node.internal", "cat a | kubectl get pods", true},
+		{"node.internal", "cat a; rm -rf /", false}, // one sub-command denied
+		{"node.internal", "cat a && kubectl delete x", false},
+		{"node.internal", "cat $(rm -rf /)", false}, // command substitution evaluated
+		{"node.internal", "cat `rm -rf /`", false},  // backtick substitution evaluated
+		{"node.internal", "(cat a; rm b)", false},   // subshell evaluated
+		{"node.internal", "cat 'a b'", true},        // quoting handled
+		{"node.internal", "$CMD a", false},          // non-literal command name denied
+		{"node.internal", "cat a > out", false},     // write redirection denied
+		{"node.internal", "cat a >> out", false},    // append redirection denied
+		{"node.internal", "cat < in", false},        // read redirection denied
+		{"node.internal", "cat a && kubectl get pods", true},
+		{"node.internal", "cat &&", false}, // parse error
+		{"node.internal", "", false},
+	}
+
+	for _, tt := range tests {
+		if got := targets.Capability(tt.host).AllowsExec(tt.command); got != tt.want {
+			t.Fatalf("Capability(%q).AllowsExec(%q) = %v, want %v", tt.host, tt.command, got, tt.want)
+		}
+	}
+}
+
+func TestCapabilityShellAndForwardOnlyWhenUnrestricted(t *testing.T) {
+	targets := Targets{
+		{Host: "github.com", Shell: true, Forward: true},
+		{Host: "*", Commands: []string{"cat"}},
+	}
+
+	if c := targets.Capability("github.com"); !c.Shell || !c.Forward {
+		t.Fatalf("Capability(github.com) = %+v, want shell and forward", c)
+	}
+	if c := targets.Capability("node.internal"); c.Shell || c.Forward {
+		t.Fatalf("Capability(node.internal) = %+v, want no shell/forward", c)
+	}
+}
+
+func TestEmptyTargetsDenyAll(t *testing.T) {
+	var targets Targets
+	if c := targets.Capability("github.com"); !c.Empty() {
+		t.Fatalf("empty targets produced capability: %+v", c)
 	}
 }
 
@@ -44,7 +111,7 @@ func TestHostCertPrincipalsIncludesLowercaseAlias(t *testing.T) {
 }
 
 func TestIssueInternalReturnsDirectProxyConfigAndKey(t *testing.T) {
-	config, key, knownHosts, err := New(Targets{"github.com", "*.example.net"}).issue("proxy.local", testProxyPort)
+	config, key, knownHosts, err := New(Targets{{Host: "github.com"}, {Host: "*.example.net"}}).issue("proxy.local", testProxyPort)
 	if err != nil {
 		t.Fatalf("issue() error = %v", err)
 	}
@@ -70,6 +137,9 @@ func TestIssueInternalReturnsDirectProxyConfigAndKey(t *testing.T) {
 	}
 	if !strings.Contains(configText, "\n\tUser "+defaultUserMarker+"\n") {
 		t.Fatalf("config does not contain default user marker: %q", configText)
+	}
+	if !strings.Contains(configText, "\n\tPort "+defaultPortMarker+"\n") {
+		t.Fatalf("config does not contain default port marker: %q", configText)
 	}
 
 	keyText := string(key)
@@ -209,7 +279,7 @@ func TestCertificateSignersPairsCertificateWithMatchingSigner(t *testing.T) {
 
 func TestSyncConfigWritesSSHFiles(t *testing.T) {
 	dir := t.TempDir()
-	cancel := runSyncConfig(t, New(Targets{"github.com"}), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(Targets{{Host: "github.com"}}), "proxy.local", dir)
 	defer cancel()
 
 	for _, name := range []string{".ssh/config", ".ssh/id_ed25519", ".ssh/known_hosts"} {

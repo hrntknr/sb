@@ -5,7 +5,7 @@ import (
 	"net"
 	"os"
 
-	"github.com/hrntknr/secretbridge/pkg/pathutil"
+	"github.com/hrntknr/secretbridge/pkg/util"
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -35,7 +35,7 @@ func appendPublicKeys(auth []cryptossh.AuthMethod, signers []cryptossh.Signer) [
 func identityFileSigners(identityFiles []string) []cryptossh.Signer {
 	var signers []cryptossh.Signer
 	for _, path := range identityFiles {
-		key, err := os.ReadFile(pathutil.ExpandHome(path))
+		key, err := os.ReadFile(util.ExpandHome(path))
 		if err != nil {
 			continue
 		}
@@ -63,7 +63,7 @@ func sshAgentSigners() []cryptossh.Signer {
 func certificateSigners(signers []cryptossh.Signer, certificateFiles []string) []cryptossh.Signer {
 	var certSigners []cryptossh.Signer
 	for _, path := range certificateFiles {
-		certBytes, err := os.ReadFile(pathutil.ExpandHome(path))
+		certBytes, err := os.ReadFile(util.ExpandHome(path))
 		if err != nil {
 			continue
 		}

@@ -12,6 +12,9 @@ func upstreamConfig(username, host, port string) (sshConfig, error) {
 	if username != "" && username != defaultUserMarker {
 		args = append(args, "-l", username)
 	}
+	if port != "" && port != defaultPortMarker {
+		args = append(args, "-p", port)
+	}
 	args = append(args, host)
 	slog.Debug("loading ssh config", "host", host)
 	output, err := exec.Command("ssh", args...).Output()
@@ -30,6 +33,9 @@ func upstreamConfig(username, host, port string) (sshConfig, error) {
 		config.User = username
 	}
 	if config.Port == "" {
+		config.Port = "22"
+	}
+	if port != "" && port != defaultPortMarker {
 		config.Port = port
 	}
 	slog.Debug("resolved ssh config", "user", config.User, "host", config.Host, "port", config.Port, "identity_files", len(config.IdentityFiles), "certificate_files", len(config.CertificateFiles), "identities_only", config.IdentitiesOnly, "proxy_command", config.ProxyCommand != "")

@@ -20,11 +20,7 @@ type sshConfig struct {
 	IdentitiesOnly   bool
 }
 
-func dialUpstream(username, host, port string) (*cryptossh.Client, error) {
-	config, err := upstreamConfig(username, host, port)
-	if err != nil {
-		return nil, err
-	}
+func dialUpstream(config sshConfig) (*cryptossh.Client, error) {
 	auth, err := upstreamAuthMethods(config.IdentityFiles, config.CertificateFiles)
 	if err != nil {
 		return nil, config.wrapError(err)

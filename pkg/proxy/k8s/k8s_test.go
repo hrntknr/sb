@@ -19,33 +19,81 @@ const testProxyPort = 16443
 
 func TestTargetsAllowReadWriteToIncludeRead(t *testing.T) {
 	targets := Targets{
-		{Verb: ReadWrite, Context: "pear"},
-		{Verb: Read, Context: "*"},
+		{Mode: ReadWrite, Cluster: "pear", ClusterScope: true},
+		{Mode: Read, Cluster: "*", ClusterScope: true},
 	}
 
 	tests := []struct {
-		verb    Verb
-		context string
-		want    bool
+		verb      Verb
+		cluster   string
+		namespace string
+		want      bool
 	}{
-		{Read, "pear", true},
-		{ReadWrite, "pear", true},
-		{Read, "test", true},
-		{ReadWrite, "test", false},
+		{Read, "pear", "default", true},
+		{ReadWrite, "pear", "default", true},
+		{Read, "test", "default", true},
+		{ReadWrite, "test", "default", false},
+		{Read, "pear", "", true},
+		{ReadWrite, "test", "", false},
 	}
 
 	for _, tt := range tests {
-		if got := targets.Allows(tt.verb, tt.context); got != tt.want {
-			t.Fatalf("Allows(%q, %q) = %v, want %v", tt.verb, tt.context, got, tt.want)
+		if got := targets.Allows(tt.verb, tt.cluster, tt.namespace); got != tt.want {
+			t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.cluster, tt.namespace, got, tt.want)
+		}
+	}
+}
+
+func TestEmptyTargetsDenyAll(t *testing.T) {
+	var targets Targets
+	for _, tt := range []struct {
+		verb      Verb
+		namespace string
+	}{
+		{Read, ""},
+		{Read, "default"},
+		{ReadWrite, "default"},
+	} {
+		if targets.Allows(tt.verb, "pear", tt.namespace) {
+			t.Fatalf("empty targets allowed (%q, %q)", tt.verb, tt.namespace)
 		}
 	}
 }
 
 func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
-	targets := Targets{{Verb: ReadWrite, Context: "pear"}}
+	targets := Targets{{Mode: ReadWrite, Cluster: "pear", ClusterScope: true}}
 
-	if got := targets.Allows(Read, "Pear"); got {
+	if got := targets.Allows(Read, "Pear", "default"); got {
 		t.Fatalf("Allows(%q, %q) = %v, want false", Read, "Pear", got)
+	}
+}
+
+func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
+	targets := Targets{
+		{Mode: ReadWrite, Cluster: "prod", Namespaces: []string{"team-*"}},
+		{Mode: Read, Cluster: "*", ClusterScope: true},
+	}
+
+	tests := []struct {
+		name      string
+		verb      Verb
+		cluster   string
+		namespace string
+		want      bool
+	}{
+		{"rw in allowed namespace", ReadWrite, "prod", "team-alpha", true},
+		{"rw in other namespace denied", ReadWrite, "prod", "other", false},
+		{"read in other namespace allowed by wildcard", Read, "prod", "other", true},
+		{"cluster-scoped rw denied", ReadWrite, "prod", "", false},
+		{"cluster-scoped read allowed by wildcard", Read, "prod", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := targets.Allows(tt.verb, tt.cluster, tt.namespace); got != tt.want {
+				t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.cluster, tt.namespace, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -156,8 +204,31 @@ func TestRequestVerbClassifiesKubernetesActions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := requestVerb(tt.method, tt.path); got != tt.want {
-				t.Fatalf("requestVerb(%q, %q) = %q, want %q", tt.method, tt.path, got, tt.want)
+			if got, _ := classifyRequest(tt.method, tt.path); got != tt.want {
+				t.Fatalf("classifyRequest(%q, %q) verb = %q, want %q", tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClassifyRequestNamespace(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		want   string
+	}{
+		{"namespaced", http.MethodGet, "/api/v1/namespaces/default/pods", "default"},
+		{"namespaced resource", http.MethodPost, "/api/v1/namespaces/apps/pods", "apps"},
+		{"cluster-scoped", http.MethodGet, "/api/v1/nodes", ""},
+		{"all namespaces", http.MethodGet, "/api/v1/pods", ""},
+		{"non-resource", http.MethodGet, "/healthz", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, got := classifyRequest(tt.method, tt.path); got != tt.want {
+				t.Fatalf("classifyRequest(%q, %q) namespace = %q, want %q", tt.method, tt.path, got, tt.want)
 			}
 		})
 	}
@@ -422,7 +493,7 @@ func TestServeRequiresListener(t *testing.T) {
 }
 
 func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
-	proxy := New(Targets{{Verb: ReadWrite, Context: "dev"}})
+	proxy := New(Targets{{Mode: ReadWrite, Cluster: "dev", ClusterScope: true}})
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev", nil)
@@ -451,7 +522,7 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Verb: Read, Context: "dev"}})
+	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -493,7 +564,7 @@ func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, idToken)
 
-	proxy := New(Targets{{Verb: Read, Context: "dev"}})
+	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

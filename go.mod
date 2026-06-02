@@ -10,6 +10,7 @@ require (
 	k8s.io/apimachinery v0.36.1
 	k8s.io/apiserver v0.36.1
 	k8s.io/client-go v0.36.1
+	mvdan.cc/sh/v3 v3.13.1
 )
 
 require (
@@ -35,8 +36,8 @@ require (
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
-	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/term v0.39.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect

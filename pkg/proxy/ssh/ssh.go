@@ -10,18 +10,20 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 	"text/template"
 
+	"github.com/hrntknr/secretbridge/pkg/util"
 	cryptossh "golang.org/x/crypto/ssh"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 const (
 	proxyHostAlias    = "secretbridge"
 	defaultUserMarker = "__secretbridge_default_user__"
+	defaultPortMarker = "65535"
 )
 
 //go:embed templates/ssh_config.tmpl
@@ -35,24 +37,123 @@ var (
 	knownHostsTemplate = template.Must(template.New("known_hosts").Parse(knownHostsTemplateText))
 )
 
-type Targets []string
+type Target struct {
+	Host     string
+	Commands []string
+	Shell    bool
+	Forward  bool
+}
 
-func (t Targets) Allows(host string) bool {
+type Targets []Target
+
+type Capability struct {
+	Commands []string
+	Shell    bool
+	Forward  bool
+}
+
+func (t Targets) Capability(host string) Capability {
 	host = strings.TrimSpace(host)
-	for _, pattern := range t {
-		pattern = strings.TrimSpace(pattern)
-		if pattern == "" || host == "" {
+	var c Capability
+	for _, rule := range t {
+		if !util.Match(rule.Host, host) {
 			continue
 		}
-		ok, err := path.Match(pattern, host)
-		if err == nil && ok {
+		c.Commands = append(c.Commands, rule.Commands...)
+		c.Shell = c.Shell || rule.Shell
+		c.Forward = c.Forward || rule.Forward
+	}
+	return c
+}
+
+func (c Capability) Empty() bool {
+	return len(c.Commands) == 0 && !c.Shell && !c.Forward
+}
+
+func (c Capability) AllowsExec(command string) bool {
+	for _, pattern := range c.Commands {
+		if strings.TrimSpace(pattern) == "*" {
+			return true
+		}
+	}
+	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
+	if err != nil {
+		return false
+	}
+	seen, allowed := false, true
+	syntax.Walk(file, func(node syntax.Node) bool {
+		switch n := node.(type) {
+		case *syntax.Redirect:
+			allowed = false // restricted hosts: pure command execution only
+		case *syntax.CallExpr:
+			if len(n.Args) == 0 {
+				return true
+			}
+			seen = true
+			if !c.allowsTokens(callTokens(n)) {
+				allowed = false
+			}
+		}
+		return true
+	})
+	return seen && allowed
+}
+
+func callTokens(call *syntax.CallExpr) []string {
+	var tokens []string
+	for _, w := range call.Args {
+		lit, ok := wordLiteral(w)
+		if !ok {
+			break
+		}
+		tokens = append(tokens, lit)
+	}
+	return tokens
+}
+
+func wordLiteral(w *syntax.Word) (string, bool) {
+	var b strings.Builder
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			b.WriteString(p.Value)
+		case *syntax.SglQuoted:
+			b.WriteString(p.Value)
+		case *syntax.DblQuoted:
+			for _, inner := range p.Parts {
+				lit, ok := inner.(*syntax.Lit)
+				if !ok {
+					return "", false
+				}
+				b.WriteString(lit.Value)
+			}
+		default:
+			return "", false
+		}
+	}
+	return b.String(), true
+}
+
+func (c Capability) allowsTokens(tokens []string) bool {
+	for _, pattern := range c.Commands {
+		patternTokens := strings.Fields(pattern)
+		if len(patternTokens) == 0 || len(tokens) < len(patternTokens) {
+			continue
+		}
+		ok := true
+		for i, pt := range patternTokens {
+			if !util.Match(pt, tokens[i]) {
+				ok = false
+				break
+			}
+		}
+		if ok {
 			return true
 		}
 	}
 	return false
 }
 
-// Proxy holds real SSH credentials and forwards sandbox sessions to allowed hosts.
 type Proxy struct {
 	Targets Targets
 
@@ -115,6 +216,7 @@ func (p *Proxy) issue(host string, port int) (config []byte, key []byte, knownHo
 
 	configText, err := renderTemplate(sshConfigTemplate, map[string]any{
 		"DefaultUserMarker": defaultUserMarker,
+		"DefaultPort":       defaultPortMarker,
 		"ProxyHostAlias":    proxyHostAlias,
 		"ProxyHost":         host,
 		"ProxyPort":         port,

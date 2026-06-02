@@ -89,40 +89,87 @@ func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cr
 			req.Reply(false, nil)
 			return
 		}
-		if len(p.Targets) > 0 && !p.Targets.Allows(host) {
-			slog.Warn("rejected ssh proxy command", "command", payload.Command, "host", host)
+		cfg, err := upstreamConfig(user, host, port)
+		if err != nil {
+			slog.Warn("rejected ssh proxy command", "command", payload.Command, "host", host, "error", err)
 			req.Reply(false, nil)
 			return
 		}
-		slog.Info("proxying ssh connection", "requested_user", user, "host", host, "port", port)
+		capability := p.Targets.Capability(cfg.Host)
+		if capability.Empty() {
+			slog.Warn("rejected ssh proxy command", "command", payload.Command, "host", host, "resolved_host", cfg.Host)
+			req.Reply(false, nil)
+			return
+		}
+		slog.Info("proxying ssh connection", "requested_user", user, "host", host, "resolved_host", cfg.Host, "port", cfg.Port)
 		req.Reply(true, nil)
-		p.serveInnerSSH(channel, user, host, port)
+		p.serveInnerSSH(channel, cfg, host, capability)
 		return
 	}
 }
 
-func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, user, host, port string) {
-	config, err := p.innerServerConfig(host)
+func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, cfg sshConfig, requestedHost string, capability Capability) {
+	serverConfig, err := p.innerServerConfig(requestedHost)
 	if err != nil {
 		return
 	}
-	server, chans, reqs, err := cryptossh.NewServerConn(channelConn{Channel: channel}, config)
+	server, chans, reqs, err := cryptossh.NewServerConn(channelConn{Channel: channel}, serverConfig)
 	if err != nil {
 		return
 	}
 	defer server.Close()
 	go cryptossh.DiscardRequests(reqs)
 
-	upstream, err := dialUpstream(user, host, port)
+	upstream, err := dialUpstream(cfg)
 	if err != nil {
-		slog.Error("failed to dial ssh upstream", "requested_user", user, "host", host, "port", port, "error", err)
+		slog.Error("failed to dial ssh upstream", "host", cfg.Host, "port", cfg.Port, "error", err)
 		return
 	}
 	defer upstream.Close()
 
 	for ch := range chans {
-		go forwardChannel(upstream, ch)
+		go serveInnerChannel(upstream, capability, ch)
 	}
+}
+
+func serveInnerChannel(upstream *cryptossh.Client, capability Capability, ch cryptossh.NewChannel) {
+	if ch.ChannelType() != "session" {
+		if !capability.Forward {
+			slog.Warn("rejected ssh channel by policy", "type", ch.ChannelType())
+			ch.Reject(cryptossh.Prohibited, "forbidden")
+			return
+		}
+		forwardChannel(upstream, ch, nil)
+		return
+	}
+	forwardChannel(upstream, ch, func(req *cryptossh.Request) bool {
+		switch req.Type {
+		case "exec":
+			command := execCommand(req)
+			if !capability.AllowsExec(command) {
+				slog.Warn("rejected ssh exec by policy", "command", command)
+				return false
+			}
+			return true
+		case "shell", "subsystem":
+			if !capability.Shell {
+				slog.Warn("rejected ssh session by policy", "type", req.Type)
+				return false
+			}
+			return true
+		default:
+			return true
+		}
+	})
+}
+
+func execCommand(req *cryptossh.Request) string {
+	if req.Type != "exec" {
+		return ""
+	}
+	var payload struct{ Command string }
+	_ = cryptossh.Unmarshal(req.Payload, &payload)
+	return payload.Command
 }
 
 func (p *Proxy) innerServerConfig(host string) (*cryptossh.ServerConfig, error) {

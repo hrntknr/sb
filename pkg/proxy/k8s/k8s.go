@@ -10,13 +10,13 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/hrntknr/secretbridge/pkg/util"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -28,24 +28,46 @@ const (
 	ReadWrite Verb = "rw"
 )
 
+// Target grants Mode access to clusters matching the Cluster glob. A nil
+// Namespaces allows any namespace; otherwise only listed namespace globs are
+// allowed. ClusterScope permits cluster-scoped (non-namespaced) requests.
 type Target struct {
-	Verb    Verb   `yaml:"verb"`
-	Context string `yaml:"context"`
+	Mode         Verb
+	Cluster      string
+	Namespaces   []string
+	ClusterScope bool
 }
 type Targets []Target
 
-func (t Targets) Allows(verb Verb, context string) bool {
-	context = strings.TrimSpace(context)
+func (t Targets) Allows(verb Verb, cluster, namespace string) bool {
+	cluster = strings.TrimSpace(cluster)
+	namespace = strings.TrimSpace(namespace)
 	for _, rule := range t {
-		if !verbAllowed(rule.Verb, verb) {
+		if !verbAllowed(rule.Mode, verb) {
 			continue
 		}
-		pattern := strings.TrimSpace(rule.Context)
-		if pattern == "" || context == "" {
+		if !util.Match(rule.Cluster, cluster) {
 			continue
 		}
-		ok, err := path.Match(pattern, context)
-		if err == nil && ok {
+		if namespace == "" {
+			if rule.ClusterScope {
+				return true
+			}
+			continue
+		}
+		if rule.allowsNamespace(namespace) {
+			return true
+		}
+	}
+	return false
+}
+
+func (target Target) allowsNamespace(namespace string) bool {
+	if target.Namespaces == nil {
+		return true
+	}
+	for _, pattern := range target.Namespaces {
+		if util.Match(pattern, namespace) {
 			return true
 		}
 	}
