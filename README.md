@@ -37,6 +37,18 @@ k8s:
 
 `host`, `cluster`, `namespace`, and `commands` all support glob patterns (`*` matches any string, `?` matches a single character). `commands` is split into tokens and each token is matched.
 
+### Drop-in: `conf.d/`
+
+Additional `*.yaml` (or `*.yml`) files placed in a `conf.d/` directory next to `config.yaml` are merged into the main config. Files are loaded in alphabetical order, so name them with a numeric prefix (e.g. `10-work.yaml`) to control precedence. Targets in later files with the same `host` (SSH) or `cluster` (k8s) override earlier ones; new targets are appended.
+
+```
+~/.config/secretbridge/
+  config.yaml
+  conf.d/
+    10-work.yaml
+    20-overrides.yaml
+```
+
 ## Flags
 
 | Flag           | Default                              | Description                                    |
