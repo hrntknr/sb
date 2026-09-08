@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -591,6 +593,157 @@ func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	}
 }
 
+func TestServeProxiesOIDCAuthProviderPerContext(t *testing.T) {
+	adminToken := testIDTokenWithSubject(t, time.Now().Add(time.Hour), "admin")
+	pfnToken := testIDTokenWithSubject(t, time.Now().Add(time.Hour), "pfn")
+	seen := make(chan string, 2)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeOIDCMultiContextSourceKubeconfig(t, sourcePath, upstream.URL, adminToken, pfnToken)
+
+	proxy := New(Targets{{Mode: Read, Cluster: "*", ClusterScope: true}})
+	proxy.tokens = map[string]string{
+		"downstream-admin-token": "pfcp-yh1-01",
+		"downstream-pfn-token":   "pfcp-pfn-yh1-01",
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	requestKubeAPI(t, client, listener.Addr().String(), "pfcp-pfn-yh1-01", "downstream-pfn-token")
+	if got := <-seen; got != "Bearer "+pfnToken {
+		t.Fatalf("first upstream Authorization = %q, want pfn token", got)
+	}
+	requestKubeAPI(t, client, listener.Addr().String(), "pfcp-yh1-01", "downstream-admin-token")
+	if got := <-seen; got != "Bearer "+adminToken {
+		t.Fatalf("second upstream Authorization = %q, want admin token", got)
+	}
+}
+
+func TestServeRefreshesOIDCAuthProviderAndPersistsUpstreamConfig(t *testing.T) {
+	refreshedToken := testIDTokenWithSubject(t, time.Now().Add(time.Hour), "refreshed")
+	var issuer *httptest.Server
+	issuer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"token_endpoint":%q}`, issuer.URL+"/token")
+		case "/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatalf("ParseForm() error = %v", err)
+			}
+			if got := r.Form.Get("refresh_token"); got != "old-refresh" {
+				t.Fatalf("refresh_token = %q, want old-refresh", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"access_token":"access","token_type":"Bearer","id_token":%q,"refresh_token":"new-refresh"}`, refreshedToken)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer issuer.Close()
+
+	seen := make(chan string, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	issuerCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.Certificate().Raw})
+	writeOIDCRefreshSourceKubeconfig(t, sourcePath, upstream.URL, issuer.URL, base64.StdEncoding.EncodeToString(issuerCA), testIDToken(t, time.Now().Add(-time.Hour)))
+
+	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+	if got := <-seen; got != "Bearer "+refreshedToken {
+		t.Fatalf("upstream Authorization = %q, want refreshed token", got)
+	}
+	content, err := os.ReadFile(sourcePath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	text := string(content)
+	if !strings.Contains(text, "id-token: "+refreshedToken) {
+		t.Fatalf("kubeconfig did not persist refreshed id-token: %q", text)
+	}
+	if !strings.Contains(text, "refresh-token: new-refresh") {
+		t.Fatalf("kubeconfig did not persist refreshed refresh-token: %q", text)
+	}
+}
+
+func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
+	oldToken := testIDTokenWithSubject(t, time.Now().Add(time.Hour), "old")
+	newToken := testIDTokenWithSubject(t, time.Now().Add(time.Hour), "new")
+	seen := make(chan string, 2)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, oldToken)
+
+	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+	if got := <-seen; got != "Bearer "+oldToken {
+		t.Fatalf("first upstream Authorization = %q, want old token", got)
+	}
+
+	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, newToken)
+	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+	if got := <-seen; got != "Bearer "+newToken {
+		t.Fatalf("second upstream Authorization = %q, want new token", got)
+	}
+}
+
+func TestOIDCCacheHostIncludesContextAndAuthProviderConfig(t *testing.T) {
+	base := oidcCacheHost("https://cluster.example", "ctx", map[string]string{"id-token": "a"})
+	if got := oidcCacheHost("https://cluster.example", "other", map[string]string{"id-token": "a"}); got == base {
+		t.Fatalf("oidcCacheHost did not include context")
+	}
+	if got := oidcCacheHost("https://cluster.example", "ctx", map[string]string{"id-token": "b"}); got == base {
+		t.Fatalf("oidcCacheHost did not include auth-provider config")
+	}
+}
+
 func runSyncConfig(t *testing.T, proxy *Proxy, host, dir string) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -700,9 +853,79 @@ func writeOIDCSourceKubeconfig(t *testing.T, path, server, idToken string) {
 	}
 }
 
-func testIDToken(t *testing.T, expiry time.Time) string {
+func writeOIDCRefreshSourceKubeconfig(t *testing.T, path, server, issuer, issuerCA, idToken string) {
 	t.Helper()
-	payload, err := json.Marshal(map[string]int64{"exp": expiry.Unix()})
+	content := "apiVersion: v1\nkind: Config\nclusters:\n" +
+		"- name: dev\n  cluster:\n    server: " + server + "\n" +
+		"    insecure-skip-tls-verify: true\n" +
+		"users:\n" +
+		"- name: dev\n  user:\n    auth-provider:\n      name: oidc\n      config:\n" +
+		"        client-id: test-client\n" +
+		"        id-token: " + idToken + "\n" +
+		"        idp-certificate-authority-data: " + issuerCA + "\n" +
+		"        idp-issuer-url: " + issuer + "\n" +
+		"        refresh-token: old-refresh\n" +
+		"contexts:\n" +
+		"- name: dev\n  context:\n    cluster: dev\n    user: dev\n" +
+		"current-context: dev\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
+func writeOIDCMultiContextSourceKubeconfig(t *testing.T, path, server, adminToken, pfnToken string) {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\nclusters:\n" +
+		"- name: shared\n  cluster:\n    server: " + server + "\n" +
+		"    insecure-skip-tls-verify: true\n" +
+		"users:\n" +
+		"- name: admin\n  user:\n    auth-provider:\n      name: oidc\n      config:\n" +
+		"        client-id: test-client\n" +
+		"        id-token: " + adminToken + "\n" +
+		"        idp-issuer-url: https://issuer.example.test\n" +
+		"- name: pfn\n  user:\n    auth-provider:\n      name: oidc\n      config:\n" +
+		"        client-id: test-client\n" +
+		"        id-token: " + pfnToken + "\n" +
+		"        idp-issuer-url: https://issuer.example.test\n" +
+		"contexts:\n" +
+		"- name: pfcp-yh1-01\n  context:\n    cluster: shared\n    user: admin\n" +
+		"- name: pfcp-pfn-yh1-01\n  context:\n    cluster: shared\n    user: pfn\n" +
+		"current-context: pfcp-yh1-01\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
+func requestKubeAPI(t *testing.T, client *http.Client, addr, context, token string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "https://"+addr+"/"+context+"/api", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+func testIDToken(t *testing.T, expiry time.Time) string {
+	return testIDTokenWithSubject(t, expiry, "")
+}
+
+func testIDTokenWithSubject(t *testing.T, expiry time.Time, subject string) string {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"exp": expiry.Unix(), "sub": subject})
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}

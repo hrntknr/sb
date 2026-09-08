@@ -3,9 +3,11 @@ package k8s
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,7 +95,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad upstream config", http.StatusBadGateway)
 		return
 	}
-	transport, err := rest.TransportFor(config)
+	transport, err := rest.TransportFor(transportConfigForContext(config, context))
 	if err != nil {
 		slog.Error("failed to create upstream k8s transport", "context", context, "error", err)
 		http.Error(w, "bad upstream transport", http.StatusBadGateway)
@@ -124,6 +127,30 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func transportConfigForContext(config *rest.Config, context string) *rest.Config {
+	transportConfig := rest.CopyConfig(config)
+	if transportConfig.AuthProvider != nil && transportConfig.AuthProvider.Name == "oidc" {
+		transportConfig.Host = oidcCacheHost(transportConfig.Host, context, transportConfig.AuthProvider.Config)
+	}
+	return transportConfig
+}
+
+func oidcCacheHost(host, context string, authProviderConfig map[string]string) string {
+	hash := sha256.New()
+	keys := make([]string, 0, len(authProviderConfig))
+	for key := range authProviderConfig {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		_, _ = hash.Write([]byte(key))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(authProviderConfig[key]))
+		_, _ = hash.Write([]byte{0})
+	}
+	return host + "#" + url.PathEscape(context) + ":" + hex.EncodeToString(hash.Sum(nil))
 }
 
 func classifyRequest(method, path string) (Verb, string) {
