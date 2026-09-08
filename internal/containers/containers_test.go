@@ -11,13 +11,15 @@ func TestArgs(t *testing.T) {
 	tests := []struct {
 		name     string
 		runtime  Runtime
+		host     string
 		tty      bool
 		userArgs []string
 		want     []string
 	}{
 		{
-			name:     "docker tty",
+			name:     "docker via host-gateway",
 			runtime:  Docker,
+			host:     dockerHost,
 			tty:      true,
 			userArgs: []string{"alpine", "sh"},
 			want: []string{"run", "--rm", "--add-host", "host.docker.internal:host-gateway",
@@ -25,8 +27,19 @@ func TestArgs(t *testing.T) {
 				"-i", "-t", "alpine", "sh"},
 		},
 		{
+			name:     "docker with resolved host ip has no add-host",
+			runtime:  Docker,
+			host:     "192.168.1.5",
+			tty:      false,
+			userArgs: []string{"alpine", "sh"},
+			want: []string{"run", "--rm",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"alpine", "sh"},
+		},
+		{
 			name:     "podman without tty",
 			runtime:  Podman,
+			host:     podmanHost,
 			tty:      false,
 			userArgs: []string{"node", "npm", "install"},
 			want: []string{"run", "--rm",
@@ -36,6 +49,7 @@ func TestArgs(t *testing.T) {
 		{
 			name:     "apple tty with user options",
 			runtime:  Apple,
+			host:     appleHost,
 			tty:      true,
 			userArgs: []string{"-v", "/work:/work", "ghcr.io/hrntknr/sh:full"},
 			want: []string{"run", "--rm",
@@ -45,7 +59,7 @@ func TestArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, "/tmp/sb", tt.tty, tt.userArgs)
+			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.tty, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Args() = %v, want %v", got, tt.want)
 			}
@@ -149,6 +163,109 @@ func fakeRuntimeDir(t *testing.T) string {
 		}
 	}
 	return dir
+}
+
+// fakeDockerDir installs a docker binary that prints FAKE_DOCKER_INFO for
+// `docker info`, and returns the directory.
+func fakeDockerDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\necho \"$FAKE_DOCKER_INFO\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestResolveDockerHost(t *testing.T) {
+	tests := []struct {
+		name        string
+		info        string
+		hostNetwork bool
+		outboundIP  string
+		want        string
+		wantErr     bool
+	}{
+		{
+			name: "rootful bridge uses host-gateway name",
+			info: "27.5.1\n[name=seccomp,profile=builtin]",
+			want: dockerHost,
+		},
+		{
+			name:        "rootful host network uses localhost",
+			info:        "27.5.1\n[name=seccomp,profile=builtin]",
+			hostNetwork: true,
+			want:        "localhost",
+		},
+		{
+			name:       "rootless uses the host outbound ip",
+			info:       "27.5.1\n[name=rootless name=seccomp,profile=builtin]",
+			outboundIP: "192.168.1.5",
+			want:       "192.168.1.5",
+		},
+		{
+			name:        "rootless host network also uses the outbound ip",
+			info:        "27.5.1\n[name=rootless name=seccomp,profile=builtin]",
+			hostNetwork: true,
+			outboundIP:  "192.168.1.5",
+			want:        "192.168.1.5",
+		},
+		{
+			name:       "rootless without a route falls back to the name",
+			info:       "27.5.1\n[name=rootless name=seccomp,profile=builtin]",
+			outboundIP: "",
+			want:       dockerHost,
+		},
+		{
+			name:    "old docker rejected",
+			info:    "19.03.12\n[name=seccomp,profile=builtin]",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PATH", fakeDockerDir(t))
+			t.Setenv("FAKE_DOCKER_INFO", tt.info)
+			original := outboundIP
+			outboundIP = func() string { return tt.outboundIP }
+			defer func() { outboundIP = original }()
+			got, err := ResolveHost(Docker, nil)
+			if tt.hostNetwork {
+				got, err = ResolveHost(Docker, []string{"--network", "host"})
+			}
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ResolveHost() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveHost() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ResolveHost() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveHostPodmanAndApple(t *testing.T) {
+	t.Run("podman host network skips checks", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir()) // no podman binary: check must not run
+		got, err := ResolveHost(Podman, []string{"--network", "host"})
+		if err != nil {
+			t.Fatalf("ResolveHost() error = %v", err)
+		}
+		if got != "localhost" {
+			t.Errorf("ResolveHost() = %q, want localhost", got)
+		}
+	})
+	t.Run("podman bridge runs checks", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if _, err := ResolveHost(Podman, nil); err == nil {
+			t.Error("ResolveHost(podman) succeeded without podman installed, want error")
+		}
+	})
 }
 
 func TestDetectPrefersEarlierRuntimes(t *testing.T) {

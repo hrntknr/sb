@@ -53,12 +53,11 @@ func runContainer(ctx context.Context, opts options, runtimeFlag string, userArg
 	if err != nil {
 		return err
 	}
-	opts.host = rt.Host()
-	if rt != containers.Apple && containers.UsesHostNetwork(userArgs) {
-		opts.host = "localhost"
-	} else if err := rt.Check(); err != nil {
+	host, err := containers.ResolveHost(rt, userArgs)
+	if err != nil {
 		return err
 	}
+	opts.host = host
 
 	dir, err := os.MkdirTemp("", "secretbridge-")
 	if err != nil {
@@ -77,7 +76,7 @@ func runContainer(ctx context.Context, opts options, runtimeFlag string, userArg
 	go func() { proxyErr <- proxy.Wait() }()
 
 	tty := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	child := exec.Command(rt.Binary(), containers.Args(rt, dir, tty, userArgs)...)
+	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, tty, userArgs)...)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := child.Start(); err != nil {
 		stop()

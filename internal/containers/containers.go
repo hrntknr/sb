@@ -6,6 +6,7 @@ package containers
 
 import (
 	"fmt"
+	"net"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,13 @@ const (
 	Apple  Runtime = "apple"
 )
 
+// Hostnames a container uses to reach a proxy listening on the host.
+const (
+	dockerHost = "host.docker.internal"
+	podmanHost = "host.containers.internal"
+	appleHost  = "host.container.internal"
+)
+
 var detectOrder = []Runtime{Docker, Podman, Apple}
 
 func (r Runtime) String() string { return string(r) }
@@ -33,17 +41,67 @@ func (r Runtime) Binary() string {
 	return string(r)
 }
 
-// Host returns the hostname a container uses to reach a proxy listening on
-// the host.
-func (r Runtime) Host() string {
+// ResolveHost verifies the runtime can reach the host and returns the
+// hostname (or IP) that containers use to reach a proxy listening on the
+// host. userArgs are the runtime arguments, inspected for host networking.
+func ResolveHost(r Runtime, userArgs []string) (string, error) {
+	hostNetwork := r != Apple && UsesHostNetwork(userArgs)
 	switch r {
 	case Docker:
-		return "host.docker.internal"
+		return resolveDockerHost(hostNetwork)
 	case Podman:
-		return "host.containers.internal"
+		if hostNetwork {
+			return "localhost", nil
+		}
+		if err := checkPodman(); err != nil {
+			return "", err
+		}
+		return podmanHost, nil
 	default:
-		return "host.container.internal"
+		if err := checkApple(); err != nil {
+			return "", err
+		}
+		return appleHost, nil
 	}
+}
+
+func resolveDockerHost(hostNetwork bool) (string, error) {
+	out, err := exec.Command("docker", "info", "--format", "{{.ServerVersion}}\n{{.SecurityOptions}}").Output()
+	if err != nil {
+		return "", fmt.Errorf("docker: cannot reach the daemon (is it running?): %w", err)
+	}
+	version := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0])
+	if !strings.Contains(string(out), "rootless") {
+		if hostNetwork {
+			return "localhost", nil
+		}
+		if !versionAtLeast(version, 20, 10) {
+			return "", fmt.Errorf("docker %s: 20.10+ is required for %s (host-gateway)", version, dockerHost)
+		}
+		return dockerHost, nil
+	}
+	// Rootless docker's host-gateway points inside the daemon's own network
+	// namespace, where nothing on the real host is reachable. The host's
+	// outbound IP is reachable from containers through slirp4netns and
+	// works with both bridge and host networking.
+	if ip := outboundIP(); ip != "" {
+		return ip, nil
+	}
+	// No route: a daemon configured to map host-gateway to the host may
+	// still work, so keep the default name.
+	return dockerHost, nil
+}
+
+// outboundIP returns the host's source address for outbound traffic. It
+// sends no packets (a UDP connect only consults the routing table) and
+// returns "" when there is no route.
+var outboundIP = func() string {
+	conn, err := net.Dial("udp", "1.1.1.1:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
 // Detect returns the first runtime found on PATH, preferring docker, then
@@ -76,29 +134,22 @@ func Parse(name string) (Runtime, error) {
 	return r, nil
 }
 
-// Check verifies the runtime is running and that containers can resolve
-// Host() to reach the host.
-func (r Runtime) Check() error {
-	switch r {
-	case Docker:
-		return checkDocker()
-	case Podman:
-		return checkPodman()
-	default:
-		return checkApple()
+// Args builds the runtime CLI arguments that run a container with the
+// secretbridge credentials under dir mounted at /root, followed by the
+// user's own arguments. host is the value ResolveHost returned.
+func Args(r Runtime, host, dir string, tty bool, userArgs []string) []string {
+	args := []string{"run", "--rm"}
+	if r == Docker && host == dockerHost {
+		args = append(args, "--add-host", dockerHost+":host-gateway")
 	}
-}
-
-func checkDocker() error {
-	out, err := exec.Command("docker", "info", "--format", "{{.ServerVersion}}").Output()
-	if err != nil {
-		return fmt.Errorf("docker: cannot reach the daemon (is it running?): %w", err)
+	args = append(args,
+		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh",
+		"-v", filepath.Join(dir, ".kube")+":/root/.kube",
+	)
+	if tty {
+		args = append(args, "-i", "-t")
 	}
-	version := strings.TrimSpace(string(out))
-	if !versionAtLeast(version, 20, 10) {
-		return fmt.Errorf("docker %s: 20.10+ is required for host.docker.internal (host-gateway)", version)
-	}
-	return nil
+	return append(args, userArgs...)
 }
 
 func checkPodman() error {
@@ -122,24 +173,6 @@ func checkApple() error {
 		return fmt.Errorf("container: host.container.internal is not set up; run:\n  sudo container system dns create host.container.internal --localhost 203.0.113.113")
 	}
 	return nil
-}
-
-// Args builds the runtime CLI arguments that run a container with the
-// secretbridge credentials under dir mounted at /root, followed by the
-// user's own arguments.
-func Args(r Runtime, dir string, tty bool, userArgs []string) []string {
-	args := []string{"run", "--rm"}
-	if r == Docker {
-		args = append(args, "--add-host", "host.docker.internal:host-gateway")
-	}
-	args = append(args,
-		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh",
-		"-v", filepath.Join(dir, ".kube")+":/root/.kube",
-	)
-	if tty {
-		args = append(args, "-i", "-t")
-	}
-	return append(args, userArgs...)
 }
 
 // HasDetach reports whether args detach the container (-d, --detach). The
