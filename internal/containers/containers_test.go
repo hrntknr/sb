@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +13,9 @@ func TestArgs(t *testing.T) {
 		name     string
 		runtime  Runtime
 		host     string
+		cname    string
+		network  string
+		envs     []string
 		tty      bool
 		mounts   []string
 		image    string
@@ -23,40 +27,61 @@ func TestArgs(t *testing.T) {
 			runtime:  Docker,
 			host:     dockerHost,
 			tty:      true,
-			userArgs: []string{"alpine", "sh"},
-			want: []string{"run", "--rm", "--add-host", "host.docker.internal:host-gateway",
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
-				"-i", "-t", "alpine", "sh"},
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+		},
+		{
+			name:     "name and network come before the image",
+			runtime:  Docker,
+			host:     "localhost",
+			cname:    "dev",
+			network:  "host",
+			envs:     []string{"FOO=bar", "LANG"},
+			tty:      true,
+			mounts:   []string{"/home/me/.claude:/root/.claude"},
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
+				"--env", "FOO=bar", "--env", "LANG",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/home/me/.claude:/root/.claude",
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
 			name:     "docker with resolved host ip has no add-host",
 			runtime:  Docker,
 			host:     "192.168.1.5",
 			tty:      false,
-			userArgs: []string{"alpine", "sh"},
-			want: []string{"run", "--rm",
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
-				"alpine", "sh"},
+				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
 			name:     "podman without tty",
 			runtime:  Podman,
 			host:     podmanHost,
 			tty:      false,
-			userArgs: []string{"node", "npm", "install"},
-			want: []string{"run", "--rm",
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"npm", "install"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
-				"node", "npm", "install"},
+				"ghcr.io/hrntknr/sh:full", "npm", "install"},
 		},
 		{
-			name:     "apple tty with user options",
+			name:     "apple tty with a command",
 			runtime:  Apple,
 			host:     appleHost,
 			tty:      true,
-			userArgs: []string{"-v", "/work:/work", "ghcr.io/hrntknr/sh:full"},
-			want: []string{"run", "--rm",
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
-				"-i", "-t", "-v", "/work:/work", "ghcr.io/hrntknr/sh:full"},
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
 			name:     "config mounts come after credentials and before user args",
@@ -64,40 +89,28 @@ func TestArgs(t *testing.T) {
 			host:     "192.168.1.5",
 			tty:      true,
 			mounts:   []string{"/home/me/.claude:/root/.claude", "/home/me/.config/opencode:/root/.config/opencode"},
-			userArgs: []string{"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
-			want: []string{"run", "--rm",
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-v", "/home/me/.config/opencode:/root/.config/opencode",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "configured image precedes the command args",
-			runtime:  Docker,
-			host:     "192.168.1.5",
-			tty:      true,
-			mounts:   []string{"/home/me/.claude:/root/.claude"},
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"claude"},
-			want: []string{"run", "--rm",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
-				"-v", "/home/me/.claude:/root/.claude",
-				"-i", "-t", "ghcr.io/hrntknr/sh:full", "claude"},
-		},
-		{
-			name:    "configured image with no args runs the image default",
+			name:    "no args runs the image default",
 			runtime: Docker,
 			host:    "192.168.1.5",
 			tty:     false,
 			image:   "ghcr.io/hrntknr/sh:full",
-			want: []string{"run", "--rm",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"ghcr.io/hrntknr/sh:full"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.tty, tt.mounts, tt.image, tt.userArgs)
+			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.image, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Args() = %v, want %v", got, tt.want)
 			}
@@ -105,53 +118,71 @@ func TestArgs(t *testing.T) {
 	}
 }
 
-func TestHasDetach(t *testing.T) {
+func TestExecArgs(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want bool
+		name    string
+		cname   string
+		workdir string
+		tty     bool
+		command []string
+		want    []string
 	}{
-		{"detach short", []string{"-d", "alpine"}, true},
-		{"detach long", []string{"--detach", "alpine"}, true},
-		{"detach assigned", []string{"--detach=true", "alpine"}, true},
-		{"detach in cluster", []string{"-itd", "alpine"}, true},
-		{"detach leading cluster", []string{"-di", "alpine"}, true},
-		{"no detach", []string{"-it", "alpine", "sh"}, false},
-		{"detach-keys is not detach", []string{"--detach-keys", "ctrl-p", "alpine"}, false},
-		{"dns long option", []string{"--dns", "8.8.8.8", "alpine"}, false},
-		{"volume option", []string{"-v", "/a:/b", "alpine"}, false},
-		{"command args", []string{"alpine", "sh", "-c", "echo hi"}, false},
+		{"tty", "dev", "", true, []string{"zsh", "-l"}, []string{"exec", "-i", "-t", "dev", "zsh", "-l"}},
+		{"no tty", "dev", "", false, []string{"kubectl", "get", "pods"}, []string{"exec", "dev", "kubectl", "get", "pods"}},
+		{"workdir", "dev", "/work", false, []string{"pwd"}, []string{"exec", "-w", "/work", "dev", "pwd"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := HasDetach(tt.args); got != tt.want {
-				t.Errorf("HasDetach(%v) = %v, want %v", tt.args, got, tt.want)
+			if got := ExecArgs(tt.cname, tt.workdir, tt.tty, tt.command); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ExecArgs() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestUsesHostNetwork(t *testing.T) {
+func TestForceRemove(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
-		want bool
+		name    string
+		runtime Runtime
+		cid     string // cidfile contents; empty means no file
+		want    string // expected invocation, empty means none
 	}{
-		{"net host", []string{"--net", "host", "alpine"}, true},
-		{"network host", []string{"--network", "host", "alpine"}, true},
-		{"net equals host", []string{"--net=host", "alpine"}, true},
-		{"network equals host", []string{"--network=host", "alpine"}, true},
-		{"net bridge", []string{"--net", "bridge", "alpine"}, false},
-		{"network equals bridge", []string{"--network=bridge", "alpine"}, false},
-		{"no network option", []string{"-it", "alpine"}, false},
+		{"docker removes the recorded container", Docker, "0123456789abcdef\n", "rm -f 0123456789abcdef"},
+		{"podman removes the recorded container", Podman, "0123456789abcdef\n", "rm -f 0123456789abcdef"},
+		{"apple removes the recorded container", Apple, "silly-name\n", "rm -f silly-name"},
+		{"missing cidfile is a no-op", Docker, "", ""},
+		{"empty cidfile is a no-op", Docker, "\n", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := UsesHostNetwork(tt.args); got != tt.want {
-				t.Errorf("UsesHostNetwork(%v) = %v, want %v", tt.args, got, tt.want)
+			dir := t.TempDir()
+			if tt.cid != "" {
+				if err := os.WriteFile(filepath.Join(dir, "cid"), []byte(tt.cid), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			log := filepath.Join(t.TempDir(), "calls.log")
+			t.Setenv("PATH", fakeLoggingRuntimeDir(t, tt.runtime))
+			t.Setenv("SB_TEST_CALLS_LOG", log)
+			ForceRemove(tt.runtime, dir)
+			got, _ := os.ReadFile(log)
+			if got := strings.TrimSpace(string(got)); got != tt.want {
+				t.Errorf("ForceRemove() invoked %q, want %q", got, tt.want)
 			}
 		})
 	}
+}
+
+// fakeLoggingRuntimeDir returns a PATH directory whose binary for the given
+// runtime appends its arguments to $SB_TEST_CALLS_LOG, one line per call.
+func fakeLoggingRuntimeDir(t *testing.T, r Runtime) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$SB_TEST_CALLS_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, r.Binary()), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func TestVersionAtLeast(t *testing.T) {
@@ -217,12 +248,12 @@ func fakeDockerDir(t *testing.T) string {
 
 func TestResolveDockerHost(t *testing.T) {
 	tests := []struct {
-		name        string
-		info        string
-		hostNetwork bool
-		outboundIP  string
-		want        string
-		wantErr     bool
+		name       string
+		info       string
+		network    string
+		outboundIP string
+		want       string
+		wantErr    bool
 	}{
 		{
 			name: "rootful bridge uses host-gateway name",
@@ -230,10 +261,10 @@ func TestResolveDockerHost(t *testing.T) {
 			want: dockerHost,
 		},
 		{
-			name:        "rootful host network uses localhost",
-			info:        "27.5.1\n[name=seccomp,profile=builtin]",
-			hostNetwork: true,
-			want:        "localhost",
+			name:    "rootful host network uses localhost",
+			info:    "27.5.1\n[name=seccomp,profile=builtin]",
+			network: "host",
+			want:    "localhost",
 		},
 		{
 			name:       "rootless uses the host outbound ip",
@@ -242,11 +273,11 @@ func TestResolveDockerHost(t *testing.T) {
 			want:       "192.168.1.5",
 		},
 		{
-			name:        "rootless host network also uses the outbound ip",
-			info:        "27.5.1\n[name=rootless name=seccomp,profile=builtin]",
-			hostNetwork: true,
-			outboundIP:  "192.168.1.5",
-			want:        "192.168.1.5",
+			name:       "rootless host network also uses the outbound ip",
+			info:       "27.5.1\n[name=rootless name=seccomp,profile=builtin]",
+			network:    "host",
+			outboundIP: "192.168.1.5",
+			want:       "192.168.1.5",
 		},
 		{
 			name:       "rootless without a route falls back to the name",
@@ -267,10 +298,7 @@ func TestResolveDockerHost(t *testing.T) {
 			original := outboundIP
 			outboundIP = func() string { return tt.outboundIP }
 			defer func() { outboundIP = original }()
-			got, err := ResolveHost(Docker, nil)
-			if tt.hostNetwork {
-				got, err = ResolveHost(Docker, []string{"--network", "host"})
-			}
+			got, err := ResolveHost(Docker, tt.network)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("ResolveHost() = %q, want error", got)
@@ -288,9 +316,15 @@ func TestResolveDockerHost(t *testing.T) {
 }
 
 func TestResolveHostPodmanAndApple(t *testing.T) {
+	t.Run("apple rejects --network", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if _, err := ResolveHost(Apple, "host"); err == nil {
+			t.Error("ResolveHost(apple, host) succeeded, want error")
+		}
+	})
 	t.Run("podman host network skips checks", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir()) // no podman binary: check must not run
-		got, err := ResolveHost(Podman, []string{"--network", "host"})
+		got, err := ResolveHost(Podman, "host")
 		if err != nil {
 			t.Fatalf("ResolveHost() error = %v", err)
 		}
@@ -300,7 +334,7 @@ func TestResolveHostPodmanAndApple(t *testing.T) {
 	})
 	t.Run("podman bridge runs checks", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
-		if _, err := ResolveHost(Podman, nil); err == nil {
+		if _, err := ResolveHost(Podman, ""); err == nil {
 			t.Error("ResolveHost(podman) succeeded without podman installed, want error")
 		}
 	})

@@ -32,7 +32,7 @@ func newProxyCommand(opts *options) *cobra.Command {
 			slog.Info("starting sb proxy", "config", opts.configPath, "host", opts.host, "ssh_listen", opts.sshListen, "k8s_listen", opts.k8sListen, "dir", args[0])
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			proxy, err := startProxy(ctx, *opts, args[0])
+			proxy, err := startProxy(ctx, *opts, opts.host, args[0])
 			if err != nil {
 				return err
 			}
@@ -46,20 +46,22 @@ func newProxyCommand(opts *options) *cobra.Command {
 }
 
 // startProxy starts the ssh and k8s proxies serving credentials under dir
-// and returns once those credentials are on disk. Cancel ctx to stop them.
-func startProxy(ctx context.Context, opts options, dir string) (*proxyServer, error) {
+// and returns once those credentials are on disk. host is the address
+// containers use to reach the proxy (from ResolveHost, or the proxy
+// command's --host flag). Cancel ctx to stop them.
+func startProxy(ctx context.Context, opts options, host, dir string) (*proxyServer, error) {
 	cfg, err := config.Load(opts.configPath)
 	if err != nil {
 		return nil, err
 	}
-	sshProxy := sshproxy.New(cfg.SSH, agentenv.Source{Path: opts.sshAgentEnv}.SocketPath)
-	k8sProxy := k8sproxy.New(cfg.K8s, opts.host)
+	sshProxy := sshproxy.New(cfg.SSH, agentenv.Source{Path: cfg.Proxy.SSHAgentEnv}.SocketPath)
+	k8sProxy := k8sproxy.New(cfg.K8s, host)
 
 	sshListener, k8sListener, err := listen(opts.sshListen, opts.k8sListen)
 	if err != nil {
 		return nil, err
 	}
-	if err := sshProxy.WriteConfig(opts.host, listenerPort(sshListener), dir); err != nil {
+	if err := sshProxy.WriteConfig(host, listenerPort(sshListener), dir); err != nil {
 		return nil, err
 	}
 

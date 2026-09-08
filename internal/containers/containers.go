@@ -7,6 +7,7 @@ package containers
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -43,9 +44,11 @@ func (r Runtime) Binary() string {
 
 // ResolveHost verifies the runtime can reach the host and returns the
 // hostname (or IP) that containers use to reach a proxy listening on the
-// host. userArgs are the runtime arguments, inspected for host networking.
-func ResolveHost(r Runtime, userArgs []string) (string, error) {
-	hostNetwork := r != Apple && UsesHostNetwork(userArgs)
+// host. network is the value of the run --network flag; "host" runs the
+// container in the host network namespace, where the proxy is reachable
+// as localhost.
+func ResolveHost(r Runtime, network string) (string, error) {
+	hostNetwork := network == "host"
 	switch r {
 	case Docker:
 		return resolveDockerHost(hostNetwork)
@@ -58,6 +61,9 @@ func ResolveHost(r Runtime, userArgs []string) (string, error) {
 		}
 		return podmanHost, nil
 	default:
+		if network != "" {
+			return "", fmt.Errorf("apple: --network is not supported by the apple container CLI")
+		}
 		if err := checkApple(); err != nil {
 			return "", err
 		}
@@ -136,11 +142,24 @@ func Parse(name string) (Runtime, error) {
 
 // Args builds the runtime CLI arguments that run a container with the
 // sb credentials under dir mounted at /root, followed by the
-// user's own arguments. host is the value ResolveHost returned. mounts are
-// extra "source:target" volumes. image, when non-empty, is inserted before
-// userArgs, which then form the container command.
-func Args(r Runtime, host, dir string, tty bool, mounts []string, image string, userArgs []string) []string {
-	args := []string{"run", "--rm"}
+// user's own arguments. host is the value ResolveHost returned. name and
+// network, when non-empty, are passed to the runtime as --name and
+// --network. envs are environment variables (KEY=VALUE, or just KEY to
+// inherit from sb's own environment). mounts are extra "source:target"
+// volumes. image is inserted before userArgs, which form the container
+// command. The runtime records the container ID in a cidfile under dir,
+// for ForceRemove.
+func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts []string, image string, userArgs []string) []string {
+	args := []string{"run", "--rm", "--cidfile", cidFile(dir)}
+	if name != "" {
+		args = append(args, "--name", name)
+	}
+	if network != "" {
+		args = append(args, "--network", network)
+	}
+	for _, env := range envs {
+		args = append(args, "--env", env)
+	}
 	if r == Docker && host == dockerHost {
 		args = append(args, "--add-host", dockerHost+":host-gateway")
 	}
@@ -154,10 +173,41 @@ func Args(r Runtime, host, dir string, tty bool, mounts []string, image string, 
 	if tty {
 		args = append(args, "-i", "-t")
 	}
-	if image != "" {
-		args = append(args, image)
+	return append(append(args, image), userArgs...)
+}
+
+// ExecArgs builds the runtime CLI arguments that run command inside the
+// container named name — the --name value of `sb run`, which every runtime
+// accepts as the container identifier for exec. workdir, when non-empty,
+// sets the working directory (-w/--workdir).
+func ExecArgs(name, workdir string, tty bool, command []string) []string {
+	args := []string{"exec"}
+	if tty {
+		args = append(args, "-i", "-t")
 	}
-	return append(args, userArgs...)
+	if workdir != "" {
+		args = append(args, "-w", workdir)
+	}
+	return append(append(args, name), command...)
+}
+
+// ForceRemove force-removes the container whose ID Args had the runtime
+// record in the cidfile under dir, stopping it if it still runs: killing
+// the runtime CLI is not enough, since the container lives outside its
+// process (in the docker or podman daemon, or the apple machine). A
+// missing or empty cidfile — the container never started — is a no-op.
+func ForceRemove(r Runtime, dir string) {
+	data, err := os.ReadFile(cidFile(dir))
+	if err != nil {
+		return
+	}
+	if cid := strings.TrimSpace(string(data)); cid != "" {
+		_ = exec.Command(r.Binary(), "rm", "-f", cid).Run()
+	}
+}
+
+func cidFile(dir string) string {
+	return filepath.Join(dir, "cid")
 }
 
 func checkPodman() error {
@@ -181,36 +231,6 @@ func checkApple() error {
 		return fmt.Errorf("container: host.container.internal is not set up; run:\n  sudo container system dns create host.container.internal --localhost 203.0.113.113")
 	}
 	return nil
-}
-
-// HasDetach reports whether args detach the container (-d, --detach). The
-// run subcommand rejects this: the credentials live in a directory owned by
-// the sb process, so the container cannot outlive it.
-func HasDetach(args []string) bool {
-	for _, arg := range args {
-		if arg == "-d" || arg == "--detach" || strings.HasPrefix(arg, "--detach=") {
-			return true
-		}
-		if len(arg) > 1 && arg[0] == '-' && arg[1] != '-' && strings.ContainsRune(arg, 'd') {
-			return true
-		}
-	}
-	return false
-}
-
-// UsesHostNetwork reports whether args run the container in the host
-// network namespace (docker and podman), where the proxy is reachable as
-// localhost instead of Host().
-func UsesHostNetwork(args []string) bool {
-	for i, arg := range args {
-		if (arg == "--net" || arg == "--network") && i+1 < len(args) && args[i+1] == "host" {
-			return true
-		}
-		if arg == "--net=host" || arg == "--network=host" {
-			return true
-		}
-	}
-	return false
 }
 
 // versionAtLeast reports whether a dotted version like "20.10.12" is at

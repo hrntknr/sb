@@ -17,44 +17,45 @@ import (
 )
 
 func newRunCommand(opts *options) *cobra.Command {
+	var name, network string
 	cmd := &cobra.Command{
-		Use:   "run [--] <args>...",
+		Use:   "run [--] <command>...",
 		Short: "Run a container with sb credentials",
 		Long: `Run a container with scoped ssh and k8s credentials mounted in.
 
-The runtime (docker, podman, or the apple container CLI) is detected
-automatically; select one with container.runtime in the config. Mounts
-configured under container.mounts are passed as -v options.
+The image comes from container.image in the config (required); the
+runtime (docker, podman, or the apple container CLI) is detected
+automatically or selected with container.runtime. Mounts configured
+under container.mounts are passed as -v options.
 
-Without a container.image in the config, all arguments are passed to the
-runtime's run command unchanged; prefix them with -- when they start with -:
+The arguments form the container command; no arguments runs the
+image's default command. Use -- when the command starts with -.
+The container is named with --name (default "default") so that
+sb exec can target it:
 
-  sb run alpine sh
-  sb run -- -v $PWD:/work -it node npm install
+  sb run
+  sb run zsh -l
+  sb run -- claude --settings '{"sandbox":{"enabled":false}}'
 
-With container.image configured, the arguments form the container command
-and no arguments at all runs the image's default command; use -- when the
-command itself starts with -:
+--network selects the container's network:
 
-  sb run claude
-  sb run -- claude --settings '{"sandbox":{"enabled":false}}'`,
+  sb run --network host zsh -l`,
 		Args:          cobra.ArbitraryArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runContainer(cmd, *opts, args)
+			return runContainer(cmd, *opts, name, network, args)
 		},
 	}
-	// Flags after the first plain argument belong to the container command,
-	// not to sb.
+	cmd.Flags().StringVar(&name, "name", "default", "name for the container, targeted by sb exec")
+	cmd.Flags().StringVar(&network, "network", "", "network for the container (with host, the proxy is reached as localhost)")
+	// Flags after the first plain argument belong to the container
+	// command, not to sb.
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
-func runContainer(cmd *cobra.Command, opts options, userArgs []string) error {
-	if containers.HasDetach(userArgs) {
-		return errors.New("run: -d/--detach is not supported; the proxy must outlive the container")
-	}
+func runContainer(cmd *cobra.Command, opts options, name, network string, userArgs []string) error {
 	if err := configureLogger(opts.logLevel); err != nil {
 		return err
 	}
@@ -67,31 +68,30 @@ func runContainer(cmd *cobra.Command, opts options, userArgs []string) error {
 		return err
 	}
 	image := cfg.Container.Image
-	if image == "" && len(userArgs) == 0 {
-		return errors.New("run: an image is required; set container.image in the config or pass one as an argument")
+	if image == "" {
+		return errors.New("run: container.image is required in the config")
 	}
 
 	rt, err := resolveRuntime(cfg.Container.Runtime)
 	if err != nil {
 		return err
 	}
-	host, err := containers.ResolveHost(rt, userArgs)
+	host, err := containers.ResolveHost(rt, network)
 	if err != nil {
 		return err
 	}
-	opts.host = host
 
 	dir, err := os.MkdirTemp("", "sb-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	slog.Info("running container", "runtime", rt.String(), "host", opts.host, "dir", dir)
+	slog.Info("running container", "runtime", rt.String(), "host", host, "dir", dir)
 
 	ctx := cmd.Context()
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	proxy, err := startProxy(ctx, opts, dir)
+	proxy, err := startProxy(ctx, opts, host, dir)
 	if err != nil {
 		return err
 	}
@@ -99,7 +99,7 @@ func runContainer(cmd *cobra.Command, opts options, userArgs []string) error {
 	go func() { proxyErr <- proxy.Wait() }()
 
 	tty := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, tty, cfg.Container.Mounts, image, userArgs)...)
+	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, name, network, cfg.Container.Environments, tty, cfg.Container.Mounts, image, userArgs)...)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := child.Start(); err != nil {
 		stop()
@@ -113,6 +113,7 @@ func runContainer(cmd *cobra.Command, opts options, userArgs []string) error {
 		if err != nil {
 			_ = child.Process.Kill()
 			<-waitErr
+			containers.ForceRemove(rt, dir)
 			return fmt.Errorf("proxy: %w", err)
 		}
 		// Interrupted: the child got the signal too; wait for it to exit.

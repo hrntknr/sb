@@ -32,12 +32,11 @@ func main() {
 // options carries the flags of the root command, which are shared by all
 // subcommands through persistent flags.
 type options struct {
-	configPath  string
-	logLevel    string
-	sshAgentEnv string
-	host        string
-	sshListen   string
-	k8sListen   string
+	configPath string
+	logLevel   string
+	host       string
+	sshListen  string
+	k8sListen  string
 }
 
 func newRootCommand() *cobra.Command {
@@ -49,8 +48,7 @@ func newRootCommand() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&opts.configPath, "config", defaultConfigPath(), "config yaml path")
 	root.PersistentFlags().StringVar(&opts.logLevel, "log-level", "silent", "log level: silent, debug, info, warn, error")
-	root.PersistentFlags().StringVar(&opts.sshAgentEnv, "ssh-agent-env", "", "env file exporting SSH_AUTH_SOCK (shell source, e.g. ssh-agent output), re-read on every upstream connection")
-	root.AddCommand(newProxyCommand(opts), newRunCommand(opts))
+	root.AddCommand(newProxyCommand(opts), newRunCommand(opts), newExecCommand(opts))
 	return root
 }
 

@@ -6,8 +6,10 @@ It generates `.ssh` / `.kube` under a given directory and proxies SSH and Kubern
 
 ## Getting Started
 
+Set `container.image` in the config (see [Configuration](#configuration)), then:
+
 ```
-$ sb run -- -it ghcr.io/hrntknr/sh:full
+$ sb run
 ```
 
 Or run the proxy manually and mount the generated credentials yourself:
@@ -20,27 +22,47 @@ $ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.ku
 
 ## Running containers: `sb run`
 
-`sb run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs your container with the scoped credentials mounted at `/root/.ssh` and `/root/.kube`. The container's exit code becomes sb's.
+`sb run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs the image set as `container.image` in the config with the scoped credentials mounted at `/root/.ssh` and `/root/.kube`. The container's exit code becomes sb's. The container is named with `--name` (default `default`), so that [`sb exec`](#running-commands-inside-sb-exec) can target it.
 
-The runtime — docker, podman, or the apple container CLI (macOS) — is auto-detected in that order; select one with `container.runtime` in the config. Everything after `--` (or plain arguments, when they don't start with `-`) is passed to the runtime's `run` command unchanged, so native options like `-v` and `-p` work as usual:
+The runtime — docker, podman, or the apple container CLI (macOS) — is auto-detected in that order; select one with `container.runtime` in the config. The arguments form the container command; no arguments at all runs the image's default command. Use `--` when the command starts with `-`:
 
 ```
-$ sb run alpine sh
-$ sb run -- -v $PWD:/work -p 8080:80 -it node npm run dev
+$ sb run
+$ sb run zsh -l
+$ sb run -- claude --settings '{"sandbox":{"enabled":false}}'
+```
+
+`sb run` also accepts `--network <n>`, passed to the runtime:
+
+```
+$ sb run --network host zsh -l
 ```
 
 The proxy listens on all interfaces and is reached through the runtime's host gateway, so the default bridged networking just works; with `--network host` (docker/podman) it falls back to `localhost`. Runtime compatibility is checked at startup, with hints for what to fix.
 
-The shared flags (`--config`, `--log-level`, `--ssh-agent-env`) also apply; see [Flags](#flags).
+The shared flags (`--config`, `--log-level`) also apply; see [Flags](#flags).
 
 Notes:
 
-- `-d`/`--detach` is rejected: the credentials live in a temp dir owned by the `run` process, so the container cannot outlive it.
+- If the proxy fails while the container is running, the container is force-removed (`rm -f` via a `--cidfile`) so it cannot outlive its credentials.
 - The credentials are mounted under `/root`; with `--user`, make sure that user can read `/root`.
 - Rootless docker is supported: since its `host-gateway` points inside the daemon's network namespace, the proxy is reached through the host's outbound IP instead.
 - A host firewall (firewalld, ufw) can block container-to-host traffic; if `kubectl`/`ssh` inside the container fail with "connection refused" or time out, pass `--network host` (docker/podman).
 - apple container needs a one-time setup so containers can reach the Mac: `sudo container system dns create host.container.internal --localhost 203.0.113.113`.
 - Rootless podman needs 5.3+ for `host.containers.internal` with the default pasta network; otherwise pass `--network host`.
+
+
+## Running commands inside: `sb exec`
+
+While `sb run` is running, `sb exec` runs a command inside its container from another terminal. It targets the run's `--name` (`default` when not given):
+
+```
+$ sb exec zsh -l
+$ sb exec --name dev -- kubectl get pods
+$ sb exec -w /work -- pwd
+```
+
+The runtime is selected like `sb run` (`container.runtime` or auto-detection); the command's exit code becomes sb's.
 
 
 ## Configuration
@@ -64,6 +86,8 @@ k8s:
   - context: "*"
     mode: r
     namespace: default          # omit for cluster scope
+proxy:
+  sshAgentEnv: ~/.cache/sb-agent.env
 ```
 
 `host`, `context`, `namespace`, and `commands` all support glob patterns (`*` matches any string, `?` matches a single character). `commands` is split into tokens and each token is matched.
@@ -80,21 +104,23 @@ container:
     - ~/.claude:/root/.claude
     - ~/.config/opencode:/root/.config/opencode
     - ~/.cache/opencode:/root/.cache/opencode
+  environments:
+    - FOO=bar                   # KEY=VALUE, or just KEY to inherit from sb's environment
+    - LANG
 ```
 
 `runtime` selects docker, podman, or apple (or `auto`, the default) for `sb run`.
 `mounts` entries are `<source>:<target>` in docker `-v` syntax; `~` in the source is expanded. The source must be an absolute path (after `~` expansion) and must exist — `run` fails early instead of letting the runtime create it as root.
+`environments` entries are `KEY=VALUE`, or just `KEY` to inherit the variable from the sb process's environment.
 
-With `image` set, the arguments form the container command and no arguments at all runs the image's default command; use `--` when the command starts with `-`:
+`image` is required for `sb run`; the arguments form the container command and no arguments at all runs the image's default command. Use `--` when the command starts with `-`:
 
 ```
 $ sb run claude
 $ sb run -- claude --settings '{"sandbox":{"enabled":false}}'
 ```
 
-Without `image`, `run` behaves as before: all arguments are passed to the runtime's run command unchanged, so the first plain argument is the image.
-
-Entries from `conf.d/` are merged: `runtime` and `image` are overridden by later files, and `mounts` are appended with exact duplicates removed.
+Entries from `conf.d/` are merged: `runtime` and `image` are overridden by later files, and `mounts` and `environments` are appended with exact duplicates removed.
 
 k8s policy is keyed by **kubeconfig context name**. Contexts that point at the same cluster are isolated from each other, so granting `rw` to the `dev` context does not grant `rw` to a `prod` context even when both use the same cluster.
 
@@ -118,14 +144,13 @@ The config (including `conf.d/`) is watched and reloaded automatically; policy c
 
 Upstream SSH connections authenticate with the keys loaded in your ssh-agent. The agent socket path is resolved on every connection, so an agent restarted with the same `SSH_AUTH_SOCK` is picked up automatically.
 
-If the socket path changes across restarts, point `--ssh-agent-env` at a file that sets `SSH_AUTH_SOCK`. The file is parsed as shell source, so the raw output of `ssh-agent` works as-is:
+If the socket path changes across restarts, set `proxy.sshAgentEnv` in the config to a file that sets `SSH_AUTH_SOCK`. The file is parsed as shell source, so the raw output of `ssh-agent` works as-is:
 
 ```
 $ ssh-agent > ~/.cache/sb-agent.env
-$ sb proxy --ssh-agent-env ~/.cache/sb-agent.env $tmp &
 ```
 
-When the flag is omitted, the `SSH_AUTH_SOCK` environment variable of the sb process is used.
+with `proxy.sshAgentEnv: ~/.cache/sb-agent.env` in the config. When unset, the `SSH_AUTH_SOCK` environment variable of the sb process is used.
 
 ## Transport verification
 
@@ -135,13 +160,13 @@ The generated kubeconfig embeds the proxy's TLS certificate (`certificate-author
 
 ## Flags
 
-Shared flags (available on every subcommand): `--config`, `--log-level`, and `--ssh-agent-env` (see the [ssh-agent section](#following-ssh-agent-restarts) for the latter). `sb proxy` adds:
+Shared flags (available on every subcommand): `--config` and `--log-level`. `sb proxy` adds:
 
-| Flag               | Default                              | Description                                             |
-| ------------------ | ------------------------------------ | ------------------------------------------------------- |
-| `--host`           | `localhost`                          | Host written into the generated config                  |
-| `--ssh-listen`     | `:0`                                 | SSH listen address                                      |
-| `--k8s-listen`     | `:0`                                 | k8s listen address                                      |
+| Flag           | Default     | Description                            |
+| -------------- | ----------- | -------------------------------------- |
+| `--host`       | `localhost` | Host written into the generated config |
+| `--ssh-listen` | `:0`        | SSH listen address                     |
+| `--k8s-listen` | `:0`        | k8s listen address                     |
 
 ## Build
 

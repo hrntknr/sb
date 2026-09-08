@@ -29,6 +29,16 @@ type Config struct {
 	K8s []k8sproxy.Target
 	// Container configures how `sb run` launches the container.
 	Container Container
+	// Proxy configures the credential proxies.
+	Proxy Proxy
+}
+
+// Proxy is the `proxy` section of the config: settings shared by the
+// ssh and k8s proxies.
+type Proxy struct {
+	// SSHAgentEnv is the env file exporting SSH_AUTH_SOCK, re-read on
+	// every upstream connection; empty uses the process environment.
+	SSHAgentEnv string
 }
 
 // Container is the `container` section of the config.
@@ -36,18 +46,22 @@ type Container struct {
 	// Runtime selects docker, podman, or apple for `sb run`;
 	// empty or "auto" auto-detects. The --runtime flag overrides it.
 	Runtime string
-	// Image, when set, is the image `sb run` starts; its
-	// arguments then form the container command.
+	// Image is the image `sb run` starts (required); the run arguments
+	// form the container command.
 	Image string
 	// Mounts are extra "source:target" volumes, with ~ expanded in the
 	// source.
 	Mounts []string
+	// Environments are environment variables ("KEY=VALUE", or just "KEY"
+	// to inherit from the sb process's environment).
+	Environments []string
 }
 
 type file struct {
 	SSH       []sshTarget    `yaml:"ssh"`
 	K8s       []k8sTarget    `yaml:"k8s"`
 	Container *containerFile `yaml:"container"`
+	Proxy     *proxyFile     `yaml:"proxy"`
 }
 
 type sshTarget struct {
@@ -62,9 +76,14 @@ type k8sTarget struct {
 }
 
 type containerFile struct {
-	Runtime string   `yaml:"runtime"`
-	Image   string   `yaml:"image"`
-	Mounts  []string `yaml:"mounts"`
+	Runtime      string   `yaml:"runtime"`
+	Image        string   `yaml:"image"`
+	Mounts       []string `yaml:"mounts"`
+	Environments []string `yaml:"environments"`
+}
+
+type proxyFile struct {
+	SSHAgentEnv string `yaml:"sshAgentEnv"`
 }
 
 // Load reads path and merges any conf.d/*.yaml (or *.yml) files placed next to
@@ -212,8 +231,20 @@ func build(f file) (Config, error) {
 			}
 			container.Mounts = append(container.Mounts, source+":"+target)
 		}
+		container.Environments = make([]string, 0, len(f.Container.Environments))
+		for i, item := range f.Container.Environments {
+			key, _, _ := strings.Cut(item, "=")
+			if key == "" || strings.TrimSpace(key) != key {
+				return Config{}, fmt.Errorf("environment %d: want KEY or KEY=VALUE, got %q", i, item)
+			}
+			container.Environments = append(container.Environments, item)
+		}
 	}
-	return Config{SSH: ssh, K8s: k8s, Container: container}, nil
+	var proxy Proxy
+	if f.Proxy != nil {
+		proxy.SSHAgentEnv = util.ExpandHome(strings.TrimSpace(f.Proxy.SSHAgentEnv))
+	}
+	return Config{SSH: ssh, K8s: k8s, Container: container, Proxy: proxy}, nil
 }
 
 func mergeConfDir(dir string, dst *Config) error {
@@ -271,6 +302,14 @@ func merge(dst *Config, src Config) {
 		if !slices.Contains(dst.Container.Mounts, mount) {
 			dst.Container.Mounts = append(dst.Container.Mounts, mount)
 		}
+	}
+	for _, env := range src.Container.Environments {
+		if !slices.Contains(dst.Container.Environments, env) {
+			dst.Container.Environments = append(dst.Container.Environments, env)
+		}
+	}
+	if src.Proxy.SSHAgentEnv != "" {
+		dst.Proxy.SSHAgentEnv = src.Proxy.SSHAgentEnv
 	}
 }
 

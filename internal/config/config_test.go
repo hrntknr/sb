@@ -299,6 +299,9 @@ container:
   mounts:
     - ~/.claude:/root/.claude
     - /srv/work:/work
+  environments:
+    - FOO=bar
+    - LANG
 `)
 
 	cfg, err := Load(path)
@@ -317,6 +320,31 @@ container:
 	}
 	if !reflect.DeepEqual(cfg.Container.Mounts, want) {
 		t.Errorf("Mounts = %v, want %v", cfg.Container.Mounts, want)
+	}
+	if want := []string{"FOO=bar", "LANG"}; !reflect.DeepEqual(cfg.Container.Environments, want) {
+		t.Errorf("Environments = %v, want %v", cfg.Container.Environments, want)
+	}
+}
+
+func TestLoadInvalidEnvironmentsError(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+	}{
+		{"missing key", "=bar"},
+		{"whitespace in key", "FOO =bar"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			writeFile(t, path, "container:\n  environments:\n    - "+tt.env+"\n")
+
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), "want KEY or KEY=VALUE") {
+				t.Fatalf("Load() error = %v, want KEY or KEY=VALUE error", err)
+			}
+		})
 	}
 }
 
@@ -395,6 +423,8 @@ container:
   image: ghcr.io/hrntknr/sh:full
   mounts:
     - /srv/shared:/shared
+  environments:
+    - FOO=main
 `)
 	writeFile(t, filepath.Join(dir, "conf.d", "agents.yaml"), `
 container:
@@ -403,6 +433,9 @@ container:
   mounts:
     - /srv/shared:/shared
     - ~/.claude:/root/.claude
+  environments:
+    - FOO=main
+    - BAZ=qux
 `)
 
 	cfg, err := Load(filepath.Join(dir, "config.yaml"))
@@ -421,6 +454,39 @@ container:
 	}
 	if !reflect.DeepEqual(cfg.Container.Mounts, want) {
 		t.Errorf("Mounts = %v, want %v", cfg.Container.Mounts, want)
+	}
+	if want := []string{"FOO=main", "BAZ=qux"}; !reflect.DeepEqual(cfg.Container.Environments, want) {
+		t.Errorf("Environments = %v, want %v (duplicate FOO=main removed)", cfg.Container.Environments, want)
+	}
+}
+
+func TestLoadSSHAgentEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, "proxy:\n  sshAgentEnv: ~/.cache/sb-agent.env\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := filepath.Join(dir, ".cache", "sb-agent.env"); cfg.Proxy.SSHAgentEnv != want {
+		t.Errorf("SSHAgentEnv = %q, want %q", cfg.Proxy.SSHAgentEnv, want)
+	}
+}
+
+func TestLoadMergesSSHAgentEnvFromConfD(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, "proxy:\n  sshAgentEnv: /main/agent.env\n")
+	writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), "proxy:\n  sshAgentEnv: /work/agent.env\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Proxy.SSHAgentEnv != "/work/agent.env" {
+		t.Errorf("SSHAgentEnv = %q, want conf.d to override", cfg.Proxy.SSHAgentEnv)
 	}
 }
 
