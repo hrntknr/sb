@@ -7,10 +7,43 @@ It generates `.ssh` / `.kube` under a given directory and proxies SSH and Kubern
 ## Getting Started
 
 ```
+$ secretbridge run -- -it ghcr.io/hrntknr/sh:full
+```
+
+Or run the proxy manually and mount the generated credentials yourself:
+
+```
 $ tmp=$(mktemp -d)
-$ secretbridge $tmp &
+$ secretbridge proxy $tmp &
 $ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.kube ghcr.io/hrntknr/sh:full
 ```
+
+## Running containers: `secretbridge run`
+
+`secretbridge run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs your container with the scoped credentials mounted at `/root/.ssh` and `/root/.kube`. The container's exit code becomes secretbridge's.
+
+The runtime — docker, podman, or the apple container CLI (macOS) — is auto-detected in that order; override with `--runtime docker|podman|apple`. Everything after `--` (or plain arguments, when they don't start with `-`) is passed to the runtime's `run` command unchanged, so native options like `-v` and `-p` work as usual:
+
+```
+$ secretbridge run alpine sh
+$ secretbridge run -- -v $PWD:/work -p 8080:80 -it node npm run dev
+```
+
+The proxy listens on all interfaces and is reached through the runtime's host gateway, so the default bridged networking just works; with `--network host` (docker/podman) it falls back to `localhost`. Runtime compatibility is checked at startup, with hints for what to fix.
+
+| Flag        | Default | Description                                            |
+| ----------- | ------- | ------------------------------------------------------ |
+| `--runtime` | `auto`  | Container runtime: `auto`, `docker`, `podman`, `apple` |
+
+The shared flags (`--config`, `--log-level`, `--ssh-agent-env`) also apply; see [Flags](#flags).
+
+Notes:
+
+- `-d`/`--detach` is rejected: the credentials live in a temp dir owned by the `run` process, so the container cannot outlive it.
+- The credentials are mounted under `/root`; with `--user`, make sure that user can read `/root`.
+- apple container needs a one-time setup so containers can reach the Mac: `sudo container system dns create host.container.internal --localhost 203.0.113.113`.
+- Rootless podman needs 5.3+ for `host.containers.internal` with the default pasta network; otherwise pass `--network host`.
+
 
 ## Configuration
 
@@ -63,7 +96,7 @@ If the socket path changes across restarts, point `--ssh-agent-env` at a file th
 
 ```
 $ ssh-agent > ~/.cache/secretbridge-agent.env
-$ secretbridge --ssh-agent-env ~/.cache/secretbridge-agent.env $tmp &
+$ secretbridge proxy --ssh-agent-env ~/.cache/secretbridge-agent.env $tmp &
 ```
 
 When the flag is omitted, the `SSH_AUTH_SOCK` environment variable of the secretbridge process is used.
@@ -76,14 +109,13 @@ The generated kubeconfig embeds the proxy's TLS certificate (`certificate-author
 
 ## Flags
 
+Shared flags (available on every subcommand): `--config`, `--log-level`, and `--ssh-agent-env` (see the [ssh-agent section](#following-ssh-agent-restarts) for the latter). `secretbridge proxy` adds:
+
 | Flag               | Default                              | Description                                             |
 | ------------------ | ------------------------------------ | ------------------------------------------------------- |
-| `--config`         | `~/.config/secretbridge/config.yaml` | Path to the config file                                 |
 | `--host`           | `localhost`                          | Host written into the generated config                  |
-| `--log-level`      | `silent`                             | `silent` / `debug` / `info` / `warn` / `error`           |
 | `--ssh-listen`     | `:0`                                 | SSH listen address                                      |
 | `--k8s-listen`     | `:0`                                 | k8s listen address                                      |
-| `--ssh-agent-env`  | (none)                               | Env file exporting `SSH_AUTH_SOCK`, re-read per connection |
 
 ## Build
 
