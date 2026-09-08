@@ -51,6 +51,10 @@ Additional `*.yaml` (or `*.yml`) files placed in a `conf.d/` directory next to `
     20-overrides.yaml
 ```
 
+### Reloading
+
+The config (including `conf.d/`) is watched and reloaded automatically; policy changes take effect without restarting secretbridge. A reload that fails (e.g. invalid yaml) keeps the previous config and retries on the next change.
+
 ## Following ssh-agent restarts
 
 Upstream SSH connections authenticate with the keys loaded in your ssh-agent. The agent socket path is resolved on every connection, so an agent restarted with the same `SSH_AUTH_SOCK` is picked up automatically.

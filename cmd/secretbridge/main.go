@@ -91,7 +91,7 @@ func run(ctx context.Context, opts options, dir string) error {
 	// The k8s proxy signals once its kubeconfig (with this process's
 	// certificate) is on disk, so the first request finds valid tokens.
 	ready := make(chan struct{})
-	errc := make(chan error, 3)
+	errc := make(chan error, 4)
 	go func() {
 		errc <- k8sProxy.SyncConfig(ctx, listenerPort(k8sListener), dir, ready)
 	}()
@@ -102,6 +102,12 @@ func run(ctx context.Context, opts options, dir string) error {
 	}
 	go serve(ctx, errc, sshListener, sshProxy.Serve)
 	go serve(ctx, errc, k8sListener, k8sProxy.Serve)
+	go func() {
+		errc <- config.Watch(ctx, opts.configPath, func(cfg config.Config) {
+			sshProxy.SetTargets(cfg.SSH)
+			k8sProxy.SetTargets(cfg.K8s)
+		})
+	}()
 
 	select {
 	case <-ctx.Done():

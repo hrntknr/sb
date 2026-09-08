@@ -4,14 +4,17 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/hrntknr/secretbridge/internal/k8sproxy"
 	"github.com/hrntknr/secretbridge/internal/sshproxy"
 	"github.com/hrntknr/secretbridge/internal/util"
@@ -53,6 +56,56 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return config, nil
+}
+
+// Watch calls onChange with the current config, then again whenever path or
+// its conf.d files change. A reload that fails (e.g. invalid yaml) keeps the
+// previous config; the next change retries.
+func Watch(ctx context.Context, path string, onChange func(Config)) error {
+	path = util.ExpandHome(path)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("watch config: %w", err)
+	}
+	defer watcher.Close()
+	// The config directory also carries the conf.d creation when conf.d
+	// does not exist yet; files inside it need their own watch.
+	if err := watcher.Add(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("watch config dir: %w", err)
+	}
+	if err := watcher.Add(confDir(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("watch config conf.d: %w", err)
+	}
+	reload(path, onChange)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case event := <-watcher.Events:
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
+				continue
+			}
+			if event.Op&fsnotify.Create != 0 && filepath.Clean(event.Name) == filepath.Clean(confDir(path)) {
+				_ = watcher.Add(confDir(path))
+			}
+			reload(path, onChange)
+		case err := <-watcher.Errors:
+			return err
+		}
+	}
+}
+
+func confDir(path string) string {
+	return filepath.Join(filepath.Dir(path), "conf.d")
+}
+
+func reload(path string, onChange func(Config)) {
+	config, err := Load(path)
+	if err != nil {
+		slog.Warn("config reload failed; keeping previous config", "error", err)
+		return
+	}
+	onChange(config)
 }
 
 func loadFile(path string) (Config, error) {

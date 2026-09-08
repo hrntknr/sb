@@ -83,6 +83,21 @@ func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cr
 	}
 }
 
+// SetTargets replaces the policy targets, called on config reloads.
+func (p *Proxy) SetTargets(targets Targets) {
+	p.mu.Lock()
+	p.Targets = targets
+	p.mu.Unlock()
+}
+
+// capability returns the current policy capability for host.
+func (p *Proxy) capability(host string) Capability {
+	p.mu.Lock()
+	targets := p.Targets
+	p.mu.Unlock()
+	return targets.Capability(host)
+}
+
 // resolveTarget parses a "proxy-ssh <user> <host> <port>" exec payload,
 // resolves the upstream ssh config, and checks that the host has a capability.
 func (p *Proxy) resolveTarget(command string) (cfg sshConfig, capability Capability, ok bool) {
@@ -94,7 +109,7 @@ func (p *Proxy) resolveTarget(command string) (cfg sshConfig, capability Capabil
 	if err != nil {
 		return sshConfig{}, Capability{}, false
 	}
-	capability = p.Targets.Capability(cfg.Host)
+	capability = p.capability(cfg.Host)
 	if capability.Empty() {
 		return sshConfig{}, Capability{}, false
 	}

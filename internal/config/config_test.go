@@ -1,10 +1,12 @@
 package config
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hrntknr/secretbridge/internal/k8sproxy"
 )
@@ -281,4 +283,119 @@ k8s:
 	if err == nil || !strings.Contains(err.Error(), `invalid mode "admin"`) {
 		t.Fatalf("Load() error = %v, want invalid mode error", err)
 	}
+}
+
+// startWatch writes an initial config, starts Watch on it, and returns the
+// config path and a channel of the configs Watch delivers.
+func startWatch(t *testing.T) (string, <-chan Config) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `
+ssh:
+  - host: initial.example
+`)
+	configs := make(chan Config, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = Watch(ctx, path, func(cfg Config) { configs <- cfg })
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Watch did not stop after cancel")
+		}
+	})
+	return path, configs
+}
+
+func waitForInitial(t *testing.T, configs <-chan Config) {
+	t.Helper()
+	select {
+	case <-configs:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial onChange not called")
+	}
+}
+
+// drainHosts reads one config from the channel if available and lists its
+// ssh host targets.
+func drainHosts(configs <-chan Config) []string {
+	select {
+	case cfg := <-configs:
+		hosts := make([]string, 0, len(cfg.SSH))
+		for _, target := range cfg.SSH {
+			hosts = append(hosts, target.Host)
+		}
+		return hosts
+	default:
+		return nil
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func waitForHosts(t *testing.T, configs <-chan Config, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := drainHosts(configs); equalStrings(got, want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("ssh hosts = %v, want %v", drainHosts(configs), want)
+}
+
+func TestWatchCallsOnChangeInitially(t *testing.T) {
+	_, configs := startWatch(t)
+	waitForInitial(t, configs)
+}
+
+func TestWatchReloadsOnConfigChange(t *testing.T) {
+	path, configs := startWatch(t)
+	waitForInitial(t, configs)
+
+	writeFile(t, path, `
+ssh:
+  - host: updated.example
+`)
+	waitForHosts(t, configs, []string{"updated.example"})
+}
+
+func TestWatchReloadsOnConfDChange(t *testing.T) {
+	path, configs := startWatch(t)
+	waitForInitial(t, configs)
+
+	writeFile(t, filepath.Join(filepath.Dir(path), "conf.d", "10-extra.yaml"), `
+ssh:
+  - host: extra.example
+`)
+	waitForHosts(t, configs, []string{"initial.example", "extra.example"})
+}
+
+func TestWatchKeepsWatchingAfterInvalidChange(t *testing.T) {
+	path, configs := startWatch(t)
+	waitForInitial(t, configs)
+
+	writeFile(t, path, "ssh: [unclosed")
+	writeFile(t, path, `
+ssh:
+  - host: recovered.example
+`)
+	waitForHosts(t, configs, []string{"recovered.example"})
 }

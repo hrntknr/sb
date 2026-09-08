@@ -100,6 +100,21 @@ func issueCertificate(host string) (tls.Certificate, error) {
 	)
 }
 
+// SetTargets replaces the policy targets, called on config reloads.
+func (p *Proxy) SetTargets(targets Targets) {
+	p.mu.Lock()
+	p.Targets = targets
+	p.mu.Unlock()
+}
+
+// allows reports whether the current policy permits the request.
+func (p *Proxy) allows(verb Verb, context, namespace string) bool {
+	p.mu.RLock()
+	targets := p.Targets
+	p.mu.RUnlock()
+	return targets.Allows(verb, context, namespace)
+}
+
 func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	p.mu.RLock()
@@ -117,7 +132,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verb, namespace := classifyRequest(r.Method, upstreamPath)
-	if !p.Targets.Allows(verb, context, namespace) {
+	if !p.allows(verb, context, namespace) {
 		slog.Warn("rejected k8s request by policy", "context", context, "method", r.Method, "path", upstreamPath)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return

@@ -65,6 +65,22 @@ func TestEmptyTargetsDenyAll(t *testing.T) {
 	}
 }
 
+func TestSetTargetsUpdatesPolicy(t *testing.T) {
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "proxy.local")
+	if !proxy.allows(Read, "dev", "") {
+		t.Fatal("initial target should be allowed")
+	}
+
+	proxy.SetTargets(Targets{{Mode: Read, Context: "prod", ClusterScope: true}})
+
+	if proxy.allows(Read, "dev", "") {
+		t.Fatal("old context should be denied after SetTargets")
+	}
+	if !proxy.allows(Read, "prod", "") {
+		t.Fatal("new context should be allowed after SetTargets")
+	}
+}
+
 func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
 	targets := Targets{{Mode: ReadWrite, Context: "pear", ClusterScope: true}}
 

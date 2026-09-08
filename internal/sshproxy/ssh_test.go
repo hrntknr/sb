@@ -102,6 +102,22 @@ func TestEmptyTargetsDenyAll(t *testing.T) {
 	}
 }
 
+func TestSetTargetsUpdatesPolicy(t *testing.T) {
+	proxy := New(Targets{{Host: "a.example", Commands: []string{"*"}}}, nil)
+	if proxy.capability("a.example").Empty() {
+		t.Fatal("initial target should be allowed")
+	}
+
+	proxy.SetTargets(Targets{{Host: "b.example", Commands: []string{"*"}}})
+
+	if !proxy.capability("a.example").Empty() {
+		t.Fatal("old target should be denied after SetTargets")
+	}
+	if proxy.capability("b.example").Empty() {
+		t.Fatal("new target should be allowed after SetTargets")
+	}
+}
+
 func TestHostCertPrincipalsIncludesLowercaseAlias(t *testing.T) {
 	principals := hostCertPrincipals("Arc-i-0dbbd72eaec1aea61")
 	if len(principals) != 2 || principals[0] != "Arc-i-0dbbd72eaec1aea61" || principals[1] != "arc-i-0dbbd72eaec1aea61" {
