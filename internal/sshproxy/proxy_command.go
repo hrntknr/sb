@@ -1,4 +1,4 @@
-package ssh
+package sshproxy
 
 import (
 	"io"
@@ -12,7 +12,7 @@ import (
 )
 
 func dialUpstreamProxyCommand(command, addr string, config *cryptossh.ClientConfig) (*cryptossh.Client, error) {
-	conn, err := startProxyCommand(command)
+	conn, err := startProxyCommand(command, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -24,7 +24,8 @@ func dialUpstreamProxyCommand(command, addr string, config *cryptossh.ClientConf
 	return cryptossh.NewClient(clientConn, chans, reqs), nil
 }
 
-func startProxyCommand(command string) (net.Conn, error) {
+// startProxyCommand runs the ssh ProxyCommand and connects to it via stdio.
+func startProxyCommand(command, addr string) (net.Conn, error) {
 	cmd := exec.Command("/bin/sh", "-c", command)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -42,6 +43,8 @@ func startProxyCommand(command string) (net.Conn, error) {
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: stdout,
+		addr:   addr,
+		once:   sync.Once{},
 		done:   make(chan struct{}),
 	}, nil
 }
@@ -50,6 +53,7 @@ type commandConn struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	addr   string
 	once   sync.Once
 	done   chan struct{}
 }
@@ -76,13 +80,13 @@ func (c *commandConn) Close() error {
 	return nil
 }
 
-func (c *commandConn) LocalAddr() net.Addr              { return commandAddr("local") }
-func (c *commandConn) RemoteAddr() net.Addr             { return commandAddr("proxycommand") }
+func (c *commandConn) LocalAddr() net.Addr              { return commandAddr{c.addr} }
+func (c *commandConn) RemoteAddr() net.Addr             { return commandAddr{c.addr} }
 func (c *commandConn) SetDeadline(time.Time) error      { return nil }
 func (c *commandConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *commandConn) SetWriteDeadline(time.Time) error { return nil }
 
-type commandAddr string
+type commandAddr struct{ addr string }
 
-func (a commandAddr) Network() string { return string(a) }
-func (a commandAddr) String() string  { return string(a) }
+func (a commandAddr) Network() string { return "proxycommand" }
+func (a commandAddr) String() string  { return a.addr }

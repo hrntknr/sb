@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -6,8 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	proxyk8s "github.com/hrntknr/secretbridge/pkg/proxy/k8s"
-	proxyssh "github.com/hrntknr/secretbridge/pkg/proxy/ssh"
+	"github.com/hrntknr/secretbridge/internal/k8sproxy"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -20,7 +19,7 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-func TestReadConfigMainOnly(t *testing.T) {
+func TestLoadMainOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	writeFile(t, path, `
@@ -29,16 +28,16 @@ ssh:
   - host: "*.example.net"
     commands: [cat]
 k8s:
-  - cluster: dev
+  - context: dev
     mode: r
-  - cluster: prod
+  - context: prod
     mode: rw
     namespace: default
 `)
 
-	cfg, err := readConfig(path)
+	cfg, err := Load(path)
 	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
+		t.Fatalf("Load() error = %v", err)
 	}
 
 	if len(cfg.SSH) != 2 {
@@ -57,22 +56,22 @@ k8s:
 	if len(cfg.K8s) != 2 {
 		t.Fatalf("K8s len = %d, want 2", len(cfg.K8s))
 	}
-	if cfg.K8s[0].Cluster != "dev" || cfg.K8s[0].Mode != proxyk8s.Read || !cfg.K8s[0].ClusterScope {
+	if cfg.K8s[0].Context != "dev" || cfg.K8s[0].Mode != k8sproxy.Read || !cfg.K8s[0].ClusterScope {
 		t.Errorf("K8s[0] = %+v", cfg.K8s[0])
 	}
-	if cfg.K8s[1].Cluster != "prod" || cfg.K8s[1].Mode != proxyk8s.ReadWrite {
+	if cfg.K8s[1].Context != "prod" || cfg.K8s[1].Mode != k8sproxy.ReadWrite {
 		t.Errorf("K8s[1] = %+v", cfg.K8s[1])
 	}
 }
 
-func TestReadConfigMergesConfD(t *testing.T) {
+func TestLoadMergesConfD(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
   - host: github.com
   - host: "*.hrntknr.net"
 k8s:
-  - cluster: dev
+  - context: dev
     mode: r
 `)
 	writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), `
@@ -81,16 +80,16 @@ ssh:
     commands: [cat]
   - host: internal.example
 k8s:
-  - cluster: dev
+  - context: dev
     mode: rw
-  - cluster: prod
+  - context: prod
     mode: r
     namespace: default
 `)
 
-	cfg, err := readConfig(filepath.Join(dir, "config.yaml"))
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
 	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
+		t.Fatalf("Load() error = %v", err)
 	}
 
 	if len(cfg.SSH) != 3 {
@@ -115,15 +114,15 @@ k8s:
 	if len(cfg.K8s) != 2 {
 		t.Fatalf("K8s len = %d, want 2", len(cfg.K8s))
 	}
-	if cfg.K8s[0].Cluster != "dev" || cfg.K8s[0].Mode != proxyk8s.ReadWrite {
+	if cfg.K8s[0].Context != "dev" || cfg.K8s[0].Mode != k8sproxy.ReadWrite {
 		t.Errorf("K8s[0] = %+v, want dev rw", cfg.K8s[0])
 	}
-	if cfg.K8s[1].Cluster != "prod" || cfg.K8s[1].Mode != proxyk8s.Read {
+	if cfg.K8s[1].Context != "prod" || cfg.K8s[1].Mode != k8sproxy.Read {
 		t.Errorf("K8s[1] = %+v, want prod r", cfg.K8s[1])
 	}
 }
 
-func TestReadConfigConfDOrderedAlphabetically(t *testing.T) {
+func TestLoadConfDOrderedAlphabetically(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
@@ -141,9 +140,9 @@ ssh:
     commands: [echo]
 `)
 
-	cfg, err := readConfig(filepath.Join(dir, "config.yaml"))
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
 	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
+		t.Fatalf("Load() error = %v", err)
 	}
 	if len(cfg.SSH) != 1 {
 		t.Fatalf("SSH len = %d, want 1", len(cfg.SSH))
@@ -153,23 +152,23 @@ ssh:
 	}
 }
 
-func TestReadConfigConfDMissingDirectory(t *testing.T) {
+func TestLoadConfDMissingDirectory(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
   - host: github.com
 `)
 
-	cfg, err := readConfig(filepath.Join(dir, "config.yaml"))
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
 	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
+		t.Fatalf("Load() error = %v", err)
 	}
 	if len(cfg.SSH) != 1 || cfg.SSH[0].Host != "github.com" {
 		t.Fatalf("SSH = %+v", cfg.SSH)
 	}
 }
 
-func TestReadConfigConfDIgnoresNonYAMLAndHidden(t *testing.T) {
+func TestLoadConfDIgnoresNonYAMLAndHidden(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
@@ -186,9 +185,9 @@ ssh:
   - host: extra.example
 `)
 
-	cfg, err := readConfig(filepath.Join(dir, "config.yaml"))
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
 	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
+		t.Fatalf("Load() error = %v", err)
 	}
 	if len(cfg.SSH) != 2 {
 		t.Fatalf("SSH len = %d, want 2 (.yml should be included)", len(cfg.SSH))
@@ -198,7 +197,7 @@ ssh:
 	}
 }
 
-func TestReadConfigConfDInvalidYAMLErrors(t *testing.T) {
+func TestLoadConfDInvalidYAMLErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
@@ -206,16 +205,16 @@ ssh:
 `)
 	writeFile(t, filepath.Join(dir, "conf.d", "bad.yaml"), "ssh: [unclosed")
 
-	_, err := readConfig(filepath.Join(dir, "config.yaml"))
+	_, err := Load(filepath.Join(dir, "config.yaml"))
 	if err == nil {
-		t.Fatal("readConfig() error = nil, want error")
+		t.Fatal("Load() error = nil, want error")
 	}
 	if !strings.Contains(err.Error(), "conf.d/bad.yaml") {
 		t.Errorf("error should mention conf.d/bad.yaml, got %v", err)
 	}
 }
 
-func TestReadConfigConfDInvalidTargetErrors(t *testing.T) {
+func TestLoadConfDInvalidTargetErrors(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
@@ -226,16 +225,16 @@ ssh:
   - commands: [cat]
 `)
 
-	_, err := readConfig(filepath.Join(dir, "config.yaml"))
+	_, err := Load(filepath.Join(dir, "config.yaml"))
 	if err == nil {
-		t.Fatal("readConfig() error = nil, want error")
+		t.Fatal("Load() error = nil, want error")
 	}
 	if !strings.Contains(err.Error(), "conf.d/bad.yaml") {
 		t.Errorf("error should mention conf.d/bad.yaml, got %v", err)
 	}
 }
 
-func TestReadConfigConfDAppendsNewTargets(t *testing.T) {
+func TestLoadConfDAppendsNewTargets(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
 ssh:
@@ -250,41 +249,36 @@ ssh:
   - host: c.example
 `)
 
-	cfg, err := readConfig(filepath.Join(dir, "config.yaml"))
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
 	if err != nil {
-		t.Fatalf("readConfig() error = %v", err)
+		t.Fatalf("Load() error = %v", err)
 	}
 	hosts := make([]string, 0, len(cfg.SSH))
-	for _, t := range cfg.SSH {
-		hosts = append(hosts, t.Host)
+	for _, target := range cfg.SSH {
+		hosts = append(hosts, target.Host)
 	}
 	want := []string{"a.example", "b.example", "c.example"}
 	if len(hosts) != len(want) {
 		t.Fatalf("SSH hosts = %v, want %v", hosts, want)
 	}
-	for i, h := range want {
-		if hosts[i] != h {
-			t.Errorf("SSH[%d].Host = %q, want %q", i, hosts[i], h)
+	for i, host := range want {
+		if hosts[i] != host {
+			t.Errorf("SSH[%d].Host = %q, want %q", i, hosts[i], host)
 		}
 	}
 }
 
-func TestFindSSHTarget(t *testing.T) {
-	targets := proxyssh.Targets{{Host: "a"}, {Host: "b"}}
-	if i := findSSHTarget(targets, "b"); i != 1 {
-		t.Errorf("findSSHTarget(b) = %d, want 1", i)
-	}
-	if i := findSSHTarget(targets, "c"); i != -1 {
-		t.Errorf("findSSHTarget(c) = %d, want -1", i)
-	}
-}
+func TestLoadInvalidModeErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `
+k8s:
+  - context: dev
+    mode: admin
+`)
 
-func TestFindK8sTarget(t *testing.T) {
-	targets := proxyk8s.Targets{{Cluster: "a"}, {Cluster: "b"}}
-	if i := findK8sTarget(targets, "b"); i != 1 {
-		t.Errorf("findK8sTarget(b) = %d, want 1", i)
-	}
-	if i := findK8sTarget(targets, "c"); i != -1 {
-		t.Errorf("findK8sTarget(c) = %d, want -1", i)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), `invalid mode "admin"`) {
+		t.Fatalf("Load() error = %v, want invalid mode error", err)
 	}
 }

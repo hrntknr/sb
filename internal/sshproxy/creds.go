@@ -1,13 +1,11 @@
-package ssh
+package sshproxy
 
 import (
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	_ "embed"
 	"encoding/pem"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -15,9 +13,8 @@ import (
 	"sync"
 	"text/template"
 
-	"github.com/hrntknr/secretbridge/pkg/util"
+	"github.com/hrntknr/secretbridge/internal/util"
 	cryptossh "golang.org/x/crypto/ssh"
-	"mvdan.cc/sh/v3/syntax"
 )
 
 const (
@@ -37,167 +34,49 @@ var (
 	knownHostsTemplate = template.Must(template.New("known_hosts").Parse(knownHostsTemplateText))
 )
 
-type Target struct {
-	Host     string
-	Commands []string
-	Shell    bool
-	Forward  bool
-}
-
-type Targets []Target
-
-type Capability struct {
-	Commands []string
-	Shell    bool
-	Forward  bool
-}
-
-func (t Targets) Capability(host string) Capability {
-	host = strings.TrimSpace(host)
-	var c Capability
-	for _, rule := range t {
-		if !util.Match(rule.Host, host) {
-			continue
-		}
-		c.Commands = append(c.Commands, rule.Commands...)
-		c.Shell = c.Shell || rule.Shell
-		c.Forward = c.Forward || rule.Forward
-	}
-	return c
-}
-
-func (c Capability) Empty() bool {
-	return len(c.Commands) == 0 && !c.Shell && !c.Forward
-}
-
-func (c Capability) AllowsExec(command string) bool {
-	for _, pattern := range c.Commands {
-		if strings.TrimSpace(pattern) == "*" {
-			return true
-		}
-	}
-	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
-	if err != nil {
-		return false
-	}
-	seen, allowed := false, true
-	syntax.Walk(file, func(node syntax.Node) bool {
-		switch n := node.(type) {
-		case *syntax.Redirect:
-			allowed = false // restricted hosts: pure command execution only
-		case *syntax.CallExpr:
-			if len(n.Args) == 0 {
-				return true
-			}
-			seen = true
-			if !c.allowsTokens(callTokens(n)) {
-				allowed = false
-			}
-		}
-		return true
-	})
-	return seen && allowed
-}
-
-func callTokens(call *syntax.CallExpr) []string {
-	var tokens []string
-	for _, w := range call.Args {
-		lit, ok := wordLiteral(w)
-		if !ok {
-			break
-		}
-		tokens = append(tokens, lit)
-	}
-	return tokens
-}
-
-func wordLiteral(w *syntax.Word) (string, bool) {
-	var b strings.Builder
-	for _, part := range w.Parts {
-		switch p := part.(type) {
-		case *syntax.Lit:
-			b.WriteString(p.Value)
-		case *syntax.SglQuoted:
-			b.WriteString(p.Value)
-		case *syntax.DblQuoted:
-			for _, inner := range p.Parts {
-				lit, ok := inner.(*syntax.Lit)
-				if !ok {
-					return "", false
-				}
-				b.WriteString(lit.Value)
-			}
-		default:
-			return "", false
-		}
-	}
-	return b.String(), true
-}
-
-func (c Capability) allowsTokens(tokens []string) bool {
-	for _, pattern := range c.Commands {
-		patternTokens := strings.Fields(pattern)
-		if len(patternTokens) == 0 || len(tokens) < len(patternTokens) {
-			continue
-		}
-		ok := true
-		for i, pt := range patternTokens {
-			if !util.Match(pt, tokens[i]) {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
-}
-
+// Proxy authenticates issued downstream keys, enforces policy, and forwards
+// sessions to upstream hosts.
 type Proxy struct {
 	Targets Targets
+	// AgentSocket resolves the ssh-agent socket path for each upstream dial,
+	// so restarted agents are followed.
+	AgentSocket func() string
 
 	mu           sync.Mutex
 	issuedKey    string
 	hostCASigner cryptossh.Signer
 }
 
-func New(targets Targets) *Proxy {
-	return &Proxy{Targets: targets}
+func New(targets Targets, agentSocket func() string) *Proxy {
+	if agentSocket == nil {
+		agentSocket = func() string { return os.Getenv("SSH_AUTH_SOCK") }
+	}
+	return &Proxy{Targets: targets, AgentSocket: agentSocket}
 }
 
-func (p *Proxy) SyncConfig(ctx context.Context, host string, port int, dir string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
+// WriteConfig issues downstream credentials and writes the ssh config, private
+// key, and known_hosts under dir.
+func (p *Proxy) WriteConfig(host string, port int, dir string) error {
 	config, key, knownHosts, err := p.issue(host, port)
 	if err != nil {
 		return err
 	}
-
-	if err := writeFile(dir, ".ssh/config", 0o600, config); err != nil {
+	if err := util.WriteFileAtomic(filepath.Join(dir, ".ssh", "config"), 0o600, config); err != nil {
 		return fmt.Errorf("write ssh config: %w", err)
 	}
-	if err := writeFile(dir, ".ssh/id_ed25519", 0o600, key); err != nil {
+	if err := util.WriteFileAtomic(filepath.Join(dir, ".ssh", "id_ed25519"), 0o600, key); err != nil {
 		return fmt.Errorf("write ssh private key: %w", err)
 	}
-	if err := writeFile(dir, ".ssh/known_hosts", 0o600, knownHosts); err != nil {
+	if err := util.WriteFileAtomic(filepath.Join(dir, ".ssh", "known_hosts"), 0o600, knownHosts); err != nil {
 		return fmt.Errorf("write ssh known_hosts: %w", err)
 	}
-	slog.Info("synced ssh config", "dir", dir, "host", host, "port", port)
-
-	<-ctx.Done()
+	slog.Info("wrote ssh config", "dir", dir, "host", host, "port", port)
 	return nil
 }
 
+// issue generates the downstream key pair and renders the proxy config and
+// known_hosts signed by the proxy host CA.
 func (p *Proxy) issue(host string, port int) (config []byte, key []byte, knownHosts []byte, err error) {
-	if p == nil {
-		return nil, nil, nil, fmt.Errorf("ssh: nil Proxy")
-	}
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return nil, nil, nil, fmt.Errorf("ssh: empty proxy host")
@@ -284,15 +163,4 @@ func issuePrivateKey() ([]byte, string, error) {
 	}
 
 	return pem.EncodeToMemory(block), string(cryptossh.MarshalAuthorizedKey(sshPublicKey)), nil
-}
-
-func writeFile(root, name string, mode fs.FileMode, content []byte) error {
-	if strings.TrimSpace(root) == "" {
-		root = "."
-	}
-	path := filepath.Join(root, filepath.FromSlash(name))
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(path, content, mode)
 }

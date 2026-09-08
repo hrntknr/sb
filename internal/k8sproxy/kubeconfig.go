@@ -1,86 +1,47 @@
-package k8s
+package k8sproxy
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/hrntknr/secretbridge/pkg/util"
+	"github.com/hrntknr/secretbridge/internal/util"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-type Verb string
-
-const (
-	Read      Verb = "r"
-	ReadWrite Verb = "rw"
-)
-
-// Target grants Mode access to clusters matching the Cluster glob. A nil
-// Namespaces allows any namespace; otherwise only listed namespace globs are
-// allowed. ClusterScope permits cluster-scoped (non-namespaced) requests.
-type Target struct {
-	Mode         Verb
-	Cluster      string
-	Namespaces   []string
-	ClusterScope bool
-}
-type Targets []Target
-
-func (t Targets) Allows(verb Verb, cluster, namespace string) bool {
-	cluster = strings.TrimSpace(cluster)
-	namespace = strings.TrimSpace(namespace)
-	for _, rule := range t {
-		if !verbAllowed(rule.Mode, verb) {
-			continue
-		}
-		if !util.Match(rule.Cluster, cluster) {
-			continue
-		}
-		if namespace == "" {
-			if rule.ClusterScope {
-				return true
-			}
-			continue
-		}
-		if rule.allowsNamespace(namespace) {
-			return true
-		}
-	}
-	return false
-}
-
-func (target Target) allowsNamespace(namespace string) bool {
-	if target.Namespaces == nil {
-		return true
-	}
-	for _, pattern := range target.Namespaces {
-		if util.Match(pattern, namespace) {
-			return true
-		}
-	}
-	return false
-}
-
+// Proxy maps issued downstream tokens to kubeconfig contexts and proxies
+// requests to the upstream cluster of the resolved context.
 type Proxy struct {
 	Targets Targets
+	// host is the address downstream clients use to reach the proxy; it is
+	// written into the generated kubeconfig and covered by the TLS
+	// certificate.
+	host string
+
 	mu      sync.RWMutex
 	tokens  map[string]string
+	cert    tls.Certificate
+	certErr error
+	certOne sync.Once
 }
 
-func New(targets Targets) *Proxy { return &Proxy{Targets: targets} }
+func New(targets Targets, host string) *Proxy { return &Proxy{Targets: targets, host: host} }
 
 type kubeconfigFile struct {
 	APIVersion     string         `yaml:"apiVersion"`
@@ -97,8 +58,8 @@ type namedCluster struct {
 }
 
 type clusterConfig struct {
-	Server                string `yaml:"server"`
-	InsecureSkipTLSVerify bool   `yaml:"insecure-skip-tls-verify"`
+	Server                   string `yaml:"server"`
+	CertificateAuthorityData string `yaml:"certificate-authority-data,omitempty"`
 }
 
 type namedUser struct {
@@ -131,21 +92,23 @@ type kubeconfigState struct {
 	CurrentContext string
 }
 
-func (p *Proxy) SyncConfig(ctx context.Context, host string, port int, dir string) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// SyncConfig keeps the proxy kubeconfig under dir in sync with the source
+// kubeconfig. It writes the initial config, signals it once through ready,
+// and then follows source changes. current-context and namespace overrides
+// made inside the generated config are preserved across syncs.
+func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- struct{}) error {
 	if port <= 0 {
 		return fmt.Errorf("k8s: invalid proxy port")
 	}
 	if strings.TrimSpace(dir) == "" {
 		dir = "."
 	}
-
 	sourcePaths := clientcmd.NewDefaultClientConfigLoadingRules().GetLoadingPrecedence()
 	if len(sourcePaths) == 0 {
 		return fmt.Errorf("k8s: no kubeconfig paths")
 	}
+	// Register the watcher before the initial sync so a change landing
+	// between them is still picked up.
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("watch kubeconfig: %w", err)
@@ -161,7 +124,10 @@ func (p *Proxy) SyncConfig(ctx context.Context, host string, port int, dir strin
 		}
 	}
 
-	lastKey, err := p.syncConfigOnce(host, port, dir, ^uint32(0))
+	lastKey, err := p.syncConfigOnce(port, dir, ^uint32(0))
+	if ready != nil {
+		close(ready)
+	}
 	if err != nil {
 		return err
 	}
@@ -185,7 +151,7 @@ func (p *Proxy) SyncConfig(ctx context.Context, host string, port int, dir strin
 				continue
 			}
 			var nextKey uint32
-			nextKey, err = p.syncConfigOnce(host, port, dir, lastKey)
+			nextKey, err = p.syncConfigOnce(port, dir, lastKey)
 			if err != nil {
 				return err
 			}
@@ -196,7 +162,7 @@ func (p *Proxy) SyncConfig(ctx context.Context, host string, port int, dir strin
 	}
 }
 
-func (p *Proxy) syncConfigOnce(host string, port int, dir string, lastKey uint32) (uint32, error) {
+func (p *Proxy) syncConfigOnce(port int, dir string, lastKey uint32) (uint32, error) {
 	source, err := readSourceKubeconfig()
 	if err != nil {
 		return lastKey, err
@@ -227,27 +193,48 @@ func (p *Proxy) syncConfigOnce(host string, port int, dir string, lastKey uint32
 		}
 	}
 
-	content, tokens, err := renderKubeconfig(host, port, source.Contexts, currentContext)
+	content, tokens, err := p.renderKubeconfig(port, source.Contexts, currentContext)
 	if err != nil {
 		return lastKey, err
+	}
+	// Write the new file first; on failure the state stays consistent with
+	// the file still on disk.
+	if err := util.WriteFileAtomic(filepath.Join(dir, ".kube", "config"), 0o600, content); err != nil {
+		return lastKey, fmt.Errorf("write kubeconfig: %w", err)
 	}
 	p.mu.Lock()
 	p.tokens = tokens
 	p.mu.Unlock()
 
-	path := filepath.Join(dir, ".kube", "config")
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return lastKey, fmt.Errorf("write kubeconfig: %w", err)
-	}
-	if err := os.WriteFile(path, content, 0o600); err != nil {
-		return lastKey, fmt.Errorf("write kubeconfig: %w", err)
-	}
-	slog.Info("synced k8s config", "path", path, "contexts", len(source.Contexts), "current_context", currentContext)
+	slog.Info("synced k8s config", "path", filepath.Join(dir, ".kube", "config"), "contexts", len(source.Contexts), "current_context", currentContext)
 	return key, nil
 }
 
-func renderKubeconfig(host string, port int, contexts []kubeconfigContext, currentContext string) ([]byte, map[string]string, error) {
-	tokens := make(map[string]string, len(contexts))
+// renderKubeconfig builds the proxy-only kubeconfig with one downstream
+// token per context. Tokens of contexts that already exist are reused, so a
+// source rewrite does not invalidate credentials clients are still using.
+// The proxy's TLS certificate is embedded as the cluster trust anchor so
+// downstream clients verify the connection.
+func (p *Proxy) renderKubeconfig(port int, contexts []kubeconfigContext, currentContext string) ([]byte, map[string]string, error) {
+	certificate, err := p.certificate()
+	if err != nil {
+		return nil, nil, err
+	}
+	caData := base64.StdEncoding.EncodeToString(pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certificate.Certificate[0],
+	}))
+
+	p.mu.RLock()
+	oldTokens := p.tokens // token -> context
+	p.mu.RUnlock()
+	// Invert to context -> token so existing contexts keep their token.
+	existing := make(map[string]string, len(oldTokens))
+	for token, context := range oldTokens {
+		existing[context] = token
+	}
+	tokens := make(map[string]string, len(contexts)) // token -> context
+
 	config := kubeconfigFile{
 		APIVersion: "v1",
 		Kind:       "Config",
@@ -257,16 +244,20 @@ func renderKubeconfig(host string, port int, contexts []kubeconfigContext, curre
 	}
 	config.CurrentContext = currentContext
 	for _, context := range contexts {
-		token, err := randomToken()
-		if err != nil {
-			return nil, nil, fmt.Errorf("k8s: issue token for %q: %w", context.Name, err)
+		token, ok := existing[context.Name]
+		if !ok {
+			var err error
+			token, err = randomToken()
+			if err != nil {
+				return nil, nil, fmt.Errorf("k8s: issue token for %q: %w", context.Name, err)
+			}
 		}
 		tokens[token] = context.Name
 		config.Clusters = append(config.Clusters, namedCluster{
 			Name: context.Name,
 			Cluster: clusterConfig{
-				Server:                fmt.Sprintf("https://%s:%d/%s", host, port, url.PathEscape(context.Name)),
-				InsecureSkipTLSVerify: true,
+				Server:                   fmt.Sprintf("https://%s/%s", net.JoinHostPort(p.host, strconv.Itoa(port)), url.PathEscape(context.Name)),
+				CertificateAuthorityData: caData,
 			},
 		})
 		config.Users = append(config.Users, namedUser{
@@ -301,17 +292,8 @@ func (s kubeconfigState) key() uint32 {
 	return hash.Sum32()
 }
 
-func verbAllowed(ruleVerb, requested Verb) bool {
-	switch ruleVerb {
-	case ReadWrite:
-		return requested == Read || requested == ReadWrite
-	case Read:
-		return requested == Read
-	default:
-		return false
-	}
-}
-
+// readSourceKubeconfig loads context names, namespaces, and the current
+// context from the user's kubeconfig.
 func readSourceKubeconfig() (kubeconfigState, error) {
 	config, err := clientcmd.NewDefaultClientConfigLoadingRules().Load()
 	if err != nil {
@@ -329,9 +311,8 @@ func readSourceKubeconfig() (kubeconfigState, error) {
 
 	contexts := make([]kubeconfigContext, 0, len(contextNames))
 	for _, context := range contextNames {
-		contextConfig := config.Contexts[context]
 		namespace := ""
-		if contextConfig != nil {
+		if contextConfig := config.Contexts[context]; contextConfig != nil {
 			namespace = contextConfig.Namespace
 		}
 		contexts = append(contexts, kubeconfigContext{Name: context, Namespace: namespace})
@@ -339,6 +320,8 @@ func readSourceKubeconfig() (kubeconfigState, error) {
 	return newKubeconfigState(config.CurrentContext, contexts), nil
 }
 
+// readInnerKubeconfig reads back the previously generated proxy kubeconfig to
+// preserve user overrides of current-context and namespaces.
 func readInnerKubeconfig(path string) (kubeconfigState, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {

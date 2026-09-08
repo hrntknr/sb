@@ -1,7 +1,6 @@
-package ssh
+package sshproxy
 
 import (
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"os"
@@ -110,8 +109,22 @@ func TestHostCertPrincipalsIncludesLowercaseAlias(t *testing.T) {
 	}
 }
 
-func TestIssueInternalReturnsDirectProxyConfigAndKey(t *testing.T) {
-	config, key, knownHosts, err := New(Targets{{Host: "github.com"}, {Host: "*.example.net"}}).issue("proxy.local", testProxyPort)
+func TestNewDefaultsAgentSocketToEnvironment(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "/tmp/from-env")
+	if got := New(nil, nil).AgentSocket(); got != "/tmp/from-env" {
+		t.Fatalf("AgentSocket() = %q, want /tmp/from-env", got)
+	}
+}
+
+func TestNewUsesProvidedAgentSocketResolver(t *testing.T) {
+	proxy := New(nil, func() string { return "/tmp/custom-agent" })
+	if got := proxy.AgentSocket(); got != "/tmp/custom-agent" {
+		t.Fatalf("AgentSocket() = %q, want /tmp/custom-agent", got)
+	}
+}
+
+func TestIssueReturnsDirectProxyConfigAndKey(t *testing.T) {
+	config, key, knownHosts, err := New(Targets{{Host: "github.com"}, {Host: "*.example.net"}}, nil).issue("proxy.local", testProxyPort)
 	if err != nil {
 		t.Fatalf("issue() error = %v", err)
 	}
@@ -159,8 +172,8 @@ func TestIssueInternalReturnsDirectProxyConfigAndKey(t *testing.T) {
 	}
 }
 
-func TestIssueInternalRemembersIssuedPublicKey(t *testing.T) {
-	proxy := &Proxy{}
+func TestIssueRemembersIssuedPublicKey(t *testing.T) {
+	proxy := New(nil, nil)
 	_, key, _, err := proxy.issue("proxy.local", testProxyPort)
 	if err != nil {
 		t.Fatalf("issue() error = %v", err)
@@ -184,19 +197,12 @@ func TestIssueInternalRemembersIssuedPublicKey(t *testing.T) {
 	}
 }
 
-func TestIssueInternalDefaultsToAllHostsWhenTargetsAreEmpty(t *testing.T) {
-	config, _, knownHosts, err := (&Proxy{}).issue("proxy.local", testProxyPort)
-	if err != nil {
-		t.Fatalf("issue() error = %v", err)
+func TestIssueEmptyHostErrors(t *testing.T) {
+	if _, _, _, err := New(nil, nil).issue("", testProxyPort); err == nil {
+		t.Fatal("issue() with empty host should error")
 	}
-
-	configText := string(config)
-	if !strings.Contains(configText, "Host *") {
-		t.Fatalf("config = %q", configText)
-	}
-	knownHostsText := string(knownHosts)
-	if !strings.Contains(knownHostsText, "@cert-authority * ") {
-		t.Fatalf("known_hosts = %q", knownHostsText)
+	if _, _, _, err := New(nil, nil).issue("proxy.local", 0); err == nil {
+		t.Fatal("issue() with zero port should error")
 	}
 }
 
@@ -211,7 +217,7 @@ func TestCurrentUsernameReplacesDefaultMarker(t *testing.T) {
 }
 
 func TestParseSSHConfig(t *testing.T) {
-	config := parseSSHConfig([]byte("user alice\nhostname bastion.example\nport 2222\nidentityfile ~/.ssh/id_ed25519\nidentityfile none\ncertificatefile ~/.ssh/id_ed25519-cert.pub\ncertificatefile none\nproxycommand /usr/bin/nc bastion.example 22\nidentitiesonly yes\n"))
+	config := parseSSHConfig([]byte("user alice\nhostname bastion.example\nport 2222\nidentityfile ~/.ssh/id_ed25519\nidentityfile none\ncertificatefile ~/.ssh/id_ed25519-cert.pub\ncertificatefile none\nproxycommand /usr/bin/nc bastion.example 22\nuserknownhostsfile ~/.ssh/known_hosts /etc/ssh/ssh_known_hosts\nglobalknownhostsfile none\nstricthostkeychecking accept-new\nhostkeyalias bastion-alias\nknownhostscommand /usr/bin/fetch-keys %H\n"))
 	if config.User != "alice" || config.Host != "bastion.example" || config.Port != "2222" {
 		t.Fatalf("parseSSHConfig() = %#v", config)
 	}
@@ -224,8 +230,39 @@ func TestParseSSHConfig(t *testing.T) {
 	if config.ProxyCommand != "/usr/bin/nc bastion.example 22" {
 		t.Fatalf("proxy command = %q", config.ProxyCommand)
 	}
-	if !config.IdentitiesOnly {
-		t.Fatalf("identities only = false, want true")
+	if len(config.UserKnownHosts) != 2 || config.UserKnownHosts[0] != "~/.ssh/known_hosts" || config.UserKnownHosts[1] != "/etc/ssh/ssh_known_hosts" {
+		t.Fatalf("user known hosts = %#v", config.UserKnownHosts)
+	}
+	if len(config.GlobalKnownHosts) != 0 {
+		t.Fatalf("global known hosts = %#v, want none entries only", config.GlobalKnownHosts)
+	}
+	if config.StrictHostKeyChecking != "accept-new" {
+		t.Fatalf("strict host key checking = %q", config.StrictHostKeyChecking)
+	}
+	if config.HostKeyAlias != "bastion-alias" {
+		t.Fatalf("host key alias = %q", config.HostKeyAlias)
+	}
+	if config.KnownHostsCommand != "/usr/bin/fetch-keys %H" {
+		t.Fatalf("known hosts command = %q", config.KnownHostsCommand)
+	}
+}
+
+func TestMatchAddrPrefersHostKeyAlias(t *testing.T) {
+	tests := []struct {
+		name   string
+		config sshConfig
+		want   string
+	}{
+		{"resolved host", sshConfig{Host: "example.com", Port: "22"}, "example.com:22"},
+		{"non-default port", sshConfig{Host: "example.com", Port: "2222"}, "example.com:2222"},
+		{"alias", sshConfig{Host: "example.com", Port: "22", HostKeyAlias: "bastion"}, "bastion:22"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.matchAddr(); got != tt.want {
+				t.Fatalf("matchAddr() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -277,17 +314,14 @@ func TestCertificateSignersPairsCertificateWithMatchingSigner(t *testing.T) {
 	}
 }
 
-func TestSyncConfigWritesSSHFiles(t *testing.T) {
+func TestWriteConfigWritesSSHFiles(t *testing.T) {
 	dir := t.TempDir()
-	cancel := runSyncConfig(t, New(Targets{{Host: "github.com"}}), "proxy.local", dir)
-	defer cancel()
+	if err := New(Targets{{Host: "github.com"}}, nil).WriteConfig("proxy.local", testProxyPort, dir); err != nil {
+		t.Fatalf("WriteConfig() error = %v", err)
+	}
 
 	for _, name := range []string{".ssh/config", ".ssh/id_ed25519", ".ssh/known_hosts"} {
 		path := filepath.Join(dir, filepath.FromSlash(name))
-		waitFor(t, func() bool {
-			_, err := os.Stat(path)
-			return err == nil
-		})
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatalf("Stat(%s) error = %v", name, err)
@@ -298,7 +332,7 @@ func TestSyncConfigWritesSSHFiles(t *testing.T) {
 	}
 }
 
-func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
+func TestWriteConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 	wd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd() error = %v", err)
@@ -313,46 +347,33 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 		}
 	}()
 
-	cancel := runSyncConfig(t, &Proxy{}, "proxy.local", "")
-	defer cancel()
-	waitFor(t, func() bool {
-		_, err := os.Stat(filepath.Join(dir, ".ssh", "config"))
-		return err == nil
-	})
+	if err := New(nil, nil).WriteConfig("proxy.local", testProxyPort, ""); err != nil {
+		t.Fatalf("WriteConfig() error = %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(dir, ".ssh", "config")); err != nil {
 		t.Fatalf("Stat() error = %v", err)
 	}
 }
 
-func runSyncConfig(t *testing.T, proxy *Proxy, host, dir string) context.CancelFunc {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	errc := make(chan error, 1)
-	go func() {
-		errc <- proxy.SyncConfig(ctx, host, testProxyPort, dir)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-errc:
-			if err != nil {
-				t.Fatalf("SyncConfig() error = %v", err)
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("SyncConfig() did not stop")
-		}
-	})
-	return cancel
-}
-
-func waitFor(t *testing.T, ok func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if ok() {
-			return
-		}
-		time.Sleep(time.Millisecond)
+func TestValidPort(t *testing.T) {
+	tests := []struct {
+		port string
+		want bool
+	}{
+		{"22", true},
+		{"1", true},
+		{"65535", true},
+		{"0", false},
+		{"65536", false},
+		{"", false},
+		{"abc", false},
+		{"22a", false},
+		{"-1", false},
+		{"+22", false},
 	}
-	t.Fatalf("condition was not met")
+	for _, tt := range tests {
+		if got := validPort(tt.port); got != tt.want {
+			t.Errorf("validPort(%q) = %v, want %v", tt.port, got, tt.want)
+		}
+	}
 }

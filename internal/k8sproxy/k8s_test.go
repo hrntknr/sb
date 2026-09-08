@@ -1,8 +1,9 @@
-package k8s
+package k8sproxy
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -15,19 +16,21 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const testProxyPort = 16443
 
 func TestTargetsAllowReadWriteToIncludeRead(t *testing.T) {
 	targets := Targets{
-		{Mode: ReadWrite, Cluster: "pear", ClusterScope: true},
-		{Mode: Read, Cluster: "*", ClusterScope: true},
+		{Mode: ReadWrite, Context: "pear", ClusterScope: true},
+		{Mode: Read, Context: "*", ClusterScope: true},
 	}
 
 	tests := []struct {
 		verb      Verb
-		cluster   string
+		context   string
 		namespace string
 		want      bool
 	}{
@@ -40,8 +43,8 @@ func TestTargetsAllowReadWriteToIncludeRead(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := targets.Allows(tt.verb, tt.cluster, tt.namespace); got != tt.want {
-			t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.cluster, tt.namespace, got, tt.want)
+		if got := targets.Allows(tt.verb, tt.context, tt.namespace); got != tt.want {
+			t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.context, tt.namespace, got, tt.want)
 		}
 	}
 }
@@ -63,7 +66,7 @@ func TestEmptyTargetsDenyAll(t *testing.T) {
 }
 
 func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
-	targets := Targets{{Mode: ReadWrite, Cluster: "pear", ClusterScope: true}}
+	targets := Targets{{Mode: ReadWrite, Context: "pear", ClusterScope: true}}
 
 	if got := targets.Allows(Read, "Pear", "default"); got {
 		t.Fatalf("Allows(%q, %q) = %v, want false", Read, "Pear", got)
@@ -72,14 +75,14 @@ func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
 
 func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
 	targets := Targets{
-		{Mode: ReadWrite, Cluster: "prod", Namespaces: []string{"team-*"}},
-		{Mode: Read, Cluster: "*", ClusterScope: true},
+		{Mode: ReadWrite, Context: "prod", Namespaces: []string{"team-*"}},
+		{Mode: Read, Context: "*", ClusterScope: true},
 	}
 
 	tests := []struct {
 		name      string
 		verb      Verb
-		cluster   string
+		context   string
 		namespace string
 		want      bool
 	}{
@@ -92,10 +95,27 @@ func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := targets.Allows(tt.verb, tt.cluster, tt.namespace); got != tt.want {
-				t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.cluster, tt.namespace, got, tt.want)
+			if got := targets.Allows(tt.verb, tt.context, tt.namespace); got != tt.want {
+				t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.context, tt.namespace, got, tt.want)
 			}
 		})
+	}
+}
+
+// Regression: contexts pointing at the same cluster must be isolated by
+// context name, so a read-only context cannot gain write access just because
+// another context to the same cluster allows it.
+func TestTargetsIsolateSameClusterDifferentContexts(t *testing.T) {
+	targets := Targets{
+		{Mode: ReadWrite, Context: "dev", ClusterScope: true},
+		{Mode: Read, Context: "prod", ClusterScope: true},
+	}
+
+	if !targets.Allows(ReadWrite, "dev", "") {
+		t.Fatal("dev context should allow read-write")
+	}
+	if targets.Allows(ReadWrite, "prod", "") {
+		t.Fatal("prod context should deny read-write even though dev shares its cluster")
 	}
 }
 
@@ -106,102 +126,22 @@ func TestRequestVerbClassifiesKubernetesActions(t *testing.T) {
 		path   string
 		want   Verb
 	}{
-		{
-			name:   "list pods",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods",
-			want:   Read,
-		},
-		{
-			name:   "watch pods",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods",
-			want:   Read,
-		},
-		{
-			name:   "get pod logs",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods/nginx/log",
-			want:   Read,
-		},
-		{
-			name:   "create pod",
-			method: http.MethodPost,
-			path:   "/api/v1/namespaces/default/pods",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get pod exec",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods/nginx/exec",
-			want:   ReadWrite,
-		},
-		{
-			name:   "post pod exec",
-			method: http.MethodPost,
-			path:   "/api/v1/namespaces/default/pods/nginx/exec",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get pod attach",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods/nginx/attach",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get pod portforward",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods/nginx/portforward",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get pod proxy path",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/pods/nginx/proxy/api",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get service proxy",
-			method: http.MethodGet,
-			path:   "/api/v1/namespaces/default/services/web/proxy",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get node proxy",
-			method: http.MethodGet,
-			path:   "/api/v1/nodes/node-1/proxy/stats",
-			want:   ReadWrite,
-		},
-		{
-			name:   "get custom resource status",
-			method: http.MethodGet,
-			path:   "/apis/example.com/v1/namespaces/default/widgets/widget-1/status",
-			want:   Read,
-		},
-		{
-			name:   "patch custom resource status",
-			method: http.MethodPatch,
-			path:   "/apis/example.com/v1/namespaces/default/widgets/widget-1/status",
-			want:   ReadWrite,
-		},
-		{
-			name:   "create self subject access review",
-			method: http.MethodPost,
-			path:   "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
-			want:   Read,
-		},
-		{
-			name:   "create subject access review",
-			method: http.MethodPost,
-			path:   "/apis/authorization.k8s.io/v1/subjectaccessreviews",
-			want:   ReadWrite,
-		},
-		{
-			name:   "create local subject access review",
-			method: http.MethodPost,
-			path:   "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
-			want:   ReadWrite,
-		},
+		{name: "list pods", method: http.MethodGet, path: "/api/v1/namespaces/default/pods", want: Read},
+		{name: "watch pods", method: http.MethodGet, path: "/api/v1/namespaces/default/pods", want: Read},
+		{name: "get pod logs", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/log", want: Read},
+		{name: "create pod", method: http.MethodPost, path: "/api/v1/namespaces/default/pods", want: ReadWrite},
+		{name: "get pod exec", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/exec", want: ReadWrite},
+		{name: "post pod exec", method: http.MethodPost, path: "/api/v1/namespaces/default/pods/nginx/exec", want: ReadWrite},
+		{name: "get pod attach", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/attach", want: ReadWrite},
+		{name: "get pod portforward", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/portforward", want: ReadWrite},
+		{name: "get pod proxy path", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/proxy/api", want: ReadWrite},
+		{name: "get service proxy", method: http.MethodGet, path: "/api/v1/namespaces/default/services/web/proxy", want: ReadWrite},
+		{name: "get node proxy", method: http.MethodGet, path: "/api/v1/nodes/node-1/proxy/stats", want: ReadWrite},
+		{name: "get custom resource status", method: http.MethodGet, path: "/apis/example.com/v1/namespaces/default/widgets/widget-1/status", want: Read},
+		{name: "patch custom resource status", method: http.MethodPatch, path: "/apis/example.com/v1/namespaces/default/widgets/widget-1/status", want: ReadWrite},
+		{name: "create self subject access review", method: http.MethodPost, path: "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", want: Read},
+		{name: "create subject access review", method: http.MethodPost, path: "/apis/authorization.k8s.io/v1/subjectaccessreviews", want: ReadWrite},
+		{name: "create local subject access review", method: http.MethodPost, path: "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews", want: ReadWrite},
 	}
 
 	for _, tt := range tests {
@@ -262,9 +202,9 @@ func TestUpstreamRequestPath(t *testing.T) {
 }
 
 func TestRenderKubeconfig(t *testing.T) {
-	kubeconfig, _, err := renderKubeconfig("proxy.local", testProxyPort, []kubeconfigContext{{Name: "pear"}, {Name: "test"}}, "test")
+	kubeconfig, _, err := New(nil, "proxy.local").renderKubeconfig(testProxyPort, []kubeconfigContext{{Name: "pear"}, {Name: "test"}}, "test")
 	if err != nil {
-		t.Fatalf("issue() error = %v", err)
+		t.Fatalf("renderKubeconfig() error = %v", err)
 	}
 
 	text := string(kubeconfig)
@@ -273,6 +213,12 @@ func TestRenderKubeconfig(t *testing.T) {
 	}
 	if !strings.Contains(text, "server: https://proxy.local:16443/test") {
 		t.Fatalf("kubeconfig does not contain test proxy path: %q", text)
+	}
+	if !strings.Contains(text, "certificate-authority-data: ") {
+		t.Fatalf("kubeconfig does not embed the proxy CA: %q", text)
+	}
+	if strings.Contains(text, "insecure-skip-tls-verify") {
+		t.Fatalf("kubeconfig disables TLS verification: %q", text)
 	}
 	if strings.Count(text, "token:") != 2 {
 		t.Fatalf("kubeconfig = %q", text)
@@ -286,9 +232,9 @@ func TestRenderKubeconfig(t *testing.T) {
 }
 
 func TestRenderKubeconfigEscapesContextInProxyPath(t *testing.T) {
-	kubeconfig, _, err := renderKubeconfig("proxy.local", testProxyPort, []kubeconfigContext{{Name: "team/dev"}}, "team/dev")
+	kubeconfig, _, err := New(nil, "proxy.local").renderKubeconfig(testProxyPort, []kubeconfigContext{{Name: "team/dev"}}, "team/dev")
 	if err != nil {
-		t.Fatalf("issue() error = %v", err)
+		t.Fatalf("renderKubeconfig() error = %v", err)
 	}
 
 	text := string(kubeconfig)
@@ -298,11 +244,11 @@ func TestRenderKubeconfigEscapesContextInProxyPath(t *testing.T) {
 }
 
 func TestRenderKubeconfigIncludesNamespace(t *testing.T) {
-	kubeconfig, _, err := renderKubeconfig("proxy.local", testProxyPort, []kubeconfigContext{
+	kubeconfig, _, err := New(nil, "proxy.local").renderKubeconfig(testProxyPort, []kubeconfigContext{
 		{Name: "dev", Namespace: "apps"},
 	}, "dev")
 	if err != nil {
-		t.Fatalf("issue() error = %v", err)
+		t.Fatalf("renderKubeconfig() error = %v", err)
 	}
 
 	text := string(kubeconfig)
@@ -312,14 +258,14 @@ func TestRenderKubeconfigIncludesNamespace(t *testing.T) {
 }
 
 func TestRenderKubeconfigWithoutContexts(t *testing.T) {
-	kubeconfig, _, err := renderKubeconfig("proxy.local", testProxyPort, nil, "")
+	kubeconfig, _, err := New(nil, "proxy.local").renderKubeconfig(testProxyPort, nil, "")
 	if err != nil {
-		t.Fatalf("issue() error = %v", err)
+		t.Fatalf("renderKubeconfig() error = %v", err)
 	}
 	text := string(kubeconfig)
 	for _, want := range []string{"clusters: []", "users: []", "contexts: []"} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("issue() kubeconfig = %q, want %q", text, want)
+			t.Fatalf("kubeconfig = %q, want %q", text, want)
 		}
 	}
 }
@@ -330,7 +276,7 @@ func TestSyncConfigWritesEmptyKubeconfigWithoutContexts(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
 
-	cancel := runSyncConfig(t, New(nil), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -351,7 +297,7 @@ func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
-	cancel := runSyncConfig(t, New(nil), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -372,7 +318,7 @@ func TestSyncConfigUsesUpstreamCurrentContextInitially(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev")
-	cancel := runSyncConfig(t, New(nil), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -387,7 +333,7 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev")
-	cancel := runSyncConfig(t, New(nil), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -419,7 +365,7 @@ func TestSyncConfigUsesUpstreamNamespaceInitially(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "apps"}, "dev")
-	cancel := runSyncConfig(t, New(nil), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -434,7 +380,7 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "apps"}, "dev")
-	cancel := runSyncConfig(t, New(nil), "proxy.local", dir)
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -479,7 +425,7 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
-	cancel := runSyncConfig(t, New(nil), "proxy.local", "")
+	cancel := runSyncConfig(t, New(nil, "proxy.local"), "")
 	defer cancel()
 
 	waitFor(t, func() bool {
@@ -488,14 +434,8 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 	})
 }
 
-func TestServeRequiresListener(t *testing.T) {
-	if err := New(nil).Serve(nil); err == nil {
-		t.Fatalf("Serve() error = nil, want error")
-	}
-}
-
 func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
-	proxy := New(Targets{{Mode: ReadWrite, Cluster: "dev", ClusterScope: true}})
+	proxy := New(Targets{{Mode: ReadWrite, Context: "dev", ClusterScope: true}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev", nil)
@@ -508,13 +448,27 @@ func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
 	}
 }
 
+func TestServeRejectsInvalidToken(t *testing.T) {
+	proxy := New(Targets{{Mode: ReadWrite, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev/api", nil)
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	rec := httptest.NewRecorder()
+
+	proxy.serveHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestServeProxiesToUpstreamContext(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api" {
 			t.Fatalf("upstream path = %q, want /api", r.URL.Path)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer upstream-token" {
-			t.Fatalf("upstream Authorization = %q", got)
+			t.Fatalf("upstream Authorization = %q, got %q", "Bearer upstream-token", got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -524,7 +478,7 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -552,11 +506,72 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 	}
 }
 
+// Regression: two contexts pointing at the same cluster must stay isolated;
+// the read-only prod context must not gain write access to the shared
+// cluster.
+func TestServeIsolatesSameClusterDifferentContexts(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer dev-upstream-token" {
+			t.Errorf("upstream Authorization = %q, want dev upstream token", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeSharedClusterSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{
+		{Mode: ReadWrite, Context: "dev", ClusterScope: true},
+		{Mode: Read, Context: "prod", ClusterScope: true},
+	}, "localhost")
+	proxy.tokens = map[string]string{"dev-token": "dev", "prod-token": "prod"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+
+	req, err := http.NewRequest(http.MethodPost, "https://"+listener.Addr().String()+"/dev/api/v1/namespaces/default/pods", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer dev-token")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("dev Do() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("dev status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	req, err = http.NewRequest(http.MethodPost, "https://"+listener.Addr().String()+"/prod/api/v1/namespaces/default/pods", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer prod-token")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("prod Do() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("prod status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
 func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	idToken := testIDToken(t, time.Now().Add(time.Hour))
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+idToken {
-			t.Fatalf("upstream Authorization = %q", got)
+			t.Fatalf("upstream Authorization = %q, got %q", "Bearer "+idToken, got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -566,7 +581,7 @@ func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, idToken)
 
-	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -607,7 +622,7 @@ func TestServeProxiesOIDCAuthProviderPerContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCMultiContextSourceKubeconfig(t, sourcePath, upstream.URL, adminToken, pfnToken)
 
-	proxy := New(Targets{{Mode: Read, Cluster: "*", ClusterScope: true}})
+	proxy := New(Targets{{Mode: Read, Context: "*", ClusterScope: true}}, "localhost")
 	proxy.tokens = map[string]string{
 		"downstream-admin-token": "pfcp-yh1-01",
 		"downstream-pfn-token":   "pfcp-pfn-yh1-01",
@@ -645,7 +660,7 @@ func TestServeRefreshesOIDCAuthProviderAndPersistsUpstreamConfig(t *testing.T) {
 				t.Fatalf("ParseForm() error = %v", err)
 			}
 			if got := r.Form.Get("refresh_token"); got != "old-refresh" {
-				t.Fatalf("refresh_token = %q, want old-refresh", got)
+				t.Fatalf("refresh_token = %q, got %q", "old-refresh", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"access_token":"access","token_type":"Bearer","id_token":%q,"refresh_token":"new-refresh"}`, refreshedToken)
@@ -667,7 +682,7 @@ func TestServeRefreshesOIDCAuthProviderAndPersistsUpstreamConfig(t *testing.T) {
 	issuerCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.Certificate().Raw})
 	writeOIDCRefreshSourceKubeconfig(t, sourcePath, upstream.URL, issuer.URL, base64.StdEncoding.EncodeToString(issuerCA), testIDToken(t, time.Now().Add(-time.Hour)))
 
-	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -710,7 +725,7 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, oldToken)
 
-	proxy := New(Targets{{Mode: Read, Cluster: "dev", ClusterScope: true}})
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -744,13 +759,218 @@ func TestOIDCCacheHostIncludesContextAndAuthProviderConfig(t *testing.T) {
 	}
 }
 
-func runSyncConfig(t *testing.T, proxy *Proxy, host, dir string) context.CancelFunc {
+// Regression: the proxy certificate must cover the configured host so that
+// clients verifying against the embedded CA succeed for non-localhost
+// --host values (DNS names and IPs).
+func TestCertificateCoversConfiguredHost(t *testing.T) {
+	tests := []struct {
+		host string
+		dns  string
+		ip   net.IP
+	}{
+		{host: "host.docker.internal", dns: "host.docker.internal"},
+		{host: "192.0.2.10", ip: net.ParseIP("192.0.2.10")},
+	}
+	for _, tt := range tests {
+		certificate, err := New(nil, tt.host).certificate()
+		if err != nil {
+			t.Fatalf("certificate() error = %v", err)
+		}
+		cert, err := x509.ParseCertificate(certificate.Certificate[0])
+		if err != nil {
+			t.Fatalf("ParseCertificate() error = %v", err)
+		}
+		if tt.dns != "" {
+			found := false
+			for _, name := range cert.DNSNames {
+				if name == tt.dns {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("certificate for %q lacks DNS SAN, got %v", tt.host, cert.DNSNames)
+			}
+		}
+		if tt.ip != nil {
+			found := false
+			for _, ip := range cert.IPAddresses {
+				if ip.Equal(tt.ip) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("certificate for %q lacks IP SAN, got %v", tt.host, cert.IPAddresses)
+			}
+		}
+	}
+}
+
+// Regression: when writing the generated kubeconfig fails (e.g. a
+// downstream process replaced the output directory with a symlink), the
+// proxy's tokens must stay consistent with what is on disk and nothing may
+// be written through the symlink.
+func TestSyncConfigOnceKeepsTokensWhenWriteFails(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeSourceKubeconfig(t, sourcePath, "dev")
+
+	proxy := New(nil, "proxy.local")
+	proxy.mu.Lock()
+	proxy.tokens = map[string]string{"old-token": "dev"}
+	proxy.mu.Unlock()
+
+	dir := t.TempDir()
+	real := t.TempDir()
+	if err := os.Symlink(real, filepath.Join(dir, ".kube")); err != nil {
+		t.Fatalf("Symlink() error = %v", err)
+	}
+
+	if _, err := proxy.syncConfigOnce(testProxyPort, dir, ^uint32(0)); err == nil {
+		t.Fatal("syncConfigOnce() through symlinked .kube should fail")
+	}
+	proxy.mu.RLock()
+	_, ok := proxy.tokens["old-token"]
+	proxy.mu.RUnlock()
+	if !ok {
+		t.Fatal("tokens were replaced despite write failure")
+	}
+	if _, err := os.Stat(filepath.Join(real, "config")); !os.IsNotExist(err) {
+		t.Fatal("write escaped through symlinked .kube dir")
+	}
+}
+
+// The generated kubeconfig embeds the proxy CA; a client verifying against
+// it (instead of skipping verification) must succeed.
+func TestServeTLSVerifiedAgainstEmbeddedCA(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	content, _, err := proxy.renderKubeconfig(testProxyPort, []kubeconfigContext{{Name: "dev"}}, "dev")
+	if err != nil {
+		t.Fatalf("renderKubeconfig() error = %v", err)
+	}
+	var rendered kubeconfigFile
+	if err := yaml.Unmarshal(content, &rendered); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	caPEM, err := base64.StdEncoding.DecodeString(rendered.Clusters[0].Cluster.CertificateAuthorityData)
+	if err != nil {
+		t.Fatalf("DecodeString() error = %v", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		t.Fatal("embedded CA is not a valid certificate")
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+}
+
+// Regression: existing contexts keep their tokens across syncs so clients
+// reading the old kubeconfig are not rejected, while new contexts get fresh
+// tokens.
+func TestSyncConfigReusesTokensForExistingContexts(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeSourceKubeconfig(t, sourcePath, "dev")
+
+	proxy := New(nil, "proxy.local")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	errc := make(chan error, 1)
+	go func() {
+		errc <- proxy.SyncConfig(ctx, testProxyPort, dir, ready)
+	}()
+	<-ready
+
+	path := filepath.Join(dir, ".kube", "config")
+	waitFor(t, func() bool {
+		content, err := os.ReadFile(path)
+		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/dev")
+	})
+	devToken := contextToken(t, path, "dev")
+
+	writeSourceKubeconfig(t, sourcePath, "dev", "prod")
+	waitFor(t, func() bool {
+		content, err := os.ReadFile(path)
+		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/prod")
+	})
+	if got := contextToken(t, path, "dev"); got != devToken {
+		t.Fatalf("dev token was re-issued: %q, want %q", got, devToken)
+	}
+	if got := contextToken(t, path, "prod"); got == "" || got == devToken {
+		t.Fatalf("prod token = %q, want a fresh token", got)
+	}
+
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("SyncConfig() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SyncConfig() did not stop")
+	}
+}
+
+// contextToken reads the token issued for a context from a generated
+// kubeconfig.
+func contextToken(t *testing.T, path, context string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var rendered kubeconfigFile
+	if err := yaml.Unmarshal(content, &rendered); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	for _, user := range rendered.Users {
+		if user.Name == context {
+			return user.User.Token
+		}
+	}
+	return ""
+}
+
+func TestRenderKubeconfigIPv6Host(t *testing.T) {
+	kubeconfig, _, err := New(nil, "::1").renderKubeconfig(testProxyPort, []kubeconfigContext{{Name: "dev"}}, "dev")
+	if err != nil {
+		t.Fatalf("renderKubeconfig() error = %v", err)
+	}
+	if !strings.Contains(string(kubeconfig), "server: https://[::1]:16443/dev") {
+		t.Fatalf("kubeconfig does not bracket IPv6 host: %q", kubeconfig)
+	}
+}
+
+func runSyncConfig(t *testing.T, proxy *Proxy, dir string) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
+	ready := make(chan struct{})
 	go func() {
-		errc <- proxy.SyncConfig(ctx, host, testProxyPort, dir)
+		errc <- proxy.SyncConfig(ctx, testProxyPort, dir, ready)
 	}()
+	<-ready
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -823,6 +1043,26 @@ func writeUsableSourceKubeconfig(t *testing.T, path, server string) {
 		"- name: dev\n  user:\n    token: upstream-token\n" +
 		"contexts:\n" +
 		"- name: dev\n  context:\n    cluster: dev\n    user: dev\n" +
+		"current-context: dev\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
+func writeSharedClusterSourceKubeconfig(t *testing.T, path, server string) {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\nclusters:\n" +
+		"- name: shared\n  cluster:\n    server: " + server + "\n" +
+		"    insecure-skip-tls-verify: true\n" +
+		"users:\n" +
+		"- name: dev\n  user:\n    token: dev-upstream-token\n" +
+		"- name: prod\n  user:\n    token: prod-upstream-token\n" +
+		"contexts:\n" +
+		"- name: dev\n  context:\n    cluster: shared\n    user: dev\n" +
+		"- name: prod\n  context:\n    cluster: shared\n    user: prod\n" +
 		"current-context: dev\n"
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("MkdirAll() error = %v", err)

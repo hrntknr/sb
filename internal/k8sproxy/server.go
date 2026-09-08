@@ -1,4 +1,4 @@
-package k8s
+package k8sproxy
 
 import (
 	"crypto/ed25519"
@@ -32,14 +32,11 @@ var requestInfoFactory = &apirequest.RequestInfoFactory{
 	GrouplessAPIPrefixes: sets.NewString("api"),
 }
 
+// Serve accepts downstream requests whose path prefix names the kubeconfig
+// context ("/<context>/api/...") and whose bearer token was issued for that
+// context.
 func (p *Proxy) Serve(l net.Listener) error {
-	if p == nil {
-		return fmt.Errorf("k8s: nil Proxy")
-	}
-	if l == nil {
-		return fmt.Errorf("k8s: nil listener")
-	}
-	certificate, err := issueCertificate()
+	certificate, err := p.certificate()
 	if err != nil {
 		return fmt.Errorf("k8s: issue certificate: %w", err)
 	}
@@ -52,6 +49,55 @@ func (p *Proxy) Serve(l net.Listener) error {
 		},
 	}
 	return server.ServeTLS(l, "", "")
+}
+
+// certificate issues the proxy's self-signed TLS certificate once. The same
+// certificate is served and embedded in the generated kubeconfig as the
+// cluster trust anchor, and it covers the configured host.
+func (p *Proxy) certificate() (tls.Certificate, error) {
+	p.certOne.Do(func() {
+		p.cert, p.certErr = issueCertificate(p.host)
+	})
+	return p.cert, p.certErr
+}
+
+func issueCertificate(host string) (tls.Certificate, error) {
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	template := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "secretbridge"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(30 * 24 * time.Hour),
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	} else if host != "" {
+		template.DNSNames = append(template.DNSNames, host)
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, privateKey.Public(), privateKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+	)
 }
 
 func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +175,8 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
+// transportConfigForContext tags the rest config host so per-context OIDC
+// auth providers get separate transports (and token caches).
 func transportConfigForContext(config *rest.Config, context string) *rest.Config {
 	transportConfig := rest.CopyConfig(config)
 	if transportConfig.AuthProvider != nil && transportConfig.AuthProvider.Name == "oidc" {
@@ -153,6 +201,9 @@ func oidcCacheHost(host, context string, authProviderConfig map[string]string) s
 	return host + "#" + url.PathEscape(context) + ":" + hex.EncodeToString(hash.Sum(nil))
 }
 
+// classifyRequest maps a request to its policy verb and namespace. Read covers
+// get/list/watch and self-subject access reviews; everything else (including
+// exec/attach/portforward/proxy subresources) is read-write.
 func classifyRequest(method, path string) (Verb, string) {
 	info, err := requestInfoFactory.NewRequestInfo(&http.Request{
 		Method: method,
@@ -180,44 +231,12 @@ func classifyRequest(method, path string) (Verb, string) {
 	}
 }
 
+// upstreamRequestPath strips the context prefix: "/dev/api/v1/..." becomes
+// "/api/v1/...".
 func upstreamRequestPath(path string) (string, bool) {
 	path = strings.TrimPrefix(path, "/")
 	if _, rest, ok := strings.Cut(path, "/"); ok {
 		return "/" + rest, true
 	}
 	return "", false
-}
-
-func issueCertificate() (tls.Certificate, error) {
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, serialLimit)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	template := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "proxy"},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, privateKey.Public(), privateKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	)
 }
