@@ -7,7 +7,7 @@ UNAME_S := $(shell uname -s)
 .PHONY: build app install
 
 build:
-	$(GO) build -o secretbridge ./cmd/secretbridge
+	$(GO) build -o sb ./cmd/sb
 
 install: build
-	$(INSTALL) -m 0755 secretbridge $(PREFIX)/secretbridge
+	$(INSTALL) -m 0755 sb $(PREFIX)/sb

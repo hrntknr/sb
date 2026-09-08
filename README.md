@@ -1,39 +1,35 @@
-# secretbridge
+# sb
 
-`secretbridge` is a credential proxy that issues **scoped, policy-restricted credentials** instead of handing over your real SSH keys or kubeconfig, so you can mount them into another environment (a Docker container, an AI agent sandbox, etc.) and let it use them safely.
+`sb` is a credential proxy that issues **scoped, policy-restricted credentials** instead of handing over your real SSH keys or kubeconfig, so you can mount them into another environment (a Docker container, an AI agent sandbox, etc.) and let it use them safely.
 
 It generates `.ssh` / `.kube` under a given directory and proxies SSH and Kubernetes access while enforcing the policy defined in the config file.
 
 ## Getting Started
 
 ```
-$ secretbridge run -- -it ghcr.io/hrntknr/sh:full
+$ sb run -- -it ghcr.io/hrntknr/sh:full
 ```
 
 Or run the proxy manually and mount the generated credentials yourself:
 
 ```
 $ tmp=$(mktemp -d)
-$ secretbridge proxy $tmp &
+$ sb proxy $tmp &
 $ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.kube ghcr.io/hrntknr/sh:full
 ```
 
-## Running containers: `secretbridge run`
+## Running containers: `sb run`
 
-`secretbridge run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs your container with the scoped credentials mounted at `/root/.ssh` and `/root/.kube`. The container's exit code becomes secretbridge's.
+`sb run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs your container with the scoped credentials mounted at `/root/.ssh` and `/root/.kube`. The container's exit code becomes sb's.
 
-The runtime — docker, podman, or the apple container CLI (macOS) — is auto-detected in that order; override with `--runtime docker|podman|apple`. Everything after `--` (or plain arguments, when they don't start with `-`) is passed to the runtime's `run` command unchanged, so native options like `-v` and `-p` work as usual:
+The runtime — docker, podman, or the apple container CLI (macOS) — is auto-detected in that order; select one with `container.runtime` in the config. Everything after `--` (or plain arguments, when they don't start with `-`) is passed to the runtime's `run` command unchanged, so native options like `-v` and `-p` work as usual:
 
 ```
-$ secretbridge run alpine sh
-$ secretbridge run -- -v $PWD:/work -p 8080:80 -it node npm run dev
+$ sb run alpine sh
+$ sb run -- -v $PWD:/work -p 8080:80 -it node npm run dev
 ```
 
 The proxy listens on all interfaces and is reached through the runtime's host gateway, so the default bridged networking just works; with `--network host` (docker/podman) it falls back to `localhost`. Runtime compatibility is checked at startup, with hints for what to fix.
-
-| Flag        | Default | Description                                            |
-| ----------- | ------- | ------------------------------------------------------ |
-| `--runtime` | `auto`  | Container runtime: `auto`, `docker`, `podman`, `apple` |
 
 The shared flags (`--config`, `--log-level`, `--ssh-agent-env`) also apply; see [Flags](#flags).
 
@@ -49,7 +45,7 @@ Notes:
 
 ## Configuration
 
-By default the config is read from `$XDG_CONFIG_HOME/secretbridge/config.yaml` (typically `~/.config/secretbridge/config.yaml` on Linux). Use `--config` to point at any path.
+By default the config is read from `$XDG_CONFIG_HOME/sb/config.yaml` (typically `~/.config/sb/config.yaml` on Linux). Use `--config` to point at any path.
 
 ```yaml
 ssh:
@@ -72,6 +68,34 @@ k8s:
 
 `host`, `context`, `namespace`, and `commands` all support glob patterns (`*` matches any string, `?` matches a single character). `commands` is split into tokens and each token is matched.
 
+### Container: `container`
+
+The `container` section configures how `sb run` launches the container.
+
+```yaml
+container:
+  runtime: docker               # docker, podman, apple; default is auto-detect
+  image: ghcr.io/hrntknr/sh:full
+  mounts:
+    - ~/.claude:/root/.claude
+    - ~/.config/opencode:/root/.config/opencode
+    - ~/.cache/opencode:/root/.cache/opencode
+```
+
+`runtime` selects docker, podman, or apple (or `auto`, the default) for `sb run`.
+`mounts` entries are `<source>:<target>` in docker `-v` syntax; `~` in the source is expanded. The source must be an absolute path (after `~` expansion) and must exist — `run` fails early instead of letting the runtime create it as root.
+
+With `image` set, the arguments form the container command and no arguments at all runs the image's default command; use `--` when the command starts with `-`:
+
+```
+$ sb run claude
+$ sb run -- claude --settings '{"sandbox":{"enabled":false}}'
+```
+
+Without `image`, `run` behaves as before: all arguments are passed to the runtime's run command unchanged, so the first plain argument is the image.
+
+Entries from `conf.d/` are merged: `runtime` and `image` are overridden by later files, and `mounts` are appended with exact duplicates removed.
+
 k8s policy is keyed by **kubeconfig context name**. Contexts that point at the same cluster are isolated from each other, so granting `rw` to the `dev` context does not grant `rw` to a `prod` context even when both use the same cluster.
 
 ### Drop-in: `conf.d/`
@@ -79,7 +103,7 @@ k8s policy is keyed by **kubeconfig context name**. Contexts that point at the s
 Additional `*.yaml` (or `*.yml`) files placed in a `conf.d/` directory next to `config.yaml` are merged into the main config. Files are loaded in alphabetical order, so name them with a numeric prefix (e.g. `10-work.yaml`) to control precedence. Targets in later files with the same `host` (SSH) or `context` (k8s) override earlier ones; new targets are appended.
 
 ```
-~/.config/secretbridge/
+~/.config/sb/
   config.yaml
   conf.d/
     10-work.yaml
@@ -88,7 +112,7 @@ Additional `*.yaml` (or `*.yml`) files placed in a `conf.d/` directory next to `
 
 ### Reloading
 
-The config (including `conf.d/`) is watched and reloaded automatically; policy changes take effect without restarting secretbridge. A reload that fails (e.g. invalid yaml) keeps the previous config and retries on the next change.
+The config (including `conf.d/`) is watched and reloaded automatically; policy changes take effect without restarting sb. A reload that fails (e.g. invalid yaml) keeps the previous config and retries on the next change.
 
 ## Following ssh-agent restarts
 
@@ -97,11 +121,11 @@ Upstream SSH connections authenticate with the keys loaded in your ssh-agent. Th
 If the socket path changes across restarts, point `--ssh-agent-env` at a file that sets `SSH_AUTH_SOCK`. The file is parsed as shell source, so the raw output of `ssh-agent` works as-is:
 
 ```
-$ ssh-agent > ~/.cache/secretbridge-agent.env
-$ secretbridge proxy --ssh-agent-env ~/.cache/secretbridge-agent.env $tmp &
+$ ssh-agent > ~/.cache/sb-agent.env
+$ sb proxy --ssh-agent-env ~/.cache/sb-agent.env $tmp &
 ```
 
-When the flag is omitted, the `SSH_AUTH_SOCK` environment variable of the secretbridge process is used.
+When the flag is omitted, the `SSH_AUTH_SOCK` environment variable of the sb process is used.
 
 ## Transport verification
 
@@ -111,7 +135,7 @@ The generated kubeconfig embeds the proxy's TLS certificate (`certificate-author
 
 ## Flags
 
-Shared flags (available on every subcommand): `--config`, `--log-level`, and `--ssh-agent-env` (see the [ssh-agent section](#following-ssh-agent-restarts) for the latter). `secretbridge proxy` adds:
+Shared flags (available on every subcommand): `--config`, `--log-level`, and `--ssh-agent-env` (see the [ssh-agent section](#following-ssh-agent-restarts) for the latter). `sb proxy` adds:
 
 | Flag               | Default                              | Description                                             |
 | ------------------ | ------------------------------------ | ------------------------------------------------------- |
@@ -122,6 +146,6 @@ Shared flags (available on every subcommand): `--config`, `--log-level`, and `--
 ## Build
 
 ```
-$ make build      # produces ./secretbridge
+$ make build      # produces ./sb
 $ make install    # installs into $PREFIX (default ~/.local/bin)
 ```

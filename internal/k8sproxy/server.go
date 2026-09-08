@@ -73,7 +73,7 @@ func issueCertificate(host string) (tls.Certificate, error) {
 	}
 	template := x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "secretbridge"},
+		Subject:      pkix.Name{CommonName: "sb"},
 		NotBefore:    time.Now().Add(-time.Minute),
 		NotAfter:     time.Now().Add(30 * 24 * time.Hour),
 		DNSNames:     []string{"localhost"},

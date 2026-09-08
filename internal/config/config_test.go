@@ -4,11 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/hrntknr/secretbridge/internal/k8sproxy"
+	"github.com/hrntknr/sb/internal/k8sproxy"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -282,6 +283,144 @@ k8s:
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), `invalid mode "admin"`) {
 		t.Fatalf("Load() error = %v, want invalid mode error", err)
+	}
+}
+
+func TestLoadContainer(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `
+ssh:
+  - host: github.com
+container:
+  runtime: podman
+  image: ghcr.io/hrntknr/sh:full
+  mounts:
+    - ~/.claude:/root/.claude
+    - /srv/work:/work
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Container.Runtime != "podman" {
+		t.Errorf("Runtime = %q, want podman", cfg.Container.Runtime)
+	}
+	if cfg.Container.Image != "ghcr.io/hrntknr/sh:full" {
+		t.Errorf("Image = %q, want ghcr.io/hrntknr/sh:full", cfg.Container.Image)
+	}
+	want := []string{
+		filepath.Join(dir, ".claude") + ":/root/.claude",
+		"/srv/work:/work",
+	}
+	if !reflect.DeepEqual(cfg.Container.Mounts, want) {
+		t.Errorf("Mounts = %v, want %v", cfg.Container.Mounts, want)
+	}
+}
+
+func TestLoadContainerRuntimeValues(t *testing.T) {
+	for _, runtime := range []string{"", "auto", "docker", "podman", "apple"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		writeFile(t, path, "container:\n  runtime: "+runtime+"\n")
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load() with runtime %q error = %v", runtime, err)
+		}
+		if cfg.Container.Runtime != runtime {
+			t.Errorf("Runtime = %q, want %q", cfg.Container.Runtime, runtime)
+		}
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, "container:\n  runtime: containerd\n")
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), `unknown runtime "containerd"`) {
+		t.Fatalf("Load() error = %v, want unknown runtime error", err)
+	}
+}
+
+func TestLoadContainerAbsent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `
+ssh:
+  - host: github.com
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Container.Image != "" || cfg.Container.Mounts != nil {
+		t.Errorf("Container = %+v, want zero value", cfg.Container)
+	}
+}
+
+func TestLoadInvalidMountsError(t *testing.T) {
+	tests := []struct {
+		name   string
+		mount  string
+		wantIn string
+	}{
+		{"no target", "/srv", "want <source>:<target>"},
+		{"empty source", ":/root/x", "want <source>:<target>"},
+		{"relative source", "work:/work", "absolute path"},
+		{"relative target", "/srv:work", "absolute path"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			writeFile(t, path, "container:\n  mounts:\n    - "+tt.mount+"\n")
+
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), tt.wantIn) {
+				t.Fatalf("Load() error = %v, want error containing %q", err, tt.wantIn)
+			}
+		})
+	}
+}
+
+func TestLoadMergesContainerFromConfD(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	writeFile(t, filepath.Join(dir, "config.yaml"), `
+ssh:
+  - host: github.com
+container:
+  image: ghcr.io/hrntknr/sh:full
+  mounts:
+    - /srv/shared:/shared
+`)
+	writeFile(t, filepath.Join(dir, "conf.d", "agents.yaml"), `
+container:
+  runtime: podman
+  image: ghcr.io/hrntknr/sh:min
+  mounts:
+    - /srv/shared:/shared
+    - ~/.claude:/root/.claude
+`)
+
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Container.Runtime != "podman" {
+		t.Errorf("Runtime = %q, want conf.d to override the runtime", cfg.Container.Runtime)
+	}
+	if cfg.Container.Image != "ghcr.io/hrntknr/sh:min" {
+		t.Errorf("Image = %q, want conf.d to override the image", cfg.Container.Image)
+	}
+	want := []string{
+		"/srv/shared:/shared",
+		filepath.Join(dir, ".claude") + ":/root/.claude",
+	}
+	if !reflect.DeepEqual(cfg.Container.Mounts, want) {
+		t.Errorf("Mounts = %v, want %v", cfg.Container.Mounts, want)
 	}
 }
 

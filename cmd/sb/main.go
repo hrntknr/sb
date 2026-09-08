@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultConfigDir  = "secretbridge"
+	defaultConfigDir  = "sb"
 	defaultConfigFile = "config.yaml"
 	defaultListenAddr = ":0"
 )
@@ -43,7 +43,7 @@ type options struct {
 func newRootCommand() *cobra.Command {
 	opts := &options{}
 	root := &cobra.Command{
-		Use:           "secretbridge",
+		Use:           "sb",
 		Short:         "Issue scoped ssh and k8s credentials and expose them to containers",
 		SilenceErrors: true,
 	}

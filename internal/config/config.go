@@ -1,4 +1,4 @@
-// Package config loads the secretbridge policy config, merging drop-in files
+// Package config loads the sb policy config, merging drop-in files
 // from a conf.d directory next to the main config.
 package config
 
@@ -11,25 +11,43 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/hrntknr/secretbridge/internal/k8sproxy"
-	"github.com/hrntknr/secretbridge/internal/sshproxy"
-	"github.com/hrntknr/secretbridge/internal/util"
+	"github.com/hrntknr/sb/internal/k8sproxy"
+	"github.com/hrntknr/sb/internal/sshproxy"
+	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the merged policy for the ssh and k8s proxies.
+// Config is the merged policy for the ssh and k8s proxies and the
+// container settings for `sb run`.
 type Config struct {
 	SSH []sshproxy.Target
 	K8s []k8sproxy.Target
+	// Container configures how `sb run` launches the container.
+	Container Container
+}
+
+// Container is the `container` section of the config.
+type Container struct {
+	// Runtime selects docker, podman, or apple for `sb run`;
+	// empty or "auto" auto-detects. The --runtime flag overrides it.
+	Runtime string
+	// Image, when set, is the image `sb run` starts; its
+	// arguments then form the container command.
+	Image string
+	// Mounts are extra "source:target" volumes, with ~ expanded in the
+	// source.
+	Mounts []string
 }
 
 type file struct {
-	SSH []sshTarget `yaml:"ssh"`
-	K8s []k8sTarget `yaml:"k8s"`
+	SSH       []sshTarget    `yaml:"ssh"`
+	K8s       []k8sTarget    `yaml:"k8s"`
+	Container *containerFile `yaml:"container"`
 }
 
 type sshTarget struct {
@@ -41,6 +59,12 @@ type k8sTarget struct {
 	Context   string `yaml:"context"`
 	Mode      string `yaml:"mode"`
 	Namespace string `yaml:"namespace"`
+}
+
+type containerFile struct {
+	Runtime string   `yaml:"runtime"`
+	Image   string   `yaml:"image"`
+	Mounts  []string `yaml:"mounts"`
 }
 
 // Load reads path and merges any conf.d/*.yaml (or *.yml) files placed next to
@@ -163,7 +187,33 @@ func build(f file) (Config, error) {
 		}
 		k8s = append(k8s, target)
 	}
-	return Config{SSH: ssh, K8s: k8s}, nil
+
+	var container Container
+	if f.Container != nil {
+		container.Runtime = strings.TrimSpace(f.Container.Runtime)
+		switch container.Runtime {
+		case "", "auto", "docker", "podman", "apple":
+		default:
+			return Config{}, fmt.Errorf("container runtime: unknown runtime %q (want docker, podman, or apple)", container.Runtime)
+		}
+		container.Image = strings.TrimSpace(f.Container.Image)
+		container.Mounts = make([]string, 0, len(f.Container.Mounts))
+		for i, item := range f.Container.Mounts {
+			source, target, found := strings.Cut(item, ":")
+			source = util.ExpandHome(source)
+			if !found || strings.TrimSpace(source) == "" || strings.TrimSpace(target) == "" {
+				return Config{}, fmt.Errorf("mount %d: want <source>:<target>, got %q", i, item)
+			}
+			if !filepath.IsAbs(source) {
+				return Config{}, fmt.Errorf("mount %d: source must be an absolute path: %q", i, source)
+			}
+			if !filepath.IsAbs(target) {
+				return Config{}, fmt.Errorf("mount %d: target must be an absolute path: %q", i, target)
+			}
+			container.Mounts = append(container.Mounts, source+":"+target)
+		}
+	}
+	return Config{SSH: ssh, K8s: k8s, Container: container}, nil
 }
 
 func mergeConfDir(dir string, dst *Config) error {
@@ -209,6 +259,17 @@ func merge(dst *Config, src Config) {
 			dst.K8s[i] = target
 		} else {
 			dst.K8s = append(dst.K8s, target)
+		}
+	}
+	if src.Container.Runtime != "" {
+		dst.Container.Runtime = src.Container.Runtime
+	}
+	if src.Container.Image != "" {
+		dst.Container.Image = src.Container.Image
+	}
+	for _, mount := range src.Container.Mounts {
+		if !slices.Contains(dst.Container.Mounts, mount) {
+			dst.Container.Mounts = append(dst.Container.Mounts, mount)
 		}
 	}
 }

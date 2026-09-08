@@ -1,4 +1,4 @@
-module github.com/hrntknr/secretbridge
+module github.com/hrntknr/sb
 
 go 1.26.0
 

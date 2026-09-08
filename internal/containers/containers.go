@@ -1,6 +1,6 @@
 // Package containers wraps the local container runtime (docker, podman, or
 // the apple container CLI): it detects which one is installed, verifies it
-// can reach the host, and builds the arguments that mount secretbridge
+// can reach the host, and builds the arguments that mount sb
 // credentials into a container.
 package containers
 
@@ -135,9 +135,11 @@ func Parse(name string) (Runtime, error) {
 }
 
 // Args builds the runtime CLI arguments that run a container with the
-// secretbridge credentials under dir mounted at /root, followed by the
-// user's own arguments. host is the value ResolveHost returned.
-func Args(r Runtime, host, dir string, tty bool, userArgs []string) []string {
+// sb credentials under dir mounted at /root, followed by the
+// user's own arguments. host is the value ResolveHost returned. mounts are
+// extra "source:target" volumes. image, when non-empty, is inserted before
+// userArgs, which then form the container command.
+func Args(r Runtime, host, dir string, tty bool, mounts []string, image string, userArgs []string) []string {
 	args := []string{"run", "--rm"}
 	if r == Docker && host == dockerHost {
 		args = append(args, "--add-host", dockerHost+":host-gateway")
@@ -146,8 +148,14 @@ func Args(r Runtime, host, dir string, tty bool, userArgs []string) []string {
 		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh",
 		"-v", filepath.Join(dir, ".kube")+":/root/.kube",
 	)
+	for _, mount := range mounts {
+		args = append(args, "-v", mount)
+	}
 	if tty {
 		args = append(args, "-i", "-t")
+	}
+	if image != "" {
+		args = append(args, image)
 	}
 	return append(args, userArgs...)
 }
@@ -177,7 +185,7 @@ func checkApple() error {
 
 // HasDetach reports whether args detach the container (-d, --detach). The
 // run subcommand rejects this: the credentials live in a directory owned by
-// the secretbridge process, so the container cannot outlive it.
+// the sb process, so the container cannot outlive it.
 func HasDetach(args []string) bool {
 	for _, arg := range args {
 		if arg == "-d" || arg == "--detach" || strings.HasPrefix(arg, "--detach=") {

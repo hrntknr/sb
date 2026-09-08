@@ -13,13 +13,13 @@ import (
 	"sync"
 	"text/template"
 
-	"github.com/hrntknr/secretbridge/internal/util"
+	"github.com/hrntknr/sb/internal/util"
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
 const (
-	proxyHostAlias    = "secretbridge"
-	defaultUserMarker = "__secretbridge_default_user__"
+	proxyHostAlias    = "sb"
+	defaultUserMarker = "__sb_default_user__"
 	defaultPortMarker = "65535"
 )
 

@@ -3,7 +3,7 @@ package k8sproxy
 import (
 	"strings"
 
-	"github.com/hrntknr/secretbridge/internal/util"
+	"github.com/hrntknr/sb/internal/util"
 )
 
 type Verb string

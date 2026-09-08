@@ -13,6 +13,8 @@ func TestArgs(t *testing.T) {
 		runtime  Runtime
 		host     string
 		tty      bool
+		mounts   []string
+		image    string
 		userArgs []string
 		want     []string
 	}{
@@ -56,10 +58,46 @@ func TestArgs(t *testing.T) {
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"-i", "-t", "-v", "/work:/work", "ghcr.io/hrntknr/sh:full"},
 		},
+		{
+			name:     "config mounts come after credentials and before user args",
+			runtime:  Docker,
+			host:     "192.168.1.5",
+			tty:      true,
+			mounts:   []string{"/home/me/.claude:/root/.claude", "/home/me/.config/opencode:/root/.config/opencode"},
+			userArgs: []string{"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+			want: []string{"run", "--rm",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/home/me/.claude:/root/.claude",
+				"-v", "/home/me/.config/opencode:/root/.config/opencode",
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+		},
+		{
+			name:     "configured image precedes the command args",
+			runtime:  Docker,
+			host:     "192.168.1.5",
+			tty:      true,
+			mounts:   []string{"/home/me/.claude:/root/.claude"},
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"claude"},
+			want: []string{"run", "--rm",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/home/me/.claude:/root/.claude",
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "claude"},
+		},
+		{
+			name:    "configured image with no args runs the image default",
+			runtime: Docker,
+			host:    "192.168.1.5",
+			tty:     false,
+			image:   "ghcr.io/hrntknr/sh:full",
+			want: []string{"run", "--rm",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"ghcr.io/hrntknr/sh:full"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.tty, tt.userArgs)
+			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.tty, tt.mounts, tt.image, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Args() = %v, want %v", got, tt.want)
 			}

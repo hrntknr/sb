@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hrntknr/secretbridge/internal/util"
+	"github.com/hrntknr/sb/internal/util"
 	"mvdan.cc/sh/v3/syntax"
 )
 

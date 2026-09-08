@@ -9,14 +9,14 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hrntknr/secretbridge/internal/agentenv"
-	"github.com/hrntknr/secretbridge/internal/config"
-	"github.com/hrntknr/secretbridge/internal/k8sproxy"
-	"github.com/hrntknr/secretbridge/internal/sshproxy"
+	"github.com/hrntknr/sb/internal/agentenv"
+	"github.com/hrntknr/sb/internal/config"
+	"github.com/hrntknr/sb/internal/k8sproxy"
+	"github.com/hrntknr/sb/internal/sshproxy"
 	"github.com/spf13/cobra"
 )
 
-// newProxyCommand builds `secretbridge proxy <dir>`: the credential proxy
+// newProxyCommand builds `sb proxy <dir>`: the credential proxy
 // without any container management.
 func newProxyCommand(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
@@ -29,7 +29,7 @@ func newProxyCommand(opts *options) *cobra.Command {
 			if err := configureLogger(opts.logLevel); err != nil {
 				return err
 			}
-			slog.Info("starting secretbridge proxy", "config", opts.configPath, "host", opts.host, "ssh_listen", opts.sshListen, "k8s_listen", opts.k8sListen, "dir", args[0])
+			slog.Info("starting sb proxy", "config", opts.configPath, "host", opts.host, "ssh_listen", opts.sshListen, "k8s_listen", opts.k8sListen, "dir", args[0])
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			proxy, err := startProxy(ctx, *opts, args[0])

@@ -20,7 +20,7 @@ import (
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/hrntknr/secretbridge/internal/util"
+	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/tools/clientcmd"
 )
