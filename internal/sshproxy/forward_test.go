@@ -56,6 +56,136 @@ func startUpstream(t *testing.T, payload []byte) string {
 	return listener.Addr().String()
 }
 
+// startSessionUpstream starts an ssh server whose session channels echo
+// "ok", send "exit-status 0", and close, like sshd after a successful
+// command.
+func startSessionUpstream(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				server, chans, reqs, err := cryptossh.NewServerConn(conn, testServerConfig(t))
+				if err != nil {
+					conn.Close()
+					return
+				}
+				defer server.Close()
+				go cryptossh.DiscardRequests(reqs)
+				for ch := range chans {
+					if ch.ChannelType() != "session" {
+						ch.Reject(cryptossh.UnknownChannelType, "session required")
+						continue
+					}
+					channel, requests, err := ch.Accept()
+					if err != nil {
+						continue
+					}
+					go func() {
+						defer channel.Close()
+						for req := range requests {
+							if req.Type != "exec" {
+								if req.WantReply {
+									req.Reply(false, nil)
+								}
+								continue
+							}
+							req.Reply(true, nil)
+							_, _ = channel.Write([]byte("ok"))
+							_, _ = channel.SendRequest("exit-status", false, cryptossh.Marshal(struct{ Status uint32 }{0}))
+							_ = channel.CloseWrite()
+							return
+						}
+					}()
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// startChannelInner starts a downstream ssh server that hands accepted
+// channels to the handler, like the proxy's inner layer does.
+func startChannelInner(t *testing.T, handle func(cryptossh.NewChannel)) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				server, chans, reqs, err := cryptossh.NewServerConn(conn, testServerConfig(t))
+				if err != nil {
+					conn.Close()
+					return
+				}
+				defer server.Close()
+				go cryptossh.DiscardRequests(reqs)
+				for ch := range chans {
+					handle(ch)
+				}
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// forwardChannel must deliver the upstream exit-status request before the
+// downstream channel closes, or clients report the session as failed (ssh
+// exits 255; ansible marks hosts unreachable). Regression test: pipe used to
+// close the downstream channel while the exit-status request was still in
+// flight.
+func TestForwardChannelDeliversExitStatus(t *testing.T) {
+	upstream, err := cryptossh.Dial("tcp", startSessionUpstream(t), testClientConfig(t))
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer upstream.Close()
+
+	newChannels := make(chan cryptossh.NewChannel)
+	innerAddr := startChannelInner(t, func(ch cryptossh.NewChannel) { newChannels <- ch })
+	go func() {
+		for ch := range newChannels {
+			go forwardChannel(upstream, ch, nil)
+		}
+	}()
+
+	downstream, err := cryptossh.Dial("tcp", innerAddr, testClientConfig(t))
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer downstream.Close()
+
+	const iterations = 20
+	for i := 0; i < iterations; i++ {
+		session, err := downstream.NewSession()
+		if err != nil {
+			t.Fatalf("iteration %d: NewSession() error = %v", i, err)
+		}
+		if err := session.Start("true"); err != nil {
+			t.Fatalf("iteration %d: Start() error = %v (%T); exit status was not delivered before close", i, err, err)
+		}
+		if err := session.Wait(); err != nil {
+			t.Fatalf("iteration %d: Wait() error = %v (%T); exit status was not delivered before close", i, err, err)
+		}
+		session.Close()
+	}
+}
+
 // startInner starts a downstream ssh server like the proxy's inner layer and
 // returns its address. The downstream client's global requests arrive on
 // the returned channel; relaying them to an upstream client is the caller's

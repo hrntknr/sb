@@ -2,6 +2,7 @@ package sshproxy
 
 import (
 	"io"
+	"sync"
 
 	cryptossh "golang.org/x/crypto/ssh"
 )
@@ -19,31 +20,57 @@ func forwardChannel(upstream *cryptossh.Client, ch cryptossh.NewChannel, allow f
 		remote.Close()
 		return
 	}
-	go forwardRequests(localRequests, remote, allow)
-	go forwardRequests(remoteRequests, local, nil)
-	pipe(local, remote)
+	// pending tracks in-flight request forwarding so the channel is not
+	// closed while a request reply (e.g. the "exec" success reply) is
+	// still on its way back to the downstream client.
+	var pending sync.WaitGroup
+	go func() {
+		forwardRequests(localRequests, remote, allow, &pending)
+		// The downstream channel closed; close the upstream too so remote
+		// commands do not outlive the client that started them.
+		_ = remote.Close()
+	}()
+	pipe(local, remote, remoteRequests, &pending)
 }
 
-func pipe(local, remote cryptossh.Channel) {
+// pipe bridges data between the downstream (local) and upstream (remote)
+// channels, relaying upstream requests to the downstream. The downstream
+// channel is closed only after the upstream channel closed and in-flight
+// requests finished, so requests the upstream sent before closing
+// (exit-status, exit-signal) are always delivered first; without this,
+// clients miss the remote exit status and report the session as a connection
+// failure.
+func pipe(local, remote cryptossh.Channel, upstreamRequests <-chan *cryptossh.Request, pending *sync.WaitGroup) {
 	go func() {
 		_, _ = io.Copy(remote, local)
 		_ = remote.CloseWrite()
 	}()
+	relayed := make(chan struct{})
+	go func() {
+		for req := range upstreamRequests {
+			forwardRequest(local, req)
+		}
+		close(relayed)
+	}()
 	_, _ = io.Copy(local, remote)
 	_ = local.CloseWrite()
+	<-relayed
+	pending.Wait()
 	_ = local.Close()
 	_ = remote.Close()
 }
 
-func forwardRequests(requests <-chan *cryptossh.Request, channel cryptossh.Channel, allow func(*cryptossh.Request) bool) {
+func forwardRequests(requests <-chan *cryptossh.Request, channel cryptossh.Channel, allow func(*cryptossh.Request) bool, pending *sync.WaitGroup) {
 	for req := range requests {
+		pending.Add(1)
 		if allow != nil && !allow(req) {
 			if req.WantReply {
 				req.Reply(false, nil)
 			}
-			continue
+		} else {
+			forwardRequest(channel, req)
 		}
-		forwardRequest(channel, req)
+		pending.Done()
 	}
 }
 
@@ -78,19 +105,20 @@ func forwardGlobalRequests(requests <-chan *cryptossh.Request, upstream *cryptos
 // (forwarded-tcpip) back on the downstream client connection.
 func reverseForwardChannels(server *cryptossh.ServerConn, upstream *cryptossh.Client) {
 	for ch := range upstream.HandleChannelOpen("forwarded-tcpip") {
-		remote, requests, err := server.OpenChannel("forwarded-tcpip", ch.ExtraData())
+		downstream, downstreamRequests, err := server.OpenChannel("forwarded-tcpip", ch.ExtraData())
 		if err != nil {
 			ch.Reject(cryptossh.ConnectionFailed, err.Error())
 			continue
 		}
-		go cryptossh.DiscardRequests(requests)
+		go cryptossh.DiscardRequests(downstreamRequests)
 		go func() {
-			local, _, err := ch.Accept()
+			upstreamCh, upstreamRequests, err := ch.Accept()
 			if err != nil {
-				remote.Close()
+				downstream.Close()
 				return
 			}
-			go pipe(local, remote)
+			var pending sync.WaitGroup
+			go pipe(downstream, upstreamCh, upstreamRequests, &pending)
 		}()
 	}
 }
