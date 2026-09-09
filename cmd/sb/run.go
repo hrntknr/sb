@@ -18,6 +18,7 @@ import (
 
 func newRunCommand(opts *options) *cobra.Command {
 	var name, network string
+	var init bool
 	cmd := &cobra.Command{
 		Use:   "run [--] <command>...",
 		Short: "Run a container with sb credentials",
@@ -39,23 +40,29 @@ sb exec can target it:
 
 --network selects the container's network:
 
-  sb run --network host zsh -l`,
+  sb run --network host zsh -l
+
+--init runs the command under an init process as PID 1 that
+forwards signals and reaps zombie processes:
+
+  sb run --init zsh -l`,
 		Args:          cobra.ArbitraryArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runContainer(cmd, *opts, name, network, args)
+			return runContainer(cmd, *opts, name, network, init, args)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "default", "name for the container, targeted by sb exec")
 	cmd.Flags().StringVar(&network, "network", "", "network for the container (with host, the proxy is reached as localhost)")
+	cmd.Flags().BoolVar(&init, "init", false, "run an init process as PID 1 that forwards signals and reaps zombies")
 	// Flags after the first plain argument belong to the container
 	// command, not to sb.
 	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
-func runContainer(cmd *cobra.Command, opts options, name, network string, userArgs []string) error {
+func runContainer(cmd *cobra.Command, opts options, name, network string, init bool, userArgs []string) error {
 	if err := configureLogger(opts.logLevel); err != nil {
 		return err
 	}
@@ -99,7 +106,7 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, userAr
 	go func() { proxyErr <- proxy.Wait() }()
 
 	tty := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, name, network, cfg.Container.Environments, tty, cfg.Container.Mounts, image, userArgs)...)
+	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, name, network, cfg.Container.Environments, tty, cfg.Container.Mounts, image, init, userArgs)...)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := child.Start(); err != nil {
 		stop()

@@ -19,6 +19,7 @@ func TestArgs(t *testing.T) {
 		tty      bool
 		mounts   []string
 		image    string
+		init     bool
 		userArgs []string
 		want     []string
 	}{
@@ -29,7 +30,19 @@ func TestArgs(t *testing.T) {
 			tty:      true,
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+		},
+		{
+			name:     "init flag comes after the cidfile",
+			runtime:  Docker,
+			host:     dockerHost,
+			tty:      true,
+			image:    "ghcr.io/hrntknr/sh:full",
+			init:     true,
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--init", "--add-host", "host.docker.internal:host-gateway",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
@@ -44,7 +57,7 @@ func TestArgs(t *testing.T) {
 			mounts:   []string{"/home/me/.claude:/root/.claude"},
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
 				"--env", "FOO=bar", "--env", "LANG",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"-v", "/home/me/.claude:/root/.claude",
@@ -57,7 +70,7 @@ func TestArgs(t *testing.T) {
 			tty:      false,
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
@@ -68,7 +81,7 @@ func TestArgs(t *testing.T) {
 			tty:      false,
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"npm", "install"},
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"ghcr.io/hrntknr/sh:full", "npm", "install"},
 		},
@@ -79,7 +92,7 @@ func TestArgs(t *testing.T) {
 			tty:      true,
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
@@ -91,7 +104,7 @@ func TestArgs(t *testing.T) {
 			mounts:   []string{"/home/me/.claude:/root/.claude", "/home/me/.config/opencode:/root/.config/opencode"},
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-v", "/home/me/.config/opencode:/root/.config/opencode",
@@ -103,14 +116,14 @@ func TestArgs(t *testing.T) {
 			host:    "192.168.1.5",
 			tty:     false,
 			image:   "ghcr.io/hrntknr/sh:full",
-			want: []string{"run", "--rm", "--init", "--cidfile", "/tmp/sb/cid",
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
 				"ghcr.io/hrntknr/sh:full"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.image, tt.userArgs)
+			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.image, tt.init, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Args() = %v, want %v", got, tt.want)
 			}

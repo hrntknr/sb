@@ -147,12 +147,16 @@ func Parse(name string) (Runtime, error) {
 // --network. envs are environment variables (KEY=VALUE, or just KEY to
 // inherit from sb's own environment). mounts are extra "source:target"
 // volumes. image is inserted before userArgs, which form the container
-// command. --init runs an init process as PID 1 that forwards signals
-// and reaps zombies, which the user's command (a shell, node, ...) would
-// not do on its own. The runtime records the container ID in a cidfile
-// under dir, for ForceRemove.
-func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts []string, image string, userArgs []string) []string {
-	args := []string{"run", "--rm", "--init", "--cidfile", cidFile(dir)}
+// command. init, when set, passes --init so the command runs under an
+// init process as PID 1 that forwards signals and reaps zombies, which
+// the user's command (a shell, node, ...) would not do on its own. The
+// runtime records the container ID in a cidfile under dir, for
+// ForceRemove.
+func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts []string, image string, init bool, userArgs []string) []string {
+	args := []string{"run", "--rm", "--cidfile", cidFile(dir)}
+	if init {
+		args = append(args, "--init")
+	}
 	if name != "" {
 		args = append(args, "--name", name)
 	}
