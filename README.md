@@ -93,6 +93,8 @@ proxy:
 
 `host`, `context`, `namespace`, and `commands` all support glob patterns (`*` matches any string, `?` matches a single character). `commands` is split into tokens and each token is matched.
 
+SSH `host` rules match the `HostName` resolved by `ssh -G` on the machine running sb, not the alias typed by the client. For example, `Host gw` with `HostName g.hrntknr.net` matches a policy for `*.hrntknr.net`.
+
 ### Container: `container`
 
 The `container` section configures how `sb run` launches the container.
@@ -158,6 +160,8 @@ with `proxy.sshAgentEnv: ~/.cache/sb-agent.env` in the config. When unset, the `
 Upstream SSH connections verify host keys against your known_hosts, honoring the `StrictHostKeyChecking` of your ssh config. `no` disables verification; `accept-new` trusts unknown keys on first use and records them; anything else (including the default `ask`, which cannot prompt here) requires the host key to be already known — connect once directly (`ssh <host>`) to record it. `HostKeyAlias` is honored like ssh; `KnownHostsCommand` is not supported and fails closed.
 
 The generated kubeconfig embeds the proxy's TLS certificate (`certificate-authority-data`), so downstream kubectl verifies the proxy's TLS connection instead of skipping verification. The certificate covers `localhost`, `127.0.0.1`, `::1`, and the `--host` value.
+
+SSH host key negotiation prioritizes key types already registered for the target in user and global known_hosts files, including hashed entries and `HostKeyAlias`. RSA keys support SHA-2 signatures, and trusted host CAs can sign host certificates of any supported key type. The negotiated key is still verified against known_hosts.
 
 ## Flags
 

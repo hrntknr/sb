@@ -393,3 +393,20 @@ func TestValidPort(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveTargetMatchesResolvedHostname(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nprintf 'hostname gateway.example.net\\nuser alice\\nport 22\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	proxy := New(Targets{{Host: "*.example.net", Commands: []string{"cat"}}}, nil)
+	cfg, capability, ok := proxy.resolveTarget("proxy-ssh alice gw 22")
+	if !ok || cfg.Host != "gateway.example.net" || cfg.RequestedHost != "gw" || !capability.AllowsExec("cat /etc/hosts") {
+		t.Fatalf("resolveTarget() = %+v, %+v, %v", cfg, capability, ok)
+	}
+	proxy.SetTargets(Targets{{Host: "gw", Commands: []string{"*"}}})
+	if _, _, ok := proxy.resolveTarget("proxy-ssh alice gw 22"); ok {
+		t.Fatal("requested alias granted access to an unlisted resolved hostname")
+	}
+}

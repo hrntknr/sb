@@ -26,6 +26,12 @@ func testSigner(t *testing.T) cryptossh.Signer {
 	return signer
 }
 
+func hostKeyCallback(config sshConfig) (cryptossh.HostKeyCallback, error) {
+	var client cryptossh.ClientConfig
+	err := configureHostKey(config, &client)
+	return client.HostKeyCallback, err
+}
+
 func writeKnownHosts(t *testing.T, entries ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "known_hosts")

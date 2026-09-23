@@ -6,35 +6,61 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/hrntknr/sb/internal/util"
+	knownhostsdb "github.com/skeema/knownhosts"
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
-// hostKeyCallback verifies upstream host keys against the user's ssh
+// configureHostKey verifies upstream host keys against the user's ssh
 // known_hosts, honoring the ssh config. Matching (and accept-new recording)
 // is keyed by HostKeyAlias when set, like ssh, and the resolved HostName
 // otherwise. "no" disables verification; "accept-new" trusts unknown keys on
 // first use and records them; anything else (including the default "ask",
 // which cannot prompt here) requires the key to be already known.
 // KnownHostsCommand is not supported and fails closed.
-func hostKeyCallback(config sshConfig) (cryptossh.HostKeyCallback, error) {
+func configureHostKey(config sshConfig, client *cryptossh.ClientConfig) error {
 	if config.KnownHostsCommand != "" {
-		return nil, fmt.Errorf("ssh: knownhostscommand is not supported; verify via known_hosts files or set strict-host-key-checking=no")
+		return fmt.Errorf("ssh: knownhostscommand is not supported; verify via known_hosts files or set strict-host-key-checking=no")
 	}
 	if strings.ToLower(strings.TrimSpace(config.StrictHostKeyChecking)) == "no" {
-		return cryptossh.InsecureIgnoreHostKey(), nil
+		client.HostKeyCallback = cryptossh.InsecureIgnoreHostKey()
+		return nil
 	}
-	known, err := knownhosts.New(existingKnownHostsFiles(config)...)
+	db, err := knownhostsdb.NewDB(existingKnownHostsFiles(config)...)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	known := db.HostKeyCallback()
 	matchAddr := config.matchAddr()
+	supported := cryptossh.SupportedAlgorithms().HostKeys
+	for _, key := range db.HostKeys(matchAddr) {
+		if key.Cert {
+			// A CA can sign host keys of any type, independently of its own key type.
+			for _, algorithm := range supported {
+				if strings.Contains(algorithm, "-cert-") {
+					client.HostKeyAlgorithms = append(client.HostKeyAlgorithms, algorithm)
+				}
+			}
+			break
+		}
+	}
+	for _, algorithm := range db.HostKeyAlgorithms(matchAddr) {
+		if slices.Contains(supported, algorithm) && !slices.Contains(client.HostKeyAlgorithms, algorithm) {
+			client.HostKeyAlgorithms = append(client.HostKeyAlgorithms, algorithm)
+		}
+	}
+	for _, algorithm := range supported {
+		if !slices.Contains(client.HostKeyAlgorithms, algorithm) {
+			client.HostKeyAlgorithms = append(client.HostKeyAlgorithms, algorithm)
+		}
+	}
 	recordPath := recordableKnownHostsFile(config)
 	acceptNew := strings.ToLower(strings.TrimSpace(config.StrictHostKeyChecking)) == "accept-new"
-	return func(_ string, remote net.Addr, key cryptossh.PublicKey) error {
+	client.HostKeyCallback = func(_ string, remote net.Addr, key cryptossh.PublicKey) error {
 		err := known(matchAddr, remote, key)
 		if err == nil {
 			return nil
@@ -49,7 +75,8 @@ func hostKeyCallback(config sshConfig) (cryptossh.HostKeyCallback, error) {
 			return fmt.Errorf("host key verification failed for %s: %w", matchAddr, err)
 		}
 		return nil
-	}, nil
+	}
+	return nil
 }
 
 // isUnknownHost reports whether the error is an unknown-host KeyError (no

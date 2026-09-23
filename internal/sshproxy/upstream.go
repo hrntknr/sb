@@ -147,15 +147,13 @@ func dialUpstream(config sshConfig, agentSocketPath string) (*cryptossh.Client, 
 		// The agent connection is only needed to sign during the handshake.
 		defer agentConn.Close()
 	}
-	hostKey, err := hostKeyCallback(config)
-	if err != nil {
-		return nil, config.wrapError(err)
-	}
 	clientConfig := &cryptossh.ClientConfig{
-		User:            config.User,
-		Auth:            auth,
-		HostKeyCallback: hostKey,
-		Timeout:         30 * time.Second,
+		User:    config.User,
+		Auth:    auth,
+		Timeout: 30 * time.Second,
+	}
+	if err := configureHostKey(config, clientConfig); err != nil {
+		return nil, config.wrapError(err)
 	}
 	if config.ProxyCommand != "" && !strings.EqualFold(config.ProxyCommand, "none") {
 		return config.wrapClient(dialUpstreamProxyCommand(config.ProxyCommand, config.matchAddr(), clientConfig))
