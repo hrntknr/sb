@@ -686,3 +686,57 @@ func TestGeneratedCAAuthenticatesProxy(t *testing.T) {
 		t.Fatalf("status = %d", response.StatusCode)
 	}
 }
+
+// TestShutdownCutsLingeringRequestAtDeadline covers the deadline of the stop
+// flow: a request the upstream never completes (logs -f, long polls) is cut
+// at the deadline, not waited for.
+func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
+	p, _ := awsTestProxy(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	release := make(chan struct{})
+	defer close(release)
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-release // the upstream never completes while this is held open
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString("ok"))}, nil
+	})
+	go func() { _ = p.Serve(listener) }()
+
+	request := httptest.NewRequest(http.MethodPost, "https://"+listener.Addr().String()+"/", strings.NewReader(`{}`))
+	request.RequestURI = ""
+	request.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	request.Header.Set("X-Amz-Target", "DynamoDB_20120810.GetItem")
+	hash := sha256.Sum256([]byte(`{}`))
+	if err := v4.NewSigner().SignHTTP(context.Background(), aws.Credentials{AccessKeyID: p.keys["dev"].ID, SecretAccessKey: p.keys["dev"].Secret}, request, hex.EncodeToString(hash[:]), "dynamodb", "eu-west-1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Do(request)
+		done <- err
+	}()
+
+	// Let the request reach the hanging upstream.
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	p.Shutdown(ctx)
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Shutdown waited %v; want it cut at the deadline", waited)
+	}
+
+	// The lingering request is cut: its connection is closed.
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the lingering request completed; want it cut")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the lingering request was not cut at the deadline")
+	}
+}

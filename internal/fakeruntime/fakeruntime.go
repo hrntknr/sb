@@ -1,0 +1,180 @@
+// Package fakeruntime installs fake container runtime CLIs (docker,
+// podman, and the apple container CLI) for tests. The fakes are driven by
+// three files: a container state (one "<id> <label>" line per container),
+// a run counter, and a calls log; they answer sb's container-runtime calls
+// (ps, ls, rm, run, exec, info) from the state, so sb's session code can
+// be tested against a runtime that behaves like the real one.
+//
+// The fakes diverge from the real CLIs in one way on purpose: run does not
+// remove its container when it exits (real runtimes do, with --rm). What
+// the CLI leaves behind is exactly what sb's own reclamation must clean.
+package fakeruntime
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// Files are the paths the fakes read from and write to.
+type Files struct {
+	// State lists the containers the runtimes "have", one "<id> <label>"
+	// line per container.
+	State string
+	// Counter is where run takes its ids from.
+	Counter string
+	// Calls records one line per ps, rm, or exec call, with the arguments.
+	Calls string
+}
+
+// Install writes the fake runtime binaries into binDir (docker, podman,
+// container), puts binDir first on PATH, and creates the state, counter, and
+// calls files as SB_FAKE_STATE, SB_FAKE_COUNTER, and SB_TEST_CALLS_LOG for
+// the fakes. Set SB_FAKE_RUN_LIFETIME afterwards to keep a run alive after
+// its stdin closes.
+func Install(t testing.TB, binDir string) Files {
+	t.Helper()
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := Files{
+		State:   filepath.Join(binDir, "state"),
+		Counter:  filepath.Join(binDir, "counter"),
+		Calls:    filepath.Join(binDir, "calls"),
+	}
+	for _, path := range []string{f.State, f.Counter, f.Calls} {
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script := fakeScript
+	for path, value := range map[string]string{
+		"@STATE@":   f.State,
+		"@COUNTER@": f.Counter,
+		"@CALLS@":   f.Calls,
+	} {
+		script = strings.ReplaceAll(script, path, shellQuote(value))
+	}
+	for _, name := range []string{"docker", "podman", "container"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("SB_FAKE_STATE", f.State)
+	t.Setenv("SB_FAKE_COUNTER", f.Counter)
+	t.Setenv("SB_TEST_CALLS_LOG", f.Calls)
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	return f
+}
+
+// shellQuote quotes a path for a shell double-quoted string.
+func shellQuote(path string) string { return fmt.Sprintf("%q", path) }
+
+// fakeScript is the runtime CLI the tests get: it answers sb's
+// container-runtime calls from a state file, a counter, and a calls log.
+// The label is the text after "label=" in sb's --filter/--label arguments
+// (sb.session.id=<session id>).
+const fakeScript = `#!/bin/sh
+# Fake container runtime CLI for sb's tests. Driven by:
+#   SB_FAKE_STATE      containers the runtime "has": "<id> <label>" lines
+#   SB_FAKE_COUNTER    where run takes its ids from
+#   SB_TEST_CALLS_LOG  one line per call: "<subcommand> <args joined>"
+#   SB_FAKE_RUN_LIFETIME  while this file exists a run stays alive; without
+#                      it, run lives until stdin closes
+set -eu
+state=@STATE@
+counter=@COUNTER@
+log=@CALLS@
+cmd=$1
+shift
+printf '%s\n' "$cmd $*" >>"$log"
+
+case $cmd in
+info)
+	# docker info, as resolveDockerHost reads it: rootful, bridge.
+	echo 27.5.1
+	echo '[name=seccomp,profile=builtin]'
+	;;
+ps)
+	# ps -aq --filter <v>...: print the ids of state lines matching every
+	# filter value.
+	filters=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--filter) filters="$filters $2 ";;
+		esac
+		shift
+	done
+	while read -r id label; do
+		if [ -z "$id" ]; then continue; fi
+		ok=1
+		for f in $filters; do
+			case $f in
+			id=*) [ "$id" = "${f#id=}" ] || ok=0 ;;
+			label=*) [ "$label" = "${f#label=}" ] || ok=0 ;;
+			*) ok=0 ;;
+			esac
+		done
+		if [ "$ok" = 1 ] && [ -n "$filters" ]; then printf '%s\n' "$id"; fi
+	done <"$state"
+	;;
+rm)
+	# rm -f <id>...: drop the containers from the state.
+	for id do
+		grep -v "^$id " "$state" >"$state.tmp" || true
+		mv "$state.tmp" "$state"
+	done
+	;;
+ls)
+	# ls --all --format json: the whole container list as JSON, the sb label
+	# from the state.
+	first=1
+	out="["
+	while read -r id label; do
+		sid=""
+		case $label in sb.session.id=*) sid="${label#sb.session.id=}" ;; esac
+		if [ "$first" = 1 ]; then comma=""; else comma=","; fi
+		out="$out$comma{\"id\":\"$id\",\"configuration\":{\"labels\":{\"sb.session.id\":\"$sid\"}}}"
+		first=0
+	done <"$state"
+	printf '%s]\n' "$out"
+	;;
+run)
+	# run <args>: register the container, write the cidfile, then live.
+	cidfile=""
+	label=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--cidfile) cidfile=$2; shift 2; continue ;;
+		--label) label=$2; shift 2; continue ;;
+		--) shift; break ;;
+		esac
+		shift
+	done
+	if [ -s "$counter" ]; then n=$(cat "$counter"); else n=0; fi
+	n=$((n+1))
+	printf '%s' "$n" >"$counter"
+	id="fake-container-$n"
+	printf '%s\n' "$id" >"$cidfile"
+	printf '%s %s\n' "$id" "$label" >>"$state"
+	if [ -e "${SB_FAKE_RUN_LIFETIME:-}" ]; then
+		# Alive until the lifetime file is gone: the caller ends the
+		# session at its own pace.
+		while [ -e "$SB_FAKE_RUN_LIFETIME" ]; do sleep 0.05; done
+	else
+		# Alive until stdin closes: the container command ended.
+		cat >/dev/null
+	fi
+	;;
+exec)
+	# exec <args>: the container id is the first arg the state knows; the
+	# rest is the container's command.
+	for a in "$@"; do
+		if grep -q "^$a " "$state"; then exit 0; fi
+	done
+	exit 1
+	;;
+esac
+`

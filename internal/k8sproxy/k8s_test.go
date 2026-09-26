@@ -1191,3 +1191,61 @@ func testIDTokenWithSubject(t *testing.T, expiry time.Time, subject string) stri
 		"signature",
 	}, ".")
 }
+
+// TestShutdownCutsLingeringRequestAtDeadline covers the deadline of the stop
+// flow: a watch the upstream never completes is cut at the deadline, not
+// waited for.
+func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // the watch never completes while this is held open
+	}))
+	defer upstream.Close()
+	// Release the hanging handler before upstream.Close() waits on it.
+	defer close(release)
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() { _ = proxy.Serve(listener) }()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/dev/api", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	req.URL.Scheme = "https"
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Do(req)
+		done <- err
+	}()
+
+	// Let the request reach the hanging upstream.
+	time.Sleep(100 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	proxy.Shutdown(ctx)
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("Shutdown waited %v; want it cut at the deadline", waited)
+	}
+
+	// The lingering request is cut: its connection is closed.
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the lingering request completed; want it cut")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the lingering request was not cut at the deadline")
+	}
+}

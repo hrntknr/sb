@@ -30,11 +30,24 @@ func (p *Proxy) Serve(l net.Listener) error {
 		if err != nil {
 			return err
 		}
+		if !p.track(conn) {
+			// Shutdown started: reject the connection outright.
+			_ = conn.Close()
+			continue
+		}
 		go p.serveOuterConn(conn, config)
 	}
 }
 
+// track registers a downstream connection for Shutdown. It reports false once
+// shutdown started: the connection is then closed by its acceptor.
+func (p *Proxy) track(conn net.Conn) bool { return p.conns.track(conn) }
+
+// untrack marks one connection's cleanup done.
+func (p *Proxy) untrack(conn net.Conn) { p.conns.untrack(conn) }
+
 func (p *Proxy) serveOuterConn(conn net.Conn, config *cryptossh.ServerConfig) {
+	defer p.untrack(conn)
 	server, chans, reqs, err := cryptossh.NewServerConn(conn, config)
 	if err != nil {
 		_ = conn.Close()

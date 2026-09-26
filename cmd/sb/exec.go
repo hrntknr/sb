@@ -2,11 +2,13 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 
-	"github.com/hrntknr/sb/internal/config"
 	"github.com/hrntknr/sb/internal/containers"
+	"github.com/hrntknr/sb/internal/session"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -19,10 +21,12 @@ func newExecCommand(opts *options) *cobra.Command {
 		Use:   "exec [--] <command>...",
 		Short: "Run a command inside a container started by sb run",
 		Long: `Run a command inside a container started by sb run, from
-another terminal. It targets the run's --name (default "default").
-The runtime is selected like sb run: container.runtime in the config
-or auto-detection. The command's exit code becomes sb's. Use -- when
-the command starts with -:
+another terminal. It targets the session started with the same --name
+(default "default"): the runtime and container ID come from that
+session's record, cross-checked against the runtime's own records, so a
+dead session or a container that took over the name connects to
+nothing. The command's exit code becomes sb's. Use -- when the command
+starts with -:
 
   sb exec zsh -l
   sb exec --name dev zsh -l
@@ -46,7 +50,7 @@ the command starts with -:
 			return execCommand(*opts, name, workdir, args)
 		},
 	}
-	cmd.Flags().StringVar(&name, "name", "default", "name of the container started by sb run")
+	cmd.Flags().StringVar(&name, "name", "default", "name of the session started by sb run")
 	cmd.Flags().StringVarP(&workdir, "workdir", "w", "", "working directory inside the container")
 	// Flags after the first plain argument belong to the container
 	// command, not to sb.
@@ -58,16 +62,37 @@ func execCommand(opts options, name, workdir string, command []string) error {
 	if err := configureLogger(opts.logLevel); err != nil {
 		return err
 	}
-	cfg, err := config.Load(opts.configPath)
+
+	sessionsDir, err := session.SessionsDir()
 	if err != nil {
 		return err
 	}
-	rt, err := resolveRuntime(cfg.Container.Runtime)
+	rec, err := session.LoadRecord(sessionsDir, name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("exec: no session %q; is it running?", name)
+		}
+		return err
+	}
+	// Only a live session is exec'd into: its owner holds the lock, so the
+	// record is not an orphan's leftover.
+	if !session.LockHeld(sessionsDir, name) {
+		return fmt.Errorf("exec: session %q is not running", name)
+	}
+	rt, err := containers.Parse(rec.Runtime)
 	if err != nil {
 		return err
 	}
+	ok, err := containers.VerifySession(rt, rec.ContainerID, rec.ID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("exec: session %q has no container %q", name, rec.ContainerID)
+	}
+
 	tty := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	child := exec.Command(rt.Binary(), containers.ExecArgs(name, workdir, tty, command)...)
+	child := exec.Command(rt.Binary(), containers.ExecArgs(rec.ContainerID, workdir, tty, command)...)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	return exitStatus(child.Run())
 }

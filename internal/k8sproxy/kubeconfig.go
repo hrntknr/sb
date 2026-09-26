@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -39,8 +40,8 @@ type Proxy struct {
 	cert    tls.Certificate
 	certErr error
 	certOne sync.Once
+	server  *http.Server
 }
-
 func New(targets Targets, host string) *Proxy { return &Proxy{Targets: targets, host: host} }
 
 type kubeconfigFile struct {

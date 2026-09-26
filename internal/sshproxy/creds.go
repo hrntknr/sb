@@ -45,6 +45,9 @@ type Proxy struct {
 	mu           sync.Mutex
 	issuedKey    string
 	hostCASigner cryptossh.Signer
+
+	// conns tracks open downstream connections for Shutdown.
+	conns connSet
 }
 
 func New(targets Targets, agentSocket func() string) *Proxy {

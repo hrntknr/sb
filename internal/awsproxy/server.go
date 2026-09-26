@@ -47,7 +47,8 @@ type Proxy struct {
 	certOnce   sync.Once
 	cert       tls.Certificate
 	certErr    error
-	client     *http.Client
+	server     *http.Server
+	client      *http.Client
 }
 
 func New(targets []Target, host string) *Proxy {
@@ -80,7 +81,33 @@ func (p *Proxy) Serve(listener net.Listener) error {
 	server := &http.Server{Handler: http.HandlerFunc(p.serveHTTP), TLSConfig: &tls.Config{
 		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12,
 	}}
+	p.setServer(server)
 	return server.ServeTLS(listener, "", "")
+}
+
+// Shutdown stops the server: it stops accepting new requests, waits for
+// active ones to finish, and closes the rest at ctx's deadline (streams
+// that never go idle are cut there).
+func (p *Proxy) Shutdown(ctx context.Context) {
+	server := p.getServer()
+	if server == nil {
+		return
+	}
+	if err := server.Shutdown(ctx); err != nil {
+		server.Close()
+	}
+}
+
+func (p *Proxy) setServer(server *http.Server) {
+	p.mu.Lock()
+	p.server = server
+	p.mu.Unlock()
+}
+
+func (p *Proxy) getServer() *http.Server {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.server
 }
 
 var (

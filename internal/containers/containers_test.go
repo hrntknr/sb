@@ -18,6 +18,7 @@ func TestArgs(t *testing.T) {
 		envs     []string
 		tty      bool
 		mounts   []string
+		labels   []string
 		image    string
 		init     bool
 		userArgs []string
@@ -31,7 +32,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -43,7 +44,7 @@ func TestArgs(t *testing.T) {
 			init:     true,
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--init", "--add-host", "host.docker.internal:host-gateway",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -59,9 +60,21 @@ func TestArgs(t *testing.T) {
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
 				"--env", "FOO=bar", "--env", "LANG",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+		},
+		{
+			name:    "session labels come before the credential mounts",
+			runtime: Docker,
+			host:    "192.168.1.5",
+			labels:  []string{"sb.session.id=3f9a1d2c4e5b6078"},
+			image:   "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+				"--label", "sb.session.id=3f9a1d2c4e5b6078",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
+				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
 			name:     "docker with resolved host ip has no add-host",
@@ -71,7 +84,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -82,7 +95,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"npm", "install"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"ghcr.io/hrntknr/sh:full", "npm", "install"},
 		},
 		{
@@ -93,7 +106,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -105,9 +118,22 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-v", "/home/me/.config/opencode:/root/.config/opencode",
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+		},
+		{
+			name:     "read-only mounts carry the ro option through",
+			runtime:  Docker,
+			host:     "192.168.1.5",
+			tty:      true,
+			mounts:   []string{"/home/me/.claude:/root/.claude:ro"},
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
+				"-v", "/home/me/.claude:/root/.claude:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -117,13 +143,13 @@ func TestArgs(t *testing.T) {
 			tty:     false,
 			image:   "ghcr.io/hrntknr/sh:full",
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"ghcr.io/hrntknr/sh:full"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.image, tt.init, tt.userArgs)
+			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.labels, tt.image, tt.init, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Args() = %v, want %v", got, tt.want)
 			}

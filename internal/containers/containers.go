@@ -5,6 +5,7 @@
 package containers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -121,6 +122,135 @@ func Detect() (Runtime, error) {
 	return "", fmt.Errorf("no container runtime found (looked for docker, podman, container)")
 }
 
+// LabelSession is the label sb puts on the containers it manages. The value
+// is the session ID that owns the container; sb finds, stops, and removes
+// containers by this label (see internal/session).
+const LabelSession = "sb.session.id"
+
+// SessionLabelArg builds the --label argument value for a session ID.
+func SessionLabelArg(sessionID string) string {
+	return LabelSession + "=" + sessionID
+}
+
+func labelFilter(sessionID string) string { return "label=" + SessionLabelArg(sessionID) }
+
+// ListSession returns the IDs of the containers (running or not) that carry
+// the session label: the runtime's own records, not sb's, are the source of
+// truth, so a session's containers are found even if its records were never
+// written.
+func ListSession(r Runtime, sessionID string) ([]string, error) {
+	var args []string
+	if r == Apple {
+		// The apple CLI's ls has no --filter; ps --filter label= covers
+		// docker and podman, and the apple CLI prints its whole container
+		// list as JSON.
+		args = []string{"ls", "--all", "--format", "json"}
+	} else {
+		args = []string{"ps", "-aq", "--filter", labelFilter(sessionID)}
+	}
+	out, err := exec.Command(r.Binary(), args...).Output()
+	if err != nil {
+		if r == Apple {
+			return nil, fmt.Errorf("%s: cannot list by session label: %w", r, err)
+		}
+		return nil, fmt.Errorf("%s: cannot list by session label (is the runtime running?): %w", r, err)
+	}
+	if r == Apple {
+		return labelMatches(out, sessionID)
+	}
+	return nonEmpty(out), nil
+}
+
+// labelMatches selects container IDs whose labels carry the session ID from
+// the apple CLI's JSON list output.
+func labelMatches(out []byte, sessionID string) ([]string, error) {
+	var containers []struct {
+		ID string `json:"id"`
+		Configuration struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"configuration"`
+	}
+	if err := json.Unmarshal(out, &containers); err != nil {
+		return nil, fmt.Errorf("apple: parse container list: %w", err)
+	}
+	var ids []string
+	for _, c := range containers {
+		if c.Configuration.Labels[LabelSession] == sessionID {
+			ids = append(ids, c.ID)
+		}
+	}
+	return ids, nil
+}
+
+func nonEmpty(out []byte) []string {
+	var ids []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if id := strings.TrimSpace(line); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// RemoveSession stops and removes the containers that carry the session
+// label (`rm -f`, which stops running containers first). A container that
+// the runtime no longer knows (already removed) is not an error: the
+// listing is the source of truth, not sb's records.
+func RemoveSession(r Runtime, sessionID string) error {
+	ids, err := ListSession(r, sessionID)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := RemoveByID(r, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RemoveByID stops and removes the container with the given ID. The output
+// is included verbatim: it is the recovery hint for a manual retry.
+func RemoveByID(r Runtime, id string) error {
+	out, err := exec.Command(r.Binary(), "rm", "-f", id).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s: remove %s: %w: %s", r, id, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// VerifySession reports whether the container with the given ID exists and
+// carries the session label, cross-checking the runtime's records against
+// the session record: a stale or copied record alone connects to nothing.
+func VerifySession(r Runtime, containerID, sessionID string) (bool, error) {
+	if containerID == "" || strings.ContainsAny(containerID, " \t\n\r") {
+		return false, nil
+	}
+	if r == Apple {
+		args := []string{"ls", "--all", "--format", "json"}
+		out, err := exec.Command(r.Binary(), args...).Output()
+		if err != nil {
+			return false, fmt.Errorf("%s: cannot list by session label: %w", r, err)
+		}
+		matches, err := labelMatches(out, sessionID)
+		if err != nil {
+			return false, err
+		}
+		for _, id := range matches {
+			if strings.HasPrefix(strings.ToLower(containerID), strings.ToLower(id)) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	args := []string{"ps", "-aq", "--filter", "id=" + containerID, "--filter", labelFilter(sessionID)}
+	out, err := exec.Command(r.Binary(), args...).Output()
+	if err != nil {
+		return false, fmt.Errorf("%s: cannot list by session label (is the runtime running?): %w", r, err)
+	}
+	return len(nonEmpty(out)) > 0, nil
+}
+
 // Parse resolves a --runtime flag value, verifying the binary is installed.
 func Parse(name string) (Runtime, error) {
 	var r Runtime
@@ -141,18 +271,20 @@ func Parse(name string) (Runtime, error) {
 }
 
 // Args builds the runtime CLI arguments that run a container with the
-// sb credentials under dir mounted at /root, followed by the
+// sb credentials under dir mounted at /root (read-only), followed by the
 // user's own arguments. host is the value ResolveHost returned. name and
 // network, when non-empty, are passed to the runtime as --name and
 // --network. envs are environment variables (KEY=VALUE, or just KEY to
 // inherit from sb's own environment). mounts are extra "source:target"
-// volumes. image is inserted before userArgs, which form the container
-// command. init, when set, passes --init so the command runs under an
-// init process as PID 1 that forwards signals and reaps zombies, which
-// the user's command (a shell, node, ...) would not do on its own. The
-// runtime records the container ID in a cidfile under dir, for
-// ForceRemove.
-func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts []string, image string, init bool, userArgs []string) []string {
+// volumes, with ~ already expanded and ":ro" appended for read-only mounts.
+// labels are --label arguments: sb marks its containers with the session
+// label so they can be found and removed without sb's own state. image is
+// inserted before userArgs, which form the container command. init, when
+// set, passes --init so the command runs under an init process as PID 1
+// that forwards signals and reaps zombies, which the user's command (a
+// shell, node, ...) would not do on its own. The runtime records the
+// container ID in a cidfile under dir, for ForceRemove.
+func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts, labels []string, image string, init bool, userArgs []string) []string {
 	args := []string{"run", "--rm", "--cidfile", cidFile(dir)}
 	if init {
 		args = append(args, "--init")
@@ -166,13 +298,16 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 	for _, env := range envs {
 		args = append(args, "--env", env)
 	}
+	for _, label := range labels {
+		args = append(args, "--label", label)
+	}
 	if r == Docker && host == dockerHost {
 		args = append(args, "--add-host", dockerHost+":host-gateway")
 	}
 	args = append(args,
-		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh",
-		"-v", filepath.Join(dir, ".kube")+":/root/.kube",
-		"-v", filepath.Join(dir, ".aws")+":/root/.aws",
+		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh:ro",
+		"-v", filepath.Join(dir, ".kube")+":/root/.kube:ro",
+		"-v", filepath.Join(dir, ".aws")+":/root/.aws:ro",
 	)
 	for _, mount := range mounts {
 		args = append(args, "-v", mount)
@@ -184,10 +319,11 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 }
 
 // ExecArgs builds the runtime CLI arguments that run command inside the
-// container named name — the --name value of `sb run`, which every runtime
-// accepts as the container identifier for exec. workdir, when non-empty,
-// sets the working directory (-w/--workdir).
-func ExecArgs(name, workdir string, tty bool, command []string) []string {
+// container identified by container — the ID from the session record, not
+// the container name: a name that another container took over must not be
+// reachable through sb's records. workdir, when non-empty, sets the
+// working directory (-w/--workdir).
+func ExecArgs(container, workdir string, tty bool, command []string) []string {
 	args := []string{"exec"}
 	if tty {
 		args = append(args, "-i", "-t")
@@ -195,7 +331,7 @@ func ExecArgs(name, workdir string, tty bool, command []string) []string {
 	if workdir != "" {
 		args = append(args, "-w", workdir)
 	}
-	return append(append(args, name), command...)
+	return append(append(args, container), command...)
 }
 
 // ForceRemove force-removes the container whose ID Args had the runtime
