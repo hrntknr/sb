@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 
 	"github.com/hrntknr/sb/internal/util"
 	cryptossh "golang.org/x/crypto/ssh"
@@ -13,9 +14,10 @@ import (
 
 // upstreamAuthMethods collects public key auth from the identity files and
 // certificates and the ssh-agent listening on agentSocketPath. The agent
-// connection is watched: a stop that begins while the auth waits closes
-// it, unblocking the reads it is stuck on. The returned connection (if
-// any) must be closed once the upstream handshake is done; the signers
+// connection is watched: a stop that begins while a request waits on it
+// — the key list, a signature during the handshake — closes it,
+// unblocking the read it is stuck on. The returned connection (if any)
+// must be closed once the upstream handshake is done; the signers
 // sign through it.
 func upstreamAuthMethods(ctx context.Context, config sshConfig, agentSocketPath string) ([]cryptossh.AuthMethod, net.Conn, error) {
 	identitySigners := identityFileSigners(config.IdentityFiles)
@@ -57,33 +59,47 @@ func identityFileSigners(identityFiles []string) []cryptossh.Signer {
 }
 
 // sshAgentSigners lists the agent's signers. The agent connection is
-// watched while the auth waits: a stop that begins then closes the
-// connection, unblocking the read it is stuck on. The watch ends with
-// the auth — the call below returning is the end of the wait, nothing
-// watches for the stop anymore.
+// watched while it is in use: a stop that begins while a request waits
+// on it — the key list, a signature during the handshake — closes it,
+// unblocking the read it is stuck on. The watch ends when the connection
+// closes: whoever owns the connection's lifetime ends its use by closing
+// it, and the stop is not tracked after that.
 func sshAgentSigners(ctx context.Context, socketPath string) ([]cryptossh.Signer, net.Conn) {
 	if socketPath == "" {
 		return nil, nil
 	}
-	conn, err := net.Dial("unix", socketPath)
+	raw, err := net.Dial("unix", socketPath)
 	if err != nil {
 		return nil, nil
 	}
-	watch := make(chan struct{})
+	conn := &watchedConn{Conn: raw, release: make(chan struct{})}
 	go func() {
 		select {
 		case <-ctx.Done():
 			conn.Close()
-		case <-watch:
+		case <-conn.release:
 		}
 	}()
 	signers, err := agent.NewClient(conn).Signers()
-	close(watch)
 	if err != nil {
 		conn.Close()
 		return nil, nil
 	}
 	return signers, conn
+}
+
+// watchedConn releases its watch when it closes: the connection's end
+// — its owner's close, or the watch's own — is the end of its use;
+// nothing watches for the stop after that.
+type watchedConn struct {
+	net.Conn
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *watchedConn) Close() error {
+	c.once.Do(func() { close(c.release) })
+	return c.Conn.Close()
 }
 
 // certificateSigners pairs certificates with the signer of their matching key.

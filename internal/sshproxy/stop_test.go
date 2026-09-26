@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -244,5 +246,215 @@ func TestAgentWatchEndsWithEachAuth(t *testing.T) {
 			t.Fatalf("the watches accumulated: %d goroutines before the iteration, %d after", before, runtime.NumGoroutine())
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// startStallingAgent serves the agent protocol on a unix socket: the
+// identities request is answered with one key, the sign request is never
+// answered — the connection stays open, the client waits on it. signAsked
+// fires when a sign request arrives; connClosed when the client side of a
+// connection that asked closes.
+func startStallingAgent(t *testing.T) (socketPath string, signAsked, connClosed <-chan struct{}) {
+	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "agent.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	blob := testSigner(t).PublicKey().Marshal() // any real key: the blob is its public form
+	signAskedC := make(chan struct{}, 1)
+	connClosedC := make(chan struct{}, 1)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				sawSign := false
+				for {
+					var length [4]byte
+					if _, err := io.ReadFull(conn, length[:]); err != nil {
+						if sawSign {
+							select {
+							case connClosedC <- struct{}{}:
+							default:
+							}
+						}
+						return
+					}
+					request := make([]byte, binary.BigEndian.Uint32(length[:]))
+					if _, err := io.ReadFull(conn, request); err != nil {
+						if sawSign {
+							select {
+							case connClosedC <- struct{}{}:
+							default:
+							}
+						}
+						return
+					}
+					if len(request) == 0 {
+						continue
+					}
+					switch request[0] {
+					case 11: // identities request: answered with one key
+						answer := make([]byte, 0, 9+len(blob))
+						answer = append(answer, 12) // identities answer
+						answer = binary.BigEndian.AppendUint32(answer, 1)
+						answer = binary.BigEndian.AppendUint32(answer, uint32(len(blob)))
+						answer = append(answer, blob...)
+						answer = binary.BigEndian.AppendUint32(answer, 0) // empty comment
+						var frame [4]byte
+						binary.BigEndian.PutUint32(frame[:], uint32(len(answer)))
+						if _, err := conn.Write(append(frame[:], answer...)); err != nil {
+							return
+						}
+					case 13: // sign request: stalled — no answer, no close
+						sawSign = true
+						select {
+						case signAskedC <- struct{}{}:
+						default:
+						}
+					default:
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return listener.Addr().String(), signAskedC, connClosedC
+}
+
+// startAuthServer starts an ssh server that accepts any public key: the
+// client's key query is answered, its handshake reaches the signature
+// wait. The address is returned.
+func startAuthServer(t *testing.T) string {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	hostKey := testSigner(t)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				config := &cryptossh.ServerConfig{
+					PublicKeyCallback: func(conn cryptossh.ConnMetadata, key cryptossh.PublicKey) (*cryptossh.Permissions, error) {
+						return &cryptossh.Permissions{}, nil
+					},
+				}
+				config.AddHostKey(hostKey)
+				server, _, reqs, err := cryptossh.NewServerConn(conn, config)
+				if err != nil {
+					conn.Close()
+					return
+				}
+				defer server.Close()
+				go cryptossh.DiscardRequests(reqs)
+			}(conn)
+		}
+	}()
+	return listener.Addr().String()
+}
+
+// TestStoppedAgentCutsTheSignatureWait covers the agent connection's
+// watch over the handshake that uses it: a fake agent that answers the
+// key list but stalls on the signature request — the handshake waits on
+// it — and a stop that begins then cuts the dial at the connection.
+// The watch ending with the key list would leave the signature wait
+// uncut: the dial would wait for an agent that never answers.
+func TestStoppedAgentCutsTheSignatureWait(t *testing.T) {
+	socketPath, signAsked, connClosed := startStallingAgent(t)
+	serverAddr := startAuthServer(t)
+	_, port, _ := net.SplitHostPort(serverAddr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dialed := make(chan error, 1)
+	go func() {
+		_, err := dialUpstream(ctx, sshConfig{
+			User:                  "test",
+			Host:                  "127.0.0.1",
+			Port:                  port,
+			StrictHostKeyChecking: "no",
+		}, socketPath)
+		dialed <- err
+	}()
+
+	// The signature wait is in flight: the agent stalls on it.
+	select {
+	case <-signAsked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handshake never reached the signature wait")
+	}
+	cancel()
+	select {
+	case err := <-dialed:
+		if err == nil {
+			t.Fatal("the dial succeeded through a stalling agent")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the dial did not return after the stop began")
+	}
+	// The agent connection ended with the dial.
+	select {
+	case <-connClosed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the agent connection did not end")
+	}
+}
+
+// TestStoppedAgentCutsTheSignatureWaitThroughAProxyCommand covers the
+// same signature wait over the ProxyCommand path: the child carries the
+// transport, the agent connection's watch cuts the wait — closing the
+// child alone would not, the handshake waits on the agent, not on the
+// child.
+func TestStoppedAgentCutsTheSignatureWaitThroughAProxyCommand(t *testing.T) {
+	if _, err := exec.LookPath("nc"); err != nil {
+		t.Skip("nc not available: no child can carry the transport")
+	}
+	socketPath, signAsked, connClosed := startStallingAgent(t)
+	serverHost, serverPort, _ := net.SplitHostPort(startAuthServer(t))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dialed := make(chan error, 1)
+	go func() {
+		_, err := dialUpstream(ctx, sshConfig{
+			User: "test",
+			Host: "127.0.0.1",
+			Port: "22",
+			// The child carries the transport to the server: nc,
+			// connecting it, like ssh's ProxyCommand does.
+			ProxyCommand:          fmt.Sprintf("nc %s %s", serverHost, serverPort),
+			HostKeyAlias:          "target.example",
+			StrictHostKeyChecking: "no",
+		}, socketPath)
+		dialed <- err
+	}()
+
+	// The signature wait is in flight: the agent stalls on it.
+	select {
+	case <-signAsked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handshake never reached the signature wait")
+	}
+	cancel()
+	select {
+	case err := <-dialed:
+		if err == nil {
+			t.Fatal("the dial succeeded through a stalling agent")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the dial did not return after the stop began")
+	}
+	// The agent connection ended with the dial.
+	select {
+	case <-connClosed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the agent connection did not end")
 	}
 }

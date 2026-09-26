@@ -46,8 +46,10 @@ func newProxyCommand(opts *options) *cobra.Command {
 			defer stop()
 			proxy, err := startProxy(ctx, cfg, *opts, opts.host, args[0])
 			if err != nil {
-				// startProxy stops the issuances and removes what they
-				// issued; nothing is left to do here.
+				// startProxy stops the issuances, waits for their
+				// exit, and removes what they issued — or joins the
+				// failed reclamation to the error, so what remains
+				// behind is shown with it.
 				return err
 			}
 			err = proxy.Wait()
@@ -114,7 +116,9 @@ func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir stri
 		return nil, err
 	}
 	// Everything after this point is undone on failure: the listeners
-	// close, nothing sb issued stays behind a failed start.
+	// close, and what sb issued is removed with the issuances' exit —
+	// or stays behind the failure, reported by its error, when they
+	// did not exit.
 	fail := func(err error) error {
 		sshListener.Close()
 		k8sListener.Close()
@@ -162,8 +166,13 @@ func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir stri
 		awsProxy.BeginStop()
 		if awaitDone(session.RuntimeWait, k8sDone, awsDone) {
 			removeIssued(dir)
+			return server, fail(err)
 		}
-		return server, fail(err)
+		// What the tasks are still writing stays: the removal would race
+		// it. The failed reclamation joins the startup error, so the
+		// caller sees what remains behind and how to reclaim it.
+		return server, fail(errors.Join(err, fmt.Errorf(
+			"proxy start: an issuing task did not exit within %s; remove %s by hand once it is done", session.RuntimeWait, dir)))
 	}
 	for _, ready := range []chan error{k8sReady, awsReady} {
 		// A cancelled run is a failed start, whatever the issuances

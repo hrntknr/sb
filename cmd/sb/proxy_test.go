@@ -312,6 +312,54 @@ func TestStartProxyAWSCancelledDuringReadyWait(t *testing.T) {
 	waitForPathExists(t, filepath.Join(issueDir, ".aws", "config"))
 }
 
+// TestStartProxyReportsTheUnfinishedReclamation covers the failed start's
+// report: a cancellation with an issuing task stuck in its read — the
+// reclamation cannot happen within the deadline — joins the unfinished
+// reclamation and the issue dir to the startup error, so the caller sees
+// what remains behind and how to reclaim it.
+func TestStartProxyReportsTheUnfinishedReclamation(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	// The kubeconfig is a fifo: the k8s side's initial sync hangs in
+	// the source read, the ready never comes.
+	if err := syscall.Mkfifo(kubeconfigPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(kubeconfigPath) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	go func() {
+		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
+		cancel()
+	}()
+	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	if err == nil {
+		t.Fatal("startProxy() with a cancelled run; want a failure")
+	}
+	// The startup error: the cancellation, joined with the failed
+	// reclamation — what stays behind, and where it stays.
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("startProxy() = %v; want context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "did not exit within") {
+		t.Fatalf("startProxy() = %v; want the unfinished reclamation", err)
+	}
+	if !strings.Contains(err.Error(), issueDir) {
+		t.Fatalf("startProxy() = %v; want the issue dir behind the failure", err)
+	}
+	// The issuing task did not exit: what it is still writing stays.
+	if _, statErr := os.Stat(filepath.Join(issueDir, ".ssh")); os.IsNotExist(statErr) {
+		t.Fatal(".ssh was removed while the issuing task is still writing")
+	}
+	// The read completes: the task's last write lands, then it exits on
+	// the next select. Waiting for the write keeps this test's cleanup
+	// from removing the issue dir while the write is still landing.
+	first, rest := kubeconfigFifoParts()
+	releaseFifo(t, kubeconfigPath, first, rest)
+	waitForPathExists(t, filepath.Join(issueDir, ".kube", "config"))
+}
+
 // TestStopJoinsTheIssuanceTasks covers the normal stop's join: an update
 // write in flight when the stop begins is waited for — the deletion of
 // what the issuing task wrote happens only after it exited, so what it is
