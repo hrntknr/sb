@@ -291,6 +291,20 @@ func VerifySession(ctx context.Context, r Runtime, containerID, sessionID string
 
 // Parse resolves a --runtime flag value, verifying the binary is installed.
 func Parse(name string) (Runtime, error) {
+	r, err := ParseName(name)
+	if err != nil {
+		return "", err
+	}
+	if _, err := exec.LookPath(r.Binary()); err != nil {
+		return "", fmt.Errorf("%s: %w", r, err)
+	}
+	return r, nil
+}
+
+// ParseName resolves a --runtime flag value without requiring the binary
+// to be installed: the recovery advice names the CLI to run by hand,
+// whether or not sb can run it.
+func ParseName(name string) (Runtime, error) {
 	var r Runtime
 	switch name {
 	case "docker":
@@ -301,9 +315,6 @@ func Parse(name string) (Runtime, error) {
 		r = Apple
 	default:
 		return "", fmt.Errorf("unknown runtime %q (want docker, podman, or apple)", name)
-	}
-	if _, err := exec.LookPath(r.Binary()); err != nil {
-		return "", fmt.Errorf("%s: %w", r, err)
 	}
 	return r, nil
 }

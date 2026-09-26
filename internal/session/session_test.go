@@ -222,7 +222,7 @@ func TestStopSessionKeepsTheRecordOnFailedRemoval(t *testing.T) {
 	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
 	t.Setenv("PATH", "/nonexistent")
 
-	err := StopSession(dir, "orphan", lock)
+	err := StopSession(dir, "orphan", lock, true)
 	if err == nil {
 		t.Fatal("StopSession() succeeded without a runtime, want error")
 	}
@@ -596,6 +596,31 @@ func TestSessionsDirRefusesAWrongParentOwner(t *testing.T) {
 	}
 }
 
+// TestSessionsDirRefusesASymlinkParent covers the fallback's parent: a
+// <tmp>/sb-<uid> symlink pointing at this user's own 0700 directory —
+// everything the verification asks for — is refused anyway: the path
+// itself must be the directory, not a link to one, whoever owns the
+// link can replace it afterwards.
+func TestSessionsDirRefusesASymlinkParent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	parent := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", os.Getuid()))
+	// The link's target is this user's, 0700: everything sb would
+	// verify — the mode check below must not fire before the link
+	// check, whatever a plain Stat would adopt.
+	target := t.TempDir()
+	if err := os.Chmod(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, parent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("SessionsDir() with a symlinked parent: %v; want a refusal", err)
+	}
+}
+
 // TestNewSessionNameGeneratesUniqueNames covers the generator: two calls
 // give two names, each the shape a user can type into sb exec --name.
 func TestNewSessionNameGeneratesUniqueNames(t *testing.T) {
@@ -626,11 +651,10 @@ func TestAcquireRefusesAnUnreadableRecord(t *testing.T) {
 
 // TestReclaimErrorAdvisesPerRuntime covers the recovery advice: each
 // runtime's listing is what the advice says for it — the apple CLI lists
-// as JSON, docker and podman by label.
+// as JSON, docker and podman by label — and the advice names the
+// runtime's own binary without looking for it on PATH: whatever picks
+// the ids out of the listing by hand works without the CLI too.
 func TestReclaimErrorAdvisesPerRuntime(t *testing.T) {
-	// The apple runtime needs its CLI on PATH: the fake provides it, so
-	// the advice names the runtime's own binary.
-	fakeruntime.Install(t, t.TempDir())
 	issue := "/issue"
 	appleErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "apple", IssueDir: issue}, "records")
 	if !strings.Contains(appleErr.Error(), "container ls --all --format json") {
@@ -639,8 +663,28 @@ func TestReclaimErrorAdvisesPerRuntime(t *testing.T) {
 	if strings.Contains(appleErr.Error(), "ps -aq --filter") {
 		t.Fatalf("ReclaimError(apple) = %v; advises the docker/podman listing", appleErr)
 	}
+	// The listing mixes this session's containers with other sessions'
+	// and sb-less ones: what to remove is picked out of it by hand —
+	// only the ids whose labels carry the session — never everything
+	// the listing lists.
+	if !strings.Contains(appleErr.Error(), "pick the ids whose labels carry sb.session.id=sid — only those") {
+		t.Fatalf("ReclaimError(apple) = %v; want the pick line", appleErr)
+	}
+	if !strings.Contains(appleErr.Error(), "container rm -f <the ids picked above>") {
+		t.Fatalf("ReclaimError(apple) = %v; want the picked ids' removal", appleErr)
+	}
+	if strings.Contains(appleErr.Error(), "apple ps") {
+		t.Fatalf("ReclaimError(apple) = %v; advises the missing apple binary", appleErr)
+	}
+	// Docker and podman list by label: nothing to pick out of them.
 	dockerErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "docker", IssueDir: issue}, "records")
 	if !strings.Contains(dockerErr.Error(), "docker ps -aq --filter label=sb.session.id=sid") {
 		t.Fatalf("ReclaimError(docker) = %v; want the ps --filter listing", dockerErr)
+	}
+	if strings.Contains(dockerErr.Error(), "pick the ids") {
+		t.Fatalf("ReclaimError(docker) = %v; advises picking out of a filtered listing", dockerErr)
+	}
+	if !strings.Contains(dockerErr.Error(), "docker rm -f <the ids it lists>") {
+		t.Fatalf("ReclaimError(docker) = %v; want the listed ids' removal", dockerErr)
 	}
 }

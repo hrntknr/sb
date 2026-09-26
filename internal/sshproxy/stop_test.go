@@ -3,9 +3,12 @@ package sshproxy
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -150,6 +153,95 @@ func TestStoppedProxyCommandCutsTheChild(t *testing.T) {
 	for !pidsGone() {
 		if time.Now().After(deadline) {
 			t.Fatalf("the ProxyCommand child survived the stop: shell=%d child=%d", shellPid, childPid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestProxyCommandWatchEndsWithEachConnection covers the watch lifecycle
+// over iterated connections: the proxy is not stopped while the
+// connections iterate — each connection's watch ends with the
+// connection itself, so iterating does not accumulate one watch per
+// connection. Without the end, a long-running proxy accumulates a watch
+// per connection it ever served.
+func TestProxyCommandWatchEndsWithEachConnection(t *testing.T) {
+	before := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		conn, err := startProxyCommand(context.Background(), "exit 0", "target.example:22")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The connection ends: Close reaps the child, done closes,
+		// the watch ends with it.
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every watch ended with its connection: none is left waiting
+	// for the proxy's stop that never comes.
+	deadline := time.Now().Add(10 * time.Second)
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) {
+			t.Fatalf("the watches accumulated: %d goroutines before the iteration, %d after", before, runtime.NumGoroutine())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestAgentWatchEndsWithEachAuth covers the agent watch over iterated
+// auths: the proxy is not stopped while the auths iterate — each auth's
+// watch ends with the auth's own call, so iterating does not accumulate
+// one watch per auth.
+func TestAgentWatchEndsWithEachAuth(t *testing.T) {
+	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "agent.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				// The key list request: read the frame, answer with
+				// an empty identities list.
+				var length [4]byte
+				if _, err := io.ReadFull(conn, length[:]); err != nil {
+					return
+				}
+				request := make([]byte, binary.BigEndian.Uint32(length[:]))
+				if _, err := io.ReadFull(conn, request); err != nil {
+					return
+				}
+				answer := []byte{12, 0, 0, 0, 0} // identities answer, count 0
+				var answerLength [4]byte
+				binary.BigEndian.PutUint32(answerLength[:], uint32(len(answer)))
+				if _, err := conn.Write(append(answerLength[:], answer...)); err != nil {
+					return
+				}
+			}(conn)
+		}
+	}()
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 20; i++ {
+		signers, conn := sshAgentSigners(context.Background(), listener.Addr().String())
+		if len(signers) != 0 {
+			t.Fatalf("signers = %v; want none", signers)
+		}
+		if conn == nil {
+			t.Fatal("no connection returned for the auth")
+		}
+		conn.Close()
+	}
+	// Every watch ended with its auth: none is left waiting for the
+	// proxy's stop that never comes.
+	deadline := time.Now().Add(10 * time.Second)
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) {
+			t.Fatalf("the watches accumulated: %d goroutines before the iteration, %d after", before, runtime.NumGoroutine())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

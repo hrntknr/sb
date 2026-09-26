@@ -158,8 +158,12 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 		// (1) Communication cut: the proxies stop accepting, cancel their
 		// upstreams, and are waited for within the deadline — whatever
 		// the child CLI is doing meanwhile.
+		issuanceExited := true
 		if proxy != nil {
-			proxy.Stop(shutdownCtx())
+			// The stop joins the issuing tasks within the deadline:
+			// what did not exit is still writing — its issue dir and
+			// the record stay, and the next sweep retries with them.
+			issuanceExited = proxy.Stop(shutdownCtx())
 		}
 		if pollDone != nil {
 			// (2) The poller stops: nothing records the container ID
@@ -170,7 +174,7 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 		// (3) Container reclaim: the session's containers are removed
 		// by label, its issue dir and record dropped. What could not be
 		// removed keeps the record for the next sweep.
-		if err := session.StopSession(sessionsDir, name, lock); err != nil {
+		if err := session.StopSession(sessionsDir, name, lock, issuanceExited); err != nil {
 			errs = append(errs, err)
 		}
 		// (4) Child collection: what is left of the CLI is killed, and

@@ -107,30 +107,39 @@ type kubeconfigState struct {
 // source changes. current-context and namespace overrides made inside the
 // generated config are preserved across syncs.
 func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- error) error {
+	// result reports the setup's own outcome through ready, so the
+	// start waiting on it learns about a failed setup: without it the
+	// caller would wait forever for an issuance that never began.
+	result := func(err error) error {
+		if ready != nil {
+			ready <- err
+		}
+		return err
+	}
 	if port <= 0 {
-		return fmt.Errorf("k8s: invalid proxy port")
+		return result(fmt.Errorf("k8s: invalid proxy port"))
 	}
 	if strings.TrimSpace(dir) == "" {
 		dir = "."
 	}
 	sourcePaths := clientcmd.NewDefaultClientConfigLoadingRules().GetLoadingPrecedence()
 	if len(sourcePaths) == 0 {
-		return fmt.Errorf("k8s: no kubeconfig paths")
+		return result(fmt.Errorf("k8s: no kubeconfig paths"))
 	}
 	// Register the watcher before the initial sync so a change landing
 	// between them is still picked up.
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("watch kubeconfig: %w", err)
+		return result(fmt.Errorf("watch kubeconfig: %w", err))
 	}
 	defer watcher.Close()
 	for _, sourcePath := range sourcePaths {
 		dir := filepath.Dir(sourcePath)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("watch kubeconfig dir: %w", err)
+			return result(fmt.Errorf("watch kubeconfig dir: %w", err))
 		}
 		if err := watcher.Add(dir); err != nil {
-			return fmt.Errorf("watch kubeconfig dir: %w", err)
+			return result(fmt.Errorf("watch kubeconfig dir: %w", err))
 		}
 	}
 

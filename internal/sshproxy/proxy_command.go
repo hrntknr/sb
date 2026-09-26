@@ -55,10 +55,14 @@ func startProxyCommand(ctx context.Context, command, addr string) (net.Conn, err
 		done:   make(chan struct{}),
 	}
 	// A shutdown that begins while the child runs kills it here: the
-	// connection's owner reaps what it started.
+	// connection's owner reaps what it started. The watch ends with the
+	// connection too — when the child is reaped, nothing is left to cut.
 	go func() {
-		<-ctx.Done()
-		conn.Close()
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-conn.done:
+		}
 	}()
 	return conn, nil
 }

@@ -782,14 +782,20 @@ func TestRequestsAfterTheStopNeverReachUpstream(t *testing.T) {
 		return aws.Credentials{}, nil
 	})}
 	p.mu.Unlock()
+	sentUpstream := int32(0)
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		// The transport refuses what the stop cancelled: the wait ends
-		// when the cancellation reaches the request, before anything
-		// goes upstream. A request the stop did not cancel hangs here
-		// — it is never delivered, whatever it carries.
+		// The transport refuses what the stop cancelled: the refusal
+		// reads the context's Done without waiting, like a real
+		// transport, which delivers nothing once the context's Done
+		// is closed. What it would send instead — a request the
+		// stop did not cancel — goes to the upstream: count it, the
+		// test fails on a nonzero count.
 		select {
 		case <-r.Context().Done():
 			return nil, r.Context().Err()
+		default:
+			atomic.AddInt32(&sentUpstream, 1)
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString("ok"))}, nil
 		}
 	})
 	go func() { _ = p.Serve(listener) }()
@@ -818,6 +824,9 @@ func TestRequestsAfterTheStopNeverReachUpstream(t *testing.T) {
 		// The request completed without reaching the upstream: the
 		// transport refused what the stop cancelled, and the request
 		// never went past it.
+		if sentUpstream != 0 {
+			t.Fatalf("a request issued after the stop began was sent upstream %d times", sentUpstream)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("a request issued after the stop began did not complete")
 	}

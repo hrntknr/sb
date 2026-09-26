@@ -38,9 +38,10 @@ type Record struct {
 
 // baseDir returns sb's per-boot base directory. With XDG_RUNTIME_DIR it is
 // <XDG_RUNTIME_DIR>/sb; without it a per-uid directory under the temp dir
-// (<tmp>/sb-<uid>/sb) keeps users apart. Each directory sb creates must
-// be this user's and 0700: a directory another user created (or left
-// too open) is refused, not adopted.
+// (<tmp>/sb-<uid>/sb) keeps users apart. The temp root is shared — anyone
+// may leave anything under it — so every directory sb puts there is
+// verified: this user's, 0700, and a real directory; a symlink is its
+// owner's, not sb's, and is refused, not adopted.
 func baseDir() (string, error) {
 	var dir string
 	if runtime, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok && filepath.IsAbs(runtime) {
@@ -61,14 +62,20 @@ func baseDir() (string, error) {
 }
 
 // secureMkdir creates dir 0700 and verifies what is already there: the
-// directory must be this user's and 0700 before sb writes into it.
+// path must be this user's real directory 0700 before sb writes into it.
+// The verification is on the path itself, not what it points at: a
+// symlink there is its owner's, not sb's, and whoever owns it can
+// replace it afterwards.
 func secureMkdir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	info, err := os.Stat(dir)
+	info, err := os.Lstat(dir)
 	if err != nil {
 		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("session dir %s: not a directory", dir)
 	}
 	owner, ok := ownerOf(info)
 	if !ok || owner != uid() {
@@ -297,7 +304,7 @@ func Sweep(dir string) error {
 		if lock == nil {
 			continue // a live session holds it
 		}
-		if err := StopSession(dir, name, lock); err != nil {
+		if err := StopSession(dir, name, lock, true); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -308,14 +315,23 @@ func Sweep(dir string) error {
 // an orphan (the sweep found it). Its containers are removed by the session
 // label, the issue dir is deleted, then the record; whatever it is that
 // fails keeps what the retry needs — the record stays — and releases the
-// lock either way: after this, nothing of sb holds the name.
-func StopSession(dir, name string, lock *Lock) error {
+// lock either way: after this, nothing of sb holds the name. With the
+// issuing tasks still writing (issuanceExited false) the issue dir is
+// not deleted: the removal would race what they are still writing; the
+// record stays, and the next sweep retries with it.
+func StopSession(dir, name string, lock *Lock, issuanceExited bool) error {
 	defer lock.Release()
 	rec, err := LoadRecord(dir, name)
 	if err != nil {
 		return ReclaimError(Record{Name: name}, dir)
 	}
 	if err := removeContainers(&rec); err != nil {
+		return ReclaimError(rec, dir)
+	}
+	if !issuanceExited {
+		// The issuing tasks are still writing the issue dir: removing
+		// it would race what they are writing next. The record
+		// stays; the next sweep retries with it.
 		return ReclaimError(rec, dir)
 	}
 	if rec.IssueDir != "" {
@@ -333,7 +349,7 @@ func StopSession(dir, name string, lock *Lock) error {
 // label. Each runtime call is bounded by RuntimeWait: a runtime that does
 // not answer within it is killed, and the removal is a failed one.
 func removeContainers(rec *Record) error {
-	rt, err := containers.Parse(rec.Runtime)
+	rt, err := containers.ParseName(rec.Runtime)
 	if err != nil {
 		return err
 	}
@@ -354,23 +370,30 @@ const RuntimeWait = 5 * time.Second
 func ReclaimError(rec Record, dir string) error {
 	binary := rec.Runtime
 	var runtime containers.Runtime
-	if rt, err := containers.Parse(rec.Runtime); err == nil {
+	if rt, err := containers.ParseName(rec.Runtime); err == nil {
 		runtime, binary = rt, rt.Binary()
 	}
 	list := fmt.Sprintf("%s ps -aq --filter label=%s=%s", binary, containers.LabelSession, rec.ID)
+	rm := "<the ids it lists>"
+	pick := ""
 	if runtime == containers.Apple {
-		// The apple CLI lists as JSON: the containers carrying the
-		// session label are picked out of it by hand.
+		// The apple CLI lists everything as JSON: what this session
+		// left behind is picked out of it by hand — only the
+		// containers carrying the session label; the rest belong to
+		// other sessions, or to no sb at all.
 		list = fmt.Sprintf("%s ls --all --format json", binary)
+		pick = fmt.Sprintf("  # pick the ids whose labels carry %s=%s — only those\n", containers.LabelSession, rec.ID)
+		rm = "<the ids picked above>"
 	}
 	return fmt.Errorf("session %q: containers left behind by a failed removal\n"+
 		"(runtime %s, session id %s, container id %q);\n"+
 		"reclaim them by hand, then start again:\n"+
-		"  %s\n"+
-		"  %s rm -f <the ids it lists>\n"+
+		"  %s\n%s"+
+		"  %s rm -f %s\n"+
 		"  rm -rf %s\n"+
 		"  rm %s",
 		rec.Name, binary, rec.ID, rec.ContainerID,
-		list,
-		binary, rec.IssueDir, RecordPath(dir, rec.Name))
+		list, pick,
+		binary, rm,
+		rec.IssueDir, RecordPath(dir, rec.Name))
 }

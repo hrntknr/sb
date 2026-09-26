@@ -7,7 +7,8 @@ import (
 
 // StoppedContext returns a context that is done when stop is done (the
 // stop began) or when base is, whichever comes first. A context issued
-// after the stop began is cancelled from its first use.
+// after the stop began is cancelled before it is returned: its Done is
+// receivable from the first use, like a standard cancelled context's.
 func StoppedContext(stop, base context.Context) context.Context {
 	if stop == nil {
 		return base
@@ -16,6 +17,16 @@ func StoppedContext(stop, base context.Context) context.Context {
 		return stop
 	}
 	ctx := &stoppedContext{stop: stop, base: base, done: make(chan struct{})}
+	if stop.Err() != nil {
+		// The stop already began: the context is cancelled here, not
+		// by a goroutine that runs later.
+		close(ctx.done)
+		return ctx
+	}
+	// The rest is done when the stop begins or the base ends, whichever
+	// comes first. The close is unconditional: a reader waiting on Done
+	// is unblocked when the base ends too, not only when the stop began.
+	// The watch ends when either did: nothing tracks the stop anymore.
 	go func() {
 		select {
 		case <-stop.Done():

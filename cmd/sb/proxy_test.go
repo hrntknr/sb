@@ -5,9 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/hrntknr/sb/internal/awsproxy"
 	v3 "github.com/hrntknr/sb/internal/config/v3"
 )
 
@@ -30,6 +33,42 @@ func startProxyTestEnv(t *testing.T) (awsSource string, kubeconfigPath string) {
 	kubeconfigPath = filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", kubeconfigPath)
 	return awsSource, kubeconfigPath
+}
+
+// writeK8sSource writes a usable source kubeconfig at path: what the k8s
+// side's initial issuance reads.
+func writeK8sSource(t *testing.T, path string) {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\nclusters:\n" +
+		"- name: dev\n  cluster:\n    server: https://127.0.0.1:6443\n    insecure-skip-tls-verify: true\n" +
+		"users:\n- name: dev\n  user:\n    token: upstream-token\n" +
+		"contexts:\n- name: dev\n  context:\n    cluster: dev\n    user: dev\ncurrent-context: dev\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// startProxyBounded runs startProxy with a return bound: a start that does
+// not return — a ready that never comes, an issuance that never begins —
+// is a hung start, and the bound reports it instead of waiting forever.
+func startProxyBounded(t *testing.T, ctx context.Context, cfg v3.Config, opts options, host, dir string) (*proxyServer, error) {
+	t.Helper()
+	type startResult struct {
+		server *proxyServer
+		err    error
+	}
+	done := make(chan startResult, 1)
+	go func() {
+		server, err := startProxy(ctx, cfg, opts, host, dir)
+		done <- startResult{server, err}
+	}()
+	select {
+	case r := <-done:
+		return r.server, r.err
+	case <-time.After(10 * time.Second):
+		t.Fatal("startProxy did not return: a ready that never comes held it")
+		return nil, nil // not reached: Fatal ends the test
+	}
 }
 
 // TestStartProxyFailureStopsTheOtherSide covers the failed start: one
@@ -107,4 +146,294 @@ func waitForPathGone(t *testing.T, path string, deadline time.Duration) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// TestStartProxyK8sWatcherSetupFailureIsReported covers the k8s side's
+// watcher setup failing: the kubeconfig path's parent exists as a file, so
+// the MkdirAll that prepares the watched dir fails. The setup's own
+// failure must be the start's result: a start that waits for a ready
+// that never comes would hang instead.
+func TestStartProxyK8sWatcherSetupFailureIsReported(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	// The kubeconfig's parent is a file: the watcher setup's MkdirAll
+	// fails on it. The aws source keeps its side's setup working.
+	writeK8sSource(t, kubeconfigPath)
+	blocker := t.TempDir()
+	blockerFile := filepath.Join(blocker, "blocker")
+	if err := os.WriteFile(blockerFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", filepath.Join(blockerFile, "config"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	if err == nil {
+		t.Fatal("startProxy() with a failing watcher setup; want a failure")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("startProxy() = %v; want the watcher setup's own failure", err)
+	}
+	// Nothing the failed start issued stays behind it.
+	for _, name := range []string{".ssh", ".kube", ".aws"} {
+		if _, statErr := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("%s still exists after the failed start: %v", name, statErr)
+		}
+	}
+}
+
+// TestStartProxyAWSWatcherSetupFailureIsReported covers the aws side's
+// watcher setup failing: the source config path's parent exists as a file.
+// The setup's own failure must reach the start — without it, the start
+// hangs waiting for a ready that never comes.
+func TestStartProxyAWSWatcherSetupFailureIsReported(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	// The k8s source stays working: the aws side's setup is the failure.
+	writeK8sSource(t, kubeconfigPath)
+	blocker := t.TempDir()
+	blockerFile := filepath.Join(blocker, "blocker")
+	if err := os.WriteFile(blockerFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(blockerFile, "config"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	if err == nil {
+		t.Fatal("startProxy() with a failing watcher setup; want a failure")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("startProxy() = %v; want the watcher setup's own failure", err)
+	}
+	for _, name := range []string{".ssh", ".kube", ".aws"} {
+		if _, statErr := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("%s still exists after the failed start: %v", name, statErr)
+		}
+	}
+}
+
+// TestStartProxyCancelledDuringReadyWait covers the run cancelled while
+// the start waits for the k8s issuance's ready: the initial sync is stuck
+// in the source read (the kubeconfig is a fifo with no writer), so the
+// ready never comes. The cancellation must end the start: the cancelled
+// run is a failed start, and what the hung issuance would write stays —
+// the issuance it is still in the middle of is not waited out.
+func TestStartProxyCancelledDuringReadyWait(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	// The kubeconfig is a fifo: the k8s side's initial sync hangs in
+	// the source read, and the ready it would signal never comes.
+	if err := syscall.Mkfifo(kubeconfigPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(kubeconfigPath) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	go func() {
+		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
+		cancel()
+	}()
+	server, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_ = server
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("startProxy() = %v; want context.Canceled", err)
+	}
+	// The issuing task did not exit within the deadline: its removal
+	// would race what it is still writing. What was issued stays.
+	if _, statErr := os.Stat(filepath.Join(issueDir, ".ssh")); os.IsNotExist(statErr) {
+		t.Fatal(".ssh was removed while the issuing task is still writing")
+	}
+	// The read completes: the task's last write lands, then it exits on
+	// the next select. Waiting for the write keeps this test's cleanup
+	// from removing the issue dir while the write is still landing.
+	first, rest := kubeconfigFifoParts()
+	releaseFifo(t, kubeconfigPath, first, rest)
+	waitForPathExists(t, filepath.Join(issueDir, ".kube", "config"))
+}
+
+// waitForPathExists fails the test if path does not appear within the
+// deadline: the task's last write must land before the test ends.
+func waitForPathExists(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("%s never appeared; the task did not finish its last write", path)
+}
+
+// TestStartProxyAWSCancelledDuringReadyWait covers the same for the aws
+// side: the source config is a fifo, so the initial sync's profile read
+// (a config with aws targets reads the source) never completes.
+func TestStartProxyAWSCancelledDuringReadyWait(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	writeK8sSource(t, kubeconfigPath) // the k8s side starts cleanly
+	// One aws rule: the aws side's sync reads the source profiles.
+	cfg := v3.Config{AWS: []v3.AWSRule{{
+		Profile:  "dev",
+		RoleARN:  "arn:aws:iam::123456789012:role/dev",
+		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "r"}},
+	}}}
+	sourcePath := os.Getenv("AWS_CONFIG_FILE")
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(sourcePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(sourcePath) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	go func() {
+		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
+		cancel()
+	}()
+	server, err := startProxyBounded(t, ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_ = server
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("startProxy() = %v; want context.Canceled", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(issueDir, ".ssh")); os.IsNotExist(statErr) {
+		t.Fatal(".ssh was removed while the issuing task is still writing")
+	}
+	// The read completes: the task's last write lands, then it exits on
+	// the next select. Waiting for the write keeps this test's cleanup
+	// from removing the issue dir while the write is still landing.
+	releaseFifo(t, sourcePath, "[profile dev]\n", "region = eu-west-1\n")
+	waitForPathExists(t, filepath.Join(issueDir, ".aws", "config"))
+}
+
+// TestStopJoinsTheIssuanceTasks covers the normal stop's join: an update
+// write in flight when the stop begins is waited for — the deletion of
+// what the issuing task wrote happens only after it exited, so what it is
+// still writing does not come back after the deletion. Without the join,
+// the stop returns while the write is in flight: the deletion lands under
+// it, and the write brings the issued files back.
+func TestStopJoinsTheIssuanceTasks(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	// Both sides start cleanly: the issuances succeed, the start
+	// returns a server both sides' loops follow.
+	writeK8sSource(t, kubeconfigPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	server, err := startProxy(ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The kubeconfig becomes a fifo: the change event the watcher
+	// delivers for it puts the k8s side's sync in the middle of the
+	// source read — the update write in flight, held there.
+	if err := os.Remove(kubeconfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(kubeconfigPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(kubeconfigPath) })
+
+	// Wait for the update to be in flight: the sync is in the source
+	// read by now.
+	time.Sleep(300 * time.Millisecond)
+
+	// The stop joins the issuing task within the deadline: with the
+	// write in flight, the join is what waits out the release below.
+	stopped := make(chan bool, 1)
+	go func() { stopped <- server.Stop(shutdownCtx()) }()
+
+	// The release: the fifo gets the source's next content — in
+	// parts, the last one late: the read completes at the end of
+	// them, so the update write lands after it. The join waits that
+	// out; without it, the deletion below races the write.
+	first, rest := kubeconfigFifoParts()
+	releaseFifo(t, kubeconfigPath, first, rest)
+	// The replace's second event may start another sync while the
+	// first is in flight: its reader is blocked at the fifo's open,
+	// waiting for a writer. Pair it: the reader proceeds with the
+	// data, the sync completes, the task exits within the join's
+	// deadline.
+	pairFifo(t, kubeconfigPath, first, rest)
+
+	joined := <-stopped
+	if !joined {
+		t.Fatal("Stop() did not join the issuing task within the deadline")
+	}
+	// The deletion: what the issuing task wrote is gone after it.
+	removeIssued(issueDir)
+
+	// The join means the exit: nothing writes anymore. What the
+	// update would have written after the deletion does not come
+	// back.
+	waitForPathGone(t, filepath.Join(issueDir, ".kube"), 5*time.Second)
+	if _, err := os.Stat(filepath.Join(issueDir, ".ssh")); !os.IsNotExist(err) {
+		t.Fatalf(".ssh exists after the removal: %v", err)
+	}
+}
+
+// pairFifo opens the fifo for writing and waits for a reader: the open
+// pairs with a reader blocked at its own open — both proceed, the data
+// flows, the reader completes at the close's EOF. No reader coming
+// within the limit means no reader waits at the fifo.
+func pairFifo(t *testing.T, path, first, rest string) bool {
+	t.Helper()
+	paired := make(chan error, 1)
+	go func() {
+		writer, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+		if err != nil {
+			paired <- err
+			return
+		}
+		if _, err = writer.WriteString(first); err == nil {
+			time.Sleep(200 * time.Millisecond)
+			_, err = writer.WriteString(rest)
+		}
+		if cerr := writer.Close(); err == nil {
+			err = cerr
+		}
+		paired <- err
+	}()
+	select {
+	case <-paired:
+		return true
+	case <-time.After(3 * time.Second):
+		return false
+	}
+}
+func releaseFifo(t *testing.T, path, first, rest string) {
+	t.Helper()
+	writer, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteString(first); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := writer.WriteString(rest); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// kubeconfigFifoParts is a kubeconfig delivered in two parts: the read
+// completes only at the last one, so what the read's completion triggers
+// lands after it.
+func kubeconfigFifoParts() (first, rest string) {
+	return "apiVersion: v1\nkind: Config\nclusters:\n",
+		"- name: dev\n  cluster:\n    server: https://127.0.0.1:9999\n    insecure-skip-tls-verify: true\n" +
+			"users:\n- name: dev\n  user:\n    token: upstream-token\n" +
+			"contexts:\n- name: dev\n  context:\n    cluster: dev\n    user: dev\ncurrent-context: dev\n"
 }

@@ -57,8 +57,10 @@ func identityFileSigners(identityFiles []string) []cryptossh.Signer {
 }
 
 // sshAgentSigners lists the agent's signers. The agent connection is
-// watched: a stop that begins while the Signers call waits closes the
-// connection, unblocking the read it is stuck on.
+// watched while the auth waits: a stop that begins then closes the
+// connection, unblocking the read it is stuck on. The watch ends with
+// the auth — the call below returning is the end of the wait, nothing
+// watches for the stop anymore.
 func sshAgentSigners(ctx context.Context, socketPath string) ([]cryptossh.Signer, net.Conn) {
 	if socketPath == "" {
 		return nil, nil
@@ -67,11 +69,16 @@ func sshAgentSigners(ctx context.Context, socketPath string) ([]cryptossh.Signer
 	if err != nil {
 		return nil, nil
 	}
+	watch := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		conn.Close()
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-watch:
+		}
 	}()
 	signers, err := agent.NewClient(conn).Signers()
+	close(watch)
 	if err != nil {
 		conn.Close()
 		return nil, nil

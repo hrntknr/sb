@@ -11,10 +11,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/hrntknr/sb/internal/awsproxy"
 	v3 "github.com/hrntknr/sb/internal/config/v3"
 	"github.com/hrntknr/sb/internal/k8sproxy"
+	"github.com/hrntknr/sb/internal/session"
 	"github.com/hrntknr/sb/internal/sshproxy"
 	"github.com/spf13/cobra"
 )
@@ -50,10 +52,15 @@ func newProxyCommand(opts *options) *cobra.Command {
 			}
 			err = proxy.Wait()
 			// The stop flow is the same on every exit: the proxies stop
-			// accepting and cancel their upstreams within the deadline,
-			// then the issued credentials are gone.
-			proxy.Stop(shutdownCtx())
-			removeIssued(args[0])
+			// accepting, cancel their upstreams, and are waited for
+			// within the deadline. What did not exit keeps what it
+			// issued: the removal would race what it is still
+			// writing.
+			if proxy.Stop(shutdownCtx()) {
+				removeIssued(args[0])
+			} else {
+				err = errors.Join(err, fmt.Errorf("proxy stop: an issuing task did not exit within %s; remove %s by hand once it is done", session.RuntimeWait, args[0]))
+			}
 			return err
 		},
 	}
@@ -108,58 +115,82 @@ func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir stri
 	}
 	// Everything after this point is undone on failure: the listeners
 	// close, nothing sb issued stays behind a failed start.
-	fail := func(err error) (*proxyServer, error) {
+	fail := func(err error) error {
 		sshListener.Close()
 		k8sListener.Close()
 		awsListener.Close()
-		return nil, err
+		return err
 	}
 	if err := sshProxy.WriteConfig(host, listenerPort(sshListener), dir); err != nil {
 		// The ssh issuance failed midway: nothing sb issued stays
-		// behind a failed start.
+		// behind a failed start. Nothing else was started: the ssh
+		// issuance runs before the issuing tasks.
 		removeIssued(dir)
-		return fail(err)
+		return nil, fail(err)
 	}
 
-	server := &proxyServer{ctx: ctx, errc: make(chan error, 6), ssh: sshProxy, k8s: k8sProxy, aws: awsProxy}
-	// The k8s and AWS issuances signal their initial write's own result
-	// (nil: the initial issuance succeeded) through their ready channel;
-	// the goroutine's return (a component's exit before its issuance
-	// was ready) is not that result.
-	k8sReady, awsReady := make(chan error, 1), make(chan error, 1)
+	server := &proxyServer{
+		ctx: ctx, errc: make(chan error, 6),
+		ssh: sshProxy, k8s: k8sProxy, aws: awsProxy,
+	}
+	// The issuing tasks' termination notifications are the server's:
+	// the start's failure path and the normal stop both wait for them.
 	k8sDone, awsDone := make(chan struct{}), make(chan struct{})
+	server.k8sDone, server.awsDone = k8sDone, awsDone
+	// The k8s and AWS issuances signal the initial write's own result
+	// (nil: the initial issuance succeeded) through their ready channel —
+	// the watcher setup's failure included; the goroutine's return (a
+	// component's exit before its issuance was ready) is not that result.
+	// The ports are taken here, before the goroutines start: a failure
+	// path closes the listeners, and a closed listener's address is gone.
+	k8sPort, awsPort := listenerPort(k8sListener), listenerPort(awsListener)
+	k8sReady, awsReady := make(chan error, 1), make(chan error, 1)
 	go func() {
-		server.errc <- k8sProxy.SyncConfig(ctx, listenerPort(k8sListener), dir, k8sReady)
+		server.errc <- k8sProxy.SyncConfig(ctx, k8sPort, dir, k8sReady)
 		close(k8sDone)
 	}()
 	go func() {
-		server.errc <- awsProxy.SyncConfig(ctx, listenerPort(awsListener), dir, awsReady)
+		server.errc <- awsProxy.SyncConfig(ctx, awsPort, dir, awsReady)
 		close(awsDone)
 	}()
-	// A failure anywhere stops both issuances and waits for their
-	// exit: the removal happens after what the other side issued
-	// landed, not before it.
+	// A failure anywhere stops both issuances and waits for their exit:
+	// the removal happens after what the other side issued landed, not
+	// before it. What does not exit within the deadline is not waited
+	// for; what it is still writing stays.
 	failStartup := func(err error) (*proxyServer, error) {
 		k8sProxy.BeginStop()
 		awsProxy.BeginStop()
-		<-k8sDone
-		<-awsDone
-		removeIssued(dir)
-		return fail(err)
+		if awaitDone(session.RuntimeWait, k8sDone, awsDone) {
+			removeIssued(dir)
+		}
+		return server, fail(err)
 	}
 	for _, ready := range []chan error{k8sReady, awsReady} {
+		// A cancelled run is a failed start, whatever the issuances
+		// delivered: the check comes first, so a cancellation that
+		// already happened is always the run's own result.
 		if err := ctx.Err(); err != nil {
+			return failStartup(err)
+		}
+		select {
+		case err := <-ready:
+			if err != nil {
+				// The issuance that failed is not the only one
+				// running: both stop here, and what they issued
+				// is gone once they have exited.
+				return failStartup(err)
+			}
+		case <-ctx.Done():
 			// The run was cancelled mid-startup: not a success.
 			// The components exit (their loops are cut by the
 			// ctx), what they issued is gone, nothing starts.
-			return failStartup(err)
+			return failStartup(ctx.Err())
 		}
-		if err := <-ready; err != nil {
-			// The issuance that failed is not the only one
-			// running: both stop here, and what they issued
-			// is gone once they have exited.
-			return failStartup(err)
-		}
+	}
+	// The last ready is in: a cancellation that began while it landed
+	// is still a failed start.
+	if err := ctx.Err(); err != nil {
+		return failStartup(err)
 	}
 
 	go serve(ctx, server.errc, sshListener, sshProxy.Serve)
@@ -176,6 +207,12 @@ type proxyServer struct {
 	ssh  *sshproxy.Proxy
 	k8s  *k8sproxy.Proxy
 	aws  *awsproxy.Proxy
+	// k8sDone and awsDone close when the issuing tasks exit: the sync
+	// goroutines' work is over. They are waited for within the shutdown
+	// deadline, so the removal of what they issued happens after they
+	// exit — not while they are still writing it.
+	k8sDone chan struct{}
+	awsDone chan struct{}
 }
 
 // Wait blocks until the proxies stop: nil after cancellation, otherwise the
@@ -191,16 +228,34 @@ func (s *proxyServer) Wait() error {
 
 // Stop stops the proxies: first they stop accepting and cancel their
 // upstreams (the beginning of the shutdown, every proxy at once), then
-// each waits for its cleanup within ctx's deadline. The deadline is made
-// here, when the shutdown starts, so a long-lived session does not stop
-// with an expired one.
-func (s *proxyServer) Stop(ctx context.Context) {
+// each waits for its cleanup within ctx's deadline. The issuing tasks
+// are waited for the same way: a write in flight at the stop completes
+// before it returns. Stop reports whether they exited within ctx's
+// deadline: false means the removal of what they issued must not happen
+// — it would race what they are still writing.
+func (s *proxyServer) Stop(ctx context.Context) bool {
 	s.ssh.BeginStop()
 	s.k8s.BeginStop()
 	s.aws.BeginStop()
+	exited := s.awaitIssuance(ctx)
 	s.ssh.Shutdown(ctx)
 	s.k8s.Shutdown(ctx)
 	s.aws.Shutdown(ctx)
+	return exited
+}
+
+// awaitIssuance waits for the issuing tasks' exit within ctx's deadline.
+// What does not exit by then is given up on: what it is still writing
+// may land after any removal, so the caller treats it as not reclaimed.
+func (s *proxyServer) awaitIssuance(ctx context.Context) bool {
+	for _, done := range []chan struct{}{s.k8sDone, s.awsDone} {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 func listenAll(sshAddr, k8sAddr, awsAddr string) (ssh, k8s, aws net.Listener, err error) {
@@ -235,4 +290,21 @@ func serve(ctx context.Context, errc chan<- error, listener net.Listener, serve 
 	if err := serve(listener); err != nil && ctx.Err() == nil {
 		errc <- err
 	}
+}
+
+// awaitDone waits for the issuing tasks' termination notifications within
+// limit. What does not exit by then is given up on: what it is still
+// writing may land after any removal, so the caller treats it as not
+// reclaimed.
+func awaitDone(limit time.Duration, done ...chan struct{}) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	for _, ch := range done {
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }

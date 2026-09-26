@@ -45,7 +45,7 @@ func (c Config) AWSTargets() []awsproxy.Target {
 			Profile:  rule.Profile,
 			RoleARN:  rule.RoleARN,
 			Regions:  rule.Regions,
-			Services:  rule.Services,
+			Services: rule.Services,
 		})
 	}
 	return targets

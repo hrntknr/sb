@@ -46,7 +46,9 @@ func withoutExitCode(err error) error {
 }
 
 // dropExitCode flattens err, dropping the exit-code parts: they are kept
-// by their code, not shown with the rest.
+// by their code, not shown with the rest. A single-part wrapper is not
+// dropped for carrying an exit code: what is left after the drop is its
+// story, and the wrapper stays — the exit code inside it shows with it.
 func dropExitCode(err error, rest *[]error) {
 	if err == nil {
 		return
@@ -57,8 +59,20 @@ func dropExitCode(err error, rest *[]error) {
 		}
 		return
 	}
-	var code *exitCodeError
-	if errors.As(err, &code) {
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if inner := wrapped.Unwrap(); inner != nil {
+			var innerRest []error
+			dropExitCode(inner, &innerRest)
+			if len(innerRest) == 0 {
+				// The wrapper is the exit code alone: dropped.
+				return
+			}
+		}
+		*rest = append(*rest, err)
+		return
+	}
+	if _, ok := err.(*exitCodeError); ok {
+		// The exit-code part itself: dropped wherever it sits.
 		return
 	}
 	*rest = append(*rest, err)

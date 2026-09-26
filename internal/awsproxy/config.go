@@ -75,17 +75,26 @@ func profiles() ([]string, map[string]string, error) {
 // SyncConfig issues downstream-only credentials and follows source profile
 // changes, keeping each existing profile's credentials stable across rewrites.
 func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- error) error {
+	// result reports the setup's own outcome through ready, so the
+	// start waiting on it learns about a failed setup: without it the
+	// caller would wait forever for an issuance that never began.
+	result := func(err error) error {
+		if ready != nil {
+			ready <- err
+		}
+		return err
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return err
+		return result(err)
 	}
 	defer watcher.Close()
 	for _, path := range sourceFiles() {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return err
+			return result(err)
 		}
 		if err := watcher.Add(filepath.Dir(path)); err != nil {
-			return err
+			return result(err)
 		}
 	}
 	err = p.syncOnce(port, dir)
