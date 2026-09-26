@@ -28,6 +28,10 @@ go.work.sum
 # env file
 .env
 
+# Python tooling for tools/gen_aws_policy
+tools/gen_aws_policy/.venv/
+tools/gen_aws_policy/__pycache__/
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -16,17 +16,19 @@ import (
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/hrntknr/sb/internal/awsproxy"
 	"github.com/hrntknr/sb/internal/k8sproxy"
 	"github.com/hrntknr/sb/internal/sshproxy"
 	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
-// Config is the merged policy for the ssh and k8s proxies and the
+// Config is the merged policy for the ssh, k8s and AWS proxies and the
 // container settings for `sb run`.
 type Config struct {
 	SSH []sshproxy.Target
 	K8s []k8sproxy.Target
+	AWS []awsproxy.Target
 	// Container configures how `sb run` launches the container.
 	Container Container
 	// Proxy configures the credential proxies.
@@ -34,7 +36,7 @@ type Config struct {
 }
 
 // Proxy is the `proxy` section of the config: settings shared by the
-// ssh and k8s proxies.
+// credential proxies.
 type Proxy struct {
 	// SSHAgentEnv is the env file exporting SSH_AUTH_SOCK, re-read on
 	// every upstream connection; empty uses the process environment.
@@ -60,6 +62,7 @@ type Container struct {
 type file struct {
 	SSH       []sshTarget    `yaml:"ssh"`
 	K8s       []k8sTarget    `yaml:"k8s"`
+	AWS       []awsTarget    `yaml:"aws"`
 	Container *containerFile `yaml:"container"`
 	Proxy     *proxyFile     `yaml:"proxy"`
 }
@@ -73,6 +76,13 @@ type k8sTarget struct {
 	Context   string `yaml:"context"`
 	Mode      string `yaml:"mode"`
 	Namespace string `yaml:"namespace"`
+}
+
+type awsTarget struct {
+	Profile  string             `yaml:"profile"`
+	RoleARN  string             `yaml:"roleArn"`
+	Services []awsproxy.Service `yaml:"services"`
+	Regions  []string           `yaml:"regions"`
 }
 
 type containerFile struct {
@@ -206,6 +216,21 @@ func build(f file) (Config, error) {
 		}
 		k8s = append(k8s, target)
 	}
+	aws := make([]awsproxy.Target, 0, len(f.AWS))
+	for i, item := range f.AWS {
+		if strings.TrimSpace(item.Profile) == "" || len(item.Services) == 0 {
+			return Config{}, fmt.Errorf("aws target %d: profile and services are required", i)
+		}
+		if item.RoleARN != "" && !awsproxy.ValidRoleARN(item.RoleARN) {
+			return Config{}, fmt.Errorf("aws target %d: invalid roleArn %q", i, item.RoleARN)
+		}
+		for _, service := range item.Services {
+			if !awsproxy.ValidService(service) {
+				return Config{}, fmt.Errorf("aws target %d: unsupported service/mode %q/%q", i, service.Name, service.Mode)
+			}
+		}
+		aws = append(aws, awsproxy.Target{Profile: item.Profile, RoleARN: item.RoleARN, Services: item.Services, Regions: item.Regions})
+	}
 
 	var container Container
 	if f.Container != nil {
@@ -244,7 +269,7 @@ func build(f file) (Config, error) {
 	if f.Proxy != nil {
 		proxy.SSHAgentEnv = util.ExpandHome(strings.TrimSpace(f.Proxy.SSHAgentEnv))
 	}
-	return Config{SSH: ssh, K8s: k8s, Container: container, Proxy: proxy}, nil
+	return Config{SSH: ssh, K8s: k8s, AWS: aws, Container: container, Proxy: proxy}, nil
 }
 
 func mergeConfDir(dir string, dst *Config) error {
@@ -290,6 +315,19 @@ func merge(dst *Config, src Config) {
 			dst.K8s[i] = target
 		} else {
 			dst.K8s = append(dst.K8s, target)
+		}
+	}
+	for _, target := range src.AWS {
+		found := false
+		for i := range dst.AWS {
+			if dst.AWS[i].Profile == target.Profile {
+				dst.AWS[i] = target
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst.AWS = append(dst.AWS, target)
 		}
 	}
 	if src.Container.Runtime != "" {

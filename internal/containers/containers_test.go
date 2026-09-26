@@ -31,7 +31,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -43,7 +43,7 @@ func TestArgs(t *testing.T) {
 			init:     true,
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--init", "--add-host", "host.docker.internal:host-gateway",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -59,7 +59,7 @@ func TestArgs(t *testing.T) {
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
 				"--env", "FOO=bar", "--env", "LANG",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
@@ -71,7 +71,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -82,7 +82,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"npm", "install"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"ghcr.io/hrntknr/sh:full", "npm", "install"},
 		},
 		{
@@ -93,7 +93,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
@@ -105,7 +105,7 @@ func TestArgs(t *testing.T) {
 			image:    "ghcr.io/hrntknr/sh:full",
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-v", "/home/me/.config/opencode:/root/.config/opencode",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
@@ -117,7 +117,7 @@ func TestArgs(t *testing.T) {
 			tty:     false,
 			image:   "ghcr.io/hrntknr/sh:full",
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
 				"ghcr.io/hrntknr/sh:full"},
 		},
 	}

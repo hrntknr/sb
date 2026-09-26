@@ -1,8 +1,8 @@
 # sb
 
-`sb` is a credential proxy that issues **scoped, policy-restricted credentials** instead of handing over your real SSH keys or kubeconfig, so you can mount them into another environment (a Docker container, an AI agent sandbox, etc.) and let it use them safely.
+`sb` is a credential proxy that issues **scoped, policy-restricted credentials** instead of handing over your real SSH keys, kubeconfig, or AWS credentials, so you can mount them into another environment (a Docker container, an AI agent sandbox, etc.) and let it use them safely.
 
-It generates `.ssh` / `.kube` under a given directory and proxies SSH and Kubernetes access while enforcing the policy defined in the config file.
+It generates `.ssh` / `.kube` / `.aws` under a given directory and proxies SSH, Kubernetes, and supported AWS access while enforcing the policy defined in the config file.
 
 ## Getting Started
 
@@ -17,12 +17,12 @@ Or run the proxy manually and mount the generated credentials yourself:
 ```
 $ tmp=$(mktemp -d)
 $ sb proxy $tmp &
-$ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.kube ghcr.io/hrntknr/sh:full
+$ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.kube -v $tmp/.aws:/root/.aws ghcr.io/hrntknr/sh:full
 ```
 
 ## Running containers: `sb run`
 
-`sb run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs the image set as `container.image` in the config with the scoped credentials mounted at `/root/.ssh` and `/root/.kube`. The container's exit code becomes sb's. The container is named with `--name` (default `default`), so that [`sb exec`](#running-commands-inside-sb-exec) can target it.
+`sb run` wraps the whole flow: it starts the proxy in the background, picks a runtime, and runs the image set as `container.image` in the config with the scoped credentials mounted at `/root/.ssh`, `/root/.kube`, and `/root/.aws`. The container's exit code becomes sb's. The container is named with `--name` (default `default`), so that [`sb exec`](#running-commands-inside-sb-exec) can target it.
 
 The runtime — docker, podman, or the apple container CLI (macOS) — is auto-detected in that order; select one with `container.runtime` in the config. The arguments form the container command; no arguments at all runs the image's default command. Use `--` when the command starts with `-`:
 
@@ -87,6 +87,15 @@ k8s:
   - context: "*"
     mode: r
     namespace: default          # omit for cluster scope
+aws:
+  - profile: dev                 # source AWS profile name
+    roleArn: arn:aws:iam::123456789012:role/sb-dev
+    regions: [eu-west-1]        # optional; defaults to all regions
+    services:
+      - name: dynamodb
+        mode: r                  # r (ReadOnlyAccess actions) / rw (all operations)
+      - name: sts
+        mode: r
 proxy:
   sshAgentEnv: ~/.cache/sb-agent.env
 ```
@@ -127,9 +136,21 @@ Entries from `conf.d/` are merged: `runtime` and `image` are overridden by later
 
 k8s policy is keyed by **kubeconfig context name**. Contexts that point at the same cluster are isolated from each other, so granting `rw` to the `dev` context does not grant `rw` to a `prod` context even when both use the same cluster.
 
+### AWS profiles
+
+AWS policy is keyed by **source profile name**. Each allowed profile is written to the generated `.aws/config` and `.aws/credentials` with a new proxy-only key and an HTTPS `endpoint_url` (and `ca_bundle`). The proxy verifies SigV4, checks the profile, region, service, and operation, then signs upstream requests with the assumed role's credentials — without a session policy: the proxy filter alone enforces the policy, and the role's own IAM permissions are the only AWS-side upper bound. `roleArn` may be omitted: without it the proxy signs upstream requests with the source profile's own credentials and no role is assumed; `roleArn` must otherwise match `arn:aws:iam::<account>:role/<name>`. When set, the source profile must be able to call `sts:AssumeRole` on that role and the role must trust that source principal, and matching targets must agree on the role. Long-running sessions are refreshed automatically. The source credentials never enter the container.
+
+`services` supports JSON (`X-Amz-Target`), Query (form-encoded `Action`), and EC2 POST APIs covered by the embedded [AWS Service Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/service-reference.html) — currently 128 services, including `sts`, `ec2`, `dynamodb`, `logs`, `kinesis`, `iam`, `ses`, `budgets`, and Cost Explorer. REST (`route53`, `s3` itself), CBOR, SigV2, multi-endpoint services that cannot be represented by one fixed or regional host template, and console-only services (`a2c`) are rejected when loading the config. For `r`, an operation is permitted only when every action exercising it matches the [AWS ReadOnlyAccess policy](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/ReadOnlyAccess.html). Operations with any non-read-only action or without an operation-to-action mapping fail closed for `r`. A supported service without any read operation has an empty `read` list.
+
+AWS ReadOnlyAccess includes operations that return credentials, authentication tokens, client secrets, or remote-access endpoints. These operations are allowed in `r`. A returned credential or capability may remain usable outside sb, bypassing its service, region, request-shape, logging, and lifecycle controls; some can lead to a different principal whose permissions are not bounded by the assumed role. The assumed role's IAM permissions are the AWS-side upper bound only where the returned capability represents that same principal. Use a dedicated role with AWS ReadOnlyAccess or a stricter policy when this risk is unacceptable.
+
+sb validates the wire shape before authorizing it: JSON requests must use the model's exact `application/x-amz-json-*` media type and `targetPrefix` with a JSON object body, while Query and EC2 requests must use `application/x-www-form-urlencoded`, provide exactly one form-encoded `Action`, and omit `X-Amz-Target`. Upstream hosts and signing-region overrides are not inferred from endpoint-rule text. `cd tools/gen_aws_policy && uv run python main.py` runs the uv-pinned botocore endpoint provider (`pyproject.toml`, `uv.lock`) for every commercial AWS region and keeps only results that mechanically reduce to one fixed host or one `{region}` host template. It also fetches the current default ReadOnlyAccess policy and AWS Service Reference mappings, then updates the committed `services.json` only when its content changes. Regeneration requires `uv`; bump the botocore pin in `pyproject.toml` to refresh endpoint data.
+
+`regions` restricts requests in sb (the IAM policy of the role is not region-scoped). The generated profile and upstream STS use the source region, falling back to `us-east-1`. If the source has no `default` profile, sb uses the host's environment or container/instance credentials for it; unset `AWS_PROFILE`/`AWS_DEFAULT_PROFILE` in that case. Profile names may use letters, digits, `_`, `-`, `.`, `@`, and `+`. An AWS client must honor the shared-config `endpoint_url` and `ca_bundle` settings; clients that ignore them cannot use these proxy-only keys. Presigned URLs, streaming requests, and custom AWS endpoints are not supported. Supported requests are SigV4 POST with signed payloads. When using `sb proxy` manually, mount `.aws` at `/root/.aws` so the generated CA path remains valid.
+
 ### Drop-in: `conf.d/`
 
-Additional `*.yaml` (or `*.yml`) files placed in a `conf.d/` directory next to `config.yaml` are merged into the main config. Files are loaded in alphabetical order, so name them with a numeric prefix (e.g. `10-work.yaml`) to control precedence. Targets in later files with the same `host` (SSH) or `context` (k8s) override earlier ones; new targets are appended.
+Additional `*.yaml` (or `*.yml`) files placed in a `conf.d/` directory next to `config.yaml` are merged into the main config. Files are loaded in alphabetical order, so name them with a numeric prefix (e.g. `10-work.yaml`) to control precedence. Targets in later files with the same `host` (SSH), `context` (k8s), or `profile` (AWS) override earlier ones; new targets are appended.
 
 ```
 ~/.config/sb/
@@ -172,6 +193,7 @@ Shared flags (available on every subcommand): `--config` and `--log-level`. `sb 
 | `--host`       | `localhost` | Host written into the generated config |
 | `--ssh-listen` | `:0`        | SSH listen address                     |
 | `--k8s-listen` | `:0`        | k8s listen address                     |
+| `--aws-listen` | `:0`        | AWS listen address                     |
 
 ## Build
 

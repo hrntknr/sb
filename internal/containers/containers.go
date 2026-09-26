@@ -172,6 +172,7 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 	args = append(args,
 		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh",
 		"-v", filepath.Join(dir, ".kube")+":/root/.kube",
+		"-v", filepath.Join(dir, ".aws")+":/root/.aws",
 	)
 	for _, mount := range mounts {
 		args = append(args, "-v", mount)

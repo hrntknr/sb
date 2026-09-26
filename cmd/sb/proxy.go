@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/hrntknr/sb/internal/agentenv"
+	"github.com/hrntknr/sb/internal/awsproxy"
 	"github.com/hrntknr/sb/internal/config"
 	"github.com/hrntknr/sb/internal/k8sproxy"
 	"github.com/hrntknr/sb/internal/sshproxy"
@@ -21,7 +22,7 @@ import (
 func newProxyCommand(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:           "proxy <dir>",
-		Short:         "Run the credential proxy, writing .ssh and .kube under dir",
+		Short:         "Run the credential proxy, writing .ssh, .kube and .aws under dir",
 		Args:          cobra.ExactArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -29,7 +30,7 @@ func newProxyCommand(opts *options) *cobra.Command {
 			if err := configureLogger(opts.logLevel); err != nil {
 				return err
 			}
-			slog.Info("starting sb proxy", "config", opts.configPath, "host", opts.host, "ssh_listen", opts.sshListen, "k8s_listen", opts.k8sListen, "dir", args[0])
+			slog.Info("starting sb proxy", "config", opts.configPath, "host", opts.host, "ssh_listen", opts.sshListen, "k8s_listen", opts.k8sListen, "aws_listen", opts.awsListen, "dir", args[0])
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			proxy, err := startProxy(ctx, *opts, opts.host, args[0])
@@ -42,10 +43,11 @@ func newProxyCommand(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&opts.host, "host", "localhost", "host written into generated config (also covered by the k8s proxy certificate)")
 	cmd.Flags().StringVar(&opts.sshListen, "ssh-listen", defaultListenAddr, "ssh listen address")
 	cmd.Flags().StringVar(&opts.k8sListen, "k8s-listen", defaultListenAddr, "k8s listen address")
+	cmd.Flags().StringVar(&opts.awsListen, "aws-listen", defaultListenAddr, "aws listen address")
 	return cmd
 }
 
-// startProxy starts the ssh and k8s proxies serving credentials under dir
+// startProxy starts the ssh, k8s and AWS proxies serving credentials under dir
 // and returns once those credentials are on disk. host is the address
 // containers use to reach the proxy (from ResolveHost, or the proxy
 // command's --host flag). Cancel ctx to stop them.
@@ -56,16 +58,23 @@ func startProxy(ctx context.Context, opts options, host, dir string) (*proxyServ
 	}
 	sshProxy := sshproxy.New(cfg.SSH, agentenv.Source{Path: cfg.Proxy.SSHAgentEnv}.SocketPath)
 	k8sProxy := k8sproxy.New(cfg.K8s, host)
+	awsProxy := awsproxy.New(cfg.AWS, host)
 
 	sshListener, k8sListener, err := listen(opts.sshListen, opts.k8sListen)
 	if err != nil {
 		return nil, err
 	}
+	awsListener, err := net.Listen("tcp", opts.awsListen)
+	if err != nil {
+		sshListener.Close()
+		k8sListener.Close()
+		return nil, fmt.Errorf("listen aws: %w", err)
+	}
 	if err := sshProxy.WriteConfig(host, listenerPort(sshListener), dir); err != nil {
 		return nil, err
 	}
 
-	server := &proxyServer{ctx: ctx, errc: make(chan error, 4)}
+	server := &proxyServer{ctx: ctx, errc: make(chan error, 6)}
 	// The k8s proxy signals once its kubeconfig (with this process's
 	// certificate) is on disk, so the first request finds valid tokens.
 	ready := make(chan struct{})
@@ -77,12 +86,30 @@ func startProxy(ctx context.Context, opts options, host, dir string) (*proxyServ
 	case err := <-server.errc:
 		return nil, err
 	}
+	awsReady := make(chan error, 1)
+	go func() { server.errc <- awsProxy.SyncConfig(ctx, listenerPort(awsListener), dir, awsReady) }()
+	select {
+	case err := <-awsReady:
+		if err != nil {
+			sshListener.Close()
+			k8sListener.Close()
+			awsListener.Close()
+			return nil, err
+		}
+	case err := <-server.errc:
+		return nil, err
+	}
 	go serve(ctx, server.errc, sshListener, sshProxy.Serve)
 	go serve(ctx, server.errc, k8sListener, k8sProxy.Serve)
+	go serve(ctx, server.errc, awsListener, awsProxy.Serve)
 	go func() {
 		server.errc <- config.Watch(ctx, opts.configPath, func(cfg config.Config) {
 			sshProxy.SetTargets(cfg.SSH)
 			k8sProxy.SetTargets(cfg.K8s)
+			awsProxy.SetTargets(cfg.AWS)
+			if err := awsProxy.Refresh(listenerPort(awsListener), dir); err != nil {
+				slog.Warn("aws config refresh failed", "error", err)
+			}
 		})
 	}()
 	return server, nil

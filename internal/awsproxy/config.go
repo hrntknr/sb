@@ -1,0 +1,187 @@
+package awsproxy
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/pem"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/hrntknr/sb/internal/util"
+	"gopkg.in/ini.v1"
+)
+
+var profileName = regexp.MustCompile(`^[a-zA-Z0-9_.@+\-]+$`)
+
+func sourceFiles() []string {
+	home, _ := os.UserHomeDir()
+	config := os.Getenv("AWS_CONFIG_FILE")
+	if config == "" {
+		config = filepath.Join(home, ".aws", "config")
+	}
+	credentials := os.Getenv("AWS_SHARED_CREDENTIALS_FILE")
+	if credentials == "" {
+		credentials = filepath.Join(home, ".aws", "credentials")
+	}
+	return []string{config, credentials}
+}
+
+func profiles() ([]string, map[string]string, error) {
+	names := map[string]bool{}
+	regions := map[string]string{}
+	for i, path := range sourceFiles() {
+		config, err := ini.Load(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("read aws profiles %s: %w", path, err)
+		}
+		for _, section := range config.Sections() {
+			name := section.Name()
+			if i == 0 {
+				name = strings.TrimPrefix(name, "profile ")
+			}
+			if name == "DEFAULT" {
+				name = "default"
+			}
+			if profileName.MatchString(name) {
+				names[name] = true
+				if i == 0 && section.HasKey("region") {
+					regions[name] = section.Key("region").String()
+				}
+			}
+		}
+	}
+	// The default credential chain can use environment or instance credentials.
+	names["default"] = true
+	var result []string
+	for name := range names {
+		result = append(result, name)
+	}
+	slices.Sort(result)
+	return result, regions, nil
+}
+
+// SyncConfig issues downstream-only credentials and follows source profile
+// changes, keeping each existing profile's credentials stable across rewrites.
+func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- error) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+	for _, path := range sourceFiles() {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return err
+		}
+		if err := watcher.Add(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	err = p.syncOnce(port, dir)
+	if ready != nil {
+		ready <- err
+	}
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case event := <-watcher.Events:
+			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
+				continue
+			}
+			for _, path := range sourceFiles() {
+				if filepath.Clean(event.Name) == filepath.Clean(path) {
+					if err := p.syncOnce(port, dir); err != nil {
+						slog.Warn("aws config sync failed; keeping previous config", "error", err)
+					}
+					break
+				}
+			}
+		case err := <-watcher.Errors:
+			return err
+		}
+	}
+}
+
+func (p *Proxy) syncOnce(port int, dir string) error {
+	p.syncMu.Lock()
+	defer p.syncMu.Unlock()
+	p.mu.RLock()
+	old := p.keys
+	targets := p.targets
+	p.mu.RUnlock()
+	var names []string
+	var regions map[string]string
+	if len(targets) > 0 {
+		var err error
+		names, regions, err = profiles()
+		if err != nil {
+			return err
+		}
+	}
+	keys := map[string]issuedKey{}
+	var config, credentials strings.Builder
+	for _, name := range names {
+		if !hasProfile(targets, name) {
+			continue
+		}
+		if _, err := assumedRole(targets, name); err != nil {
+			return fmt.Errorf("aws profile %s: %w", name, err)
+		}
+		key := old[name]
+		if key.ID == "" {
+			var b [30]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				return err
+			}
+			key = issuedKey{ID: "SB" + strings.ToUpper(base64.RawURLEncoding.EncodeToString(b[:16])), Secret: base64.StdEncoding.EncodeToString(b[:])}
+		}
+		keys[name] = key
+		section := "profile " + name
+		if name == "default" {
+			section = "default"
+		}
+		region := regions[name]
+		if region == "" {
+			region = "us-east-1"
+		}
+		fmt.Fprintf(&config, "[%s]\nendpoint_url = https://%s\nca_bundle = /root/.aws/ca.pem\nregion = %s\n\n", section, net.JoinHostPort(p.host, strconv.Itoa(port)), region)
+		fmt.Fprintf(&credentials, "[%s]\naws_access_key_id = %s\naws_secret_access_key = %s\n\n", name, key.ID, key.Secret)
+	}
+	cert, err := p.certificate()
+	if err != nil {
+		return err
+	}
+	awsDir := filepath.Join(dir, ".aws")
+	if err := util.WriteFileAtomic(filepath.Join(awsDir, "ca.pem"), 0o600, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})); err != nil {
+		return err
+	}
+	if err := util.WriteFileAtomic(filepath.Join(awsDir, "credentials"), 0o600, []byte(credentials.String())); err != nil {
+		return err
+	}
+	if err := util.WriteFileAtomic(filepath.Join(awsDir, "config"), 0o600, []byte(config.String())); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.keys = keys
+	p.sessions = map[string]session{}
+	p.generation++
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *Proxy) Refresh(port int, dir string) error { return p.syncOnce(port, dir) }

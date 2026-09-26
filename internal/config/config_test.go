@@ -9,8 +9,107 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hrntknr/sb/internal/awsproxy"
 	"github.com/hrntknr/sb/internal/k8sproxy"
 )
+
+func TestLoadAWSAndOverrides(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "config.yaml"), `aws:
+  - profile: dev
+    roleArn: arn:aws:iam::123456789012:role/dev
+    regions: [eu-*]
+    services:
+      - name: dynamodb
+        mode: r
+`)
+	writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), `aws:
+  - profile: dev
+    roleArn: arn:aws:iam::123456789012:role/dev
+    services:
+      - name: dynamodb
+        mode: rw
+  - profile: prod
+    roleArn: arn:aws:iam::123456789012:role/prod
+    services:
+      - name: sts
+        mode: r
+`)
+	cfg, err := Load(filepath.Join(dir, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AWS) != 2 || cfg.AWS[0].Services[0] != (awsproxy.Service{Name: "dynamodb", Mode: "rw"}) || cfg.AWS[1].Profile != "prod" {
+		t.Fatalf("AWS targets = %+v", cfg.AWS)
+	}
+}
+
+func TestLoadAWSWithoutRoleArn(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: dev
+    services:
+      - name: dynamodb
+        mode: r
+`)
+	// An omitted roleArn is valid: the source profile's own credentials are used.
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("roleArn must be optional: %v", err)
+	}
+	if cfg.AWS[0].RoleARN != "" {
+		t.Fatalf("RoleARN = %q, want empty", cfg.AWS[0].RoleARN)
+	}
+	writeFile(t, path, `aws:
+  - profile: dev
+    roleArn: arn:aws:iam::123456789012:role/
+    services:
+      - name: dynamodb
+        mode: r
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "invalid roleArn") {
+		t.Fatalf("invalid roleArn must error, got %v", err)
+	}
+}
+
+func TestLoadAWSRejectsUnknownServices(t *testing.T) {
+	// nonexistent: no reference data; route53: a real AWS REST API sb cannot
+	// forward; a2c: console-only service without an API endpoint.
+	for _, name := range []string{"nonexistent-aws-service", "route53", "a2c"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "config.yaml")
+		writeFile(t, path, `aws:
+  - profile: dev
+    roleArn: arn:aws:iam::123456789012:role/dev
+    services:
+      - name: `+name+`
+        mode: rw
+`)
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unsupported service/mode") {
+			t.Fatalf("expected unsupported service error for %s, got %v", name, err)
+		}
+	}
+}
+
+func TestLoadAWSAllowsLargeCombinations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: dev
+    roleArn: arn:aws:iam::123456789012:role/dev
+    services:
+      - name: aoss
+        mode: r
+      - name: lightsail
+        mode: r
+`)
+	// Without a session policy there is no 2048-byte AssumeRole limit, so
+	// combinations that used to overflow are plain valid configs.
+	if _, err := Load(path); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()

@@ -1,25 +1,19 @@
 package k8sproxy
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sort"
 	"strings"
-	"time"
 
+	"github.com/hrntknr/sb/internal/util"
 	"k8s.io/apimachinery/pkg/util/sets"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -56,48 +50,9 @@ func (p *Proxy) Serve(l net.Listener) error {
 // cluster trust anchor, and it covers the configured host.
 func (p *Proxy) certificate() (tls.Certificate, error) {
 	p.certOne.Do(func() {
-		p.cert, p.certErr = issueCertificate(p.host)
+		p.cert, p.certErr = util.IssueCertificate(p.host)
 	})
 	return p.cert, p.certErr
-}
-
-func issueCertificate(host string) (tls.Certificate, error) {
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, serialLimit)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	template := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "sb"},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(30 * 24 * time.Hour),
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		template.IPAddresses = append(template.IPAddresses, ip)
-	} else if host != "" {
-		template.DNSNames = append(template.DNSNames, host)
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, privateKey.Public(), privateKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.X509KeyPair(
-		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
-	)
 }
 
 // SetTargets replaces the policy targets, called on config reloads.

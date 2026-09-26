@@ -37,13 +37,14 @@ type options struct {
 	host       string
 	sshListen  string
 	k8sListen  string
+	awsListen  string
 }
 
 func newRootCommand() *cobra.Command {
 	opts := &options{}
 	root := &cobra.Command{
 		Use:           "sb",
-		Short:         "Issue scoped ssh and k8s credentials and expose them to containers",
+		Short:         "Issue scoped ssh, k8s, and AWS credentials to containers",
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&opts.configPath, "config", defaultConfigPath(), "config yaml path")

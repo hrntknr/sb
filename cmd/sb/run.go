@@ -22,7 +22,7 @@ func newRunCommand(opts *options) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run [--] <command>...",
 		Short: "Run a container with sb credentials",
-		Long: `Run a container with scoped ssh and k8s credentials mounted in.
+		Long: `Run a container with scoped ssh, k8s and AWS credentials mounted in.
 
 The image comes from container.image in the config (required); the
 runtime (docker, podman, or the apple container CLI) is detected
