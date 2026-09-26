@@ -78,9 +78,16 @@ var servicesJSON []byte
 var allowedOperations, serviceEndpoints = parseServices()
 
 func ValidService(service Service) bool {
-	entry, forwardable := serviceEndpoints[service.Name]
-	_, allowed := allowedOperations[service.Name]
-	return allowed && forwardable && supportedProtocols[entry.Protocol] && (service.Mode == "r" || service.Mode == "rw")
+	return ValidServiceName(service.Name) && (service.Mode == "r" || service.Mode == "rw")
+}
+
+// ValidServiceName reports whether name is an AWS service sb can forward:
+// covered by the embedded service reference with a fixed or {region} host
+// and a protocol sb proxies (JSON, Query, or EC2 POST).
+func ValidServiceName(name string) bool {
+	entry, forwardable := serviceEndpoints[name]
+	_, allowed := allowedOperations[name]
+	return allowed && forwardable && supportedProtocols[entry.Protocol]
 }
 
 // assumedRole returns the role ARN to assume for a profile from matching
