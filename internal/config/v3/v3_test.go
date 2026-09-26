@@ -268,10 +268,19 @@ func TestLoadInvalid(t *testing.T) {
 		{"k8s group with whitespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: bad group\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
 		{"aws profile with whitespace", "version: 3\naws:\n  - profile: bad profile\n    services: []\n", "must not contain whitespace"},
 		{"aws region with whitespace", "version: 3\naws:\n  - profile: dev\n    regions: [\"eu west\"]\n    services: []\n", "must not contain whitespace"},
-		{"container image whitespace only", "version: 3\ncontainer:\n  runtime: docker\n  image: \"   \"\n", "image is required when the container section is set"},
+		{"container image whitespace only", "version: 3\ncontainer:\n  runtime: docker\n  image: \"   \"\n", "image must not be whitespace-only"},
 		{"second yaml document", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    access: full\n", "multiple yaml documents"},
 		{"second document v2 format", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    commands: [cat]\n", "field commands not found"},
 		{"trailing syntax error", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh: [unclosed\n", "parse config"},
+		// unicode.IsSpace covers U+00A0, \v (U+000B) and \f (U+000C),
+		// which " \t\r\n" does not.
+		{"ssh host with nbsp", "version: 3\nssh:\n  - host: \"bad\\u00a0host\"\n    access: full\n", "must not contain whitespace"},
+		{"ssh host with vertical tab", "version: 3\nssh:\n  - host: \"bad\\vhost\"\n    access: full\n", "must not contain whitespace"},
+		{"ssh host with form feed", "version: 3\nssh:\n  - host: \"bad\\fhost\"\n    access: full\n", "must not contain whitespace"},
+		{"k8s group with nbsp", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"bad\\u00a0group\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"k8s resource with nbsp", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"pods\\u00a0\"\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"aws profile with nbsp", "version: 3\naws:\n  - profile: \"bad\\u00a0profile\"\n    services:\n      - name: dynamodb\n        mode: ro\n", "must not contain whitespace"},
+		{"aws region with nbsp", "version: 3\naws:\n  - profile: dev\n    regions: [\"eu\\u00a0west\"]\n    services:\n      - name: dynamodb\n        mode: ro\n", "must not contain whitespace"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -339,6 +348,12 @@ func TestLoadDuplicates(t *testing.T) {
 			main:   "version: 3\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n",
 			dropIn: "container:\n  runtime: podman\n",
 			wantIn: "runtime is already defined in",
+		},
+		{
+			name:   "whitespace-only image in drop-in",
+			main:   "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n",
+			dropIn: "container:\n  image: \"   \"\n",
+			wantIn: "image must not be whitespace-only",
 		},
 	}
 	for _, tt := range tests {

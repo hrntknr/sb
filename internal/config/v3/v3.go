@@ -19,6 +19,7 @@ import (
 	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"unicode"
 )
 
 // Config is the validated v3 policy for the ssh, k8s, and AWS proxies and
@@ -238,7 +239,14 @@ func Load(path string) (Config, error) {
 				runtimeFrom = f.path
 				cfg.Container.Runtime = runtime
 			}
-			if image := strings.TrimSpace(d.Image); image != "" {
+			if d.Image != "" {
+				// A value that is present but whitespace-only is a broken
+				// definition, not an omission: without this check it would
+				// silently lose to an image in another file.
+				image := strings.TrimSpace(d.Image)
+				if image == "" {
+					return Config{}, fmt.Errorf("%s: container: image must not be whitespace-only", f.path)
+				}
 				if imageFrom != "" {
 					return Config{}, fmt.Errorf("%s: container: image is already defined in %s", f.path, imageFrom)
 				}
@@ -439,8 +447,10 @@ func buildMount(d mountEntry) (Mount, error) {
 // noWhitespace rejects values that cannot match a real name: patterns are
 // matched with util.Match, which trims and compares against names that
 // never contain whitespace, so a whitespace pattern never matches anything.
+// unicode.IsSpace also rejects U+00A0, \v, \f and other Unicode whitespace
+// that the same TrimSpace would strip, which plain " \t\r\n" misses.
 func noWhitespace(field, value string) error {
-	if strings.ContainsAny(value, " \t\r\n") {
+	if strings.ContainsFunc(value, unicode.IsSpace) {
 		return fmt.Errorf("invalid %s %q (must not contain whitespace)", field, value)
 	}
 	return nil
