@@ -39,6 +39,10 @@ aws:
         mode: ro
 ```
 
+## Phase 1 scope
+
+The v3 config is read by `sb config check` only. `sb run` and `sb proxy` still use the v2 parser and reject a v3 config (`version: 3`); they switch to the v3 config in a later phase. Until then a v3 config works only with `sb config check` — keep the v2 config for `sb run` and `sb proxy`.
+
 ## v2 config is rejected, not converted
 
 `--config` accepts v3 only. A v2 config (no `version` key, or the old structure) fails with an error that points here, for example:
@@ -91,13 +95,13 @@ Review each host: a v2 `commands` rule that felt limited now becomes an explicit
 
 ## k8s: `mode` → enumerated `resources`
 
-v2 granted `r`/`rw` on a context for a single namespace (or cluster scope when `namespace` was omitted). v3 enumerates every grant explicitly, so the conversion is manual:
+v2 granted `r`/`rw` on a context. With `namespace: default` set, the grants applied to namespaced requests in `default` only; with `namespace` omitted, they applied to namespaced requests in *every* namespace *and* to cluster-scoped requests. v3 enumerates every grant explicitly, so the conversion is manual:
 
 | v2 | v3 |
 | --- | --- |
 | `mode: r`, `namespace: default` | `resources` with the verbs you want in `default` (below) |
 | `mode: rw` | **no v3 equivalent in the initial version** — no write verbs exist; drop the entry or keep only the read you intended |
-| `namespace` omitted (cluster scope) | `scope: cluster` on the rule instead of `namespace` |
+| `namespace` omitted | v2 granted both every-namespace namespaced operations *and* cluster-scoped operations. In v3 these are separate grants: pick per resource — `namespace: "*"` for namespaced resources, `scope: cluster` for cluster-scoped resources (like `namespaces` or `nodes`). Converting only to `scope: cluster` silently drops every namespaced grant. |
 | read of `pods` | does *not* inherit to `pods/log`; add a separate `pods/log` rule if you use `kubectl logs` |
 
 `mode: r` granted all resources read access in the namespace; v3 requires listing each resource you actually use:
@@ -111,6 +115,23 @@ k8s:                          k8s:
         resource: pods
         namespace: default
         verbs: [get, list, watch]
+```
+
+For an omitted `namespace`, convert the resources you used — namespaced resources keep working with `namespace: "*"`, and cluster-scoped resources (like `namespaces`) need `scope: cluster`:
+
+```yaml
+# v2                                # v3
+k8s:                                k8s:
+  - context: dev                      - context: dev
+    mode: r                             resources:
+    # namespace omitted                    - group: ""
+                                            resource: pods
+                                            namespace: "*"
+                                            verbs: [get, list, watch]
+                                          - group: ""
+                                            resource: namespaces
+                                            scope: cluster
+                                            verbs: [get, list, watch]
 ```
 
 Rules:
@@ -178,4 +199,4 @@ To remove or replace a definition, edit the file that defines it. Overlapping mo
 $ sb config check [--config path]
 ```
 
-It validates the form, names, supported ranges, and conflicts statically, then lists every issuance target (ssh hosts, k8s contexts, aws profiles) and the permissions granted to each. It reads no credentials and contacts no cluster; connecting to the upstreams is done by running sb itself.
+It validates the form, names, supported ranges, and conflicts statically, then lists every issuance target (ssh hosts, k8s contexts, aws profiles) and the permissions granted to each. It reads no credentials and contacts no cluster; connecting to the upstreams is done by running sb itself — which today still reads the v2 config (see Phase 1 scope above).

@@ -18,6 +18,7 @@ import (
 	"github.com/hrntknr/sb/internal/awsproxy"
 	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Config is the validated v3 policy for the ssh, k8s, and AWS proxies and
@@ -227,22 +228,22 @@ func Load(path string) (Config, error) {
 				firstEnv[key] = f.path
 				cfg.Container.Environment[key] = env
 			}
-			if d.Runtime != "" {
-				if err := validateRuntime(d.Runtime); err != nil {
+			if runtime := strings.TrimSpace(d.Runtime); runtime != "" {
+				if err := validateRuntime(runtime); err != nil {
 					return Config{}, fmt.Errorf("%s: container: %w", f.path, err)
 				}
 				if runtimeFrom != "" {
 					return Config{}, fmt.Errorf("%s: container: runtime is already defined in %s", f.path, runtimeFrom)
 				}
 				runtimeFrom = f.path
-				cfg.Container.Runtime = d.Runtime
+				cfg.Container.Runtime = runtime
 			}
-			if d.Image != "" {
+			if image := strings.TrimSpace(d.Image); image != "" {
 				if imageFrom != "" {
 					return Config{}, fmt.Errorf("%s: container: image is already defined in %s", f.path, imageFrom)
 				}
 				imageFrom = f.path
-				cfg.Container.Image = d.Image
+				cfg.Container.Image = image
 			}
 		}
 	}
@@ -251,7 +252,7 @@ func Load(path string) (Config, error) {
 	}
 	for i, mount := range cfg.Container.Mounts {
 		for j := range cfg.Container.Mounts {
-			if i == j || mount.Target == cfg.Container.Mounts[j].Target {
+			if i == j {
 				continue
 			}
 			if strings.HasPrefix(mount.Target, cfg.Container.Mounts[j].Target+string(filepath.Separator)) {
@@ -265,6 +266,9 @@ func Load(path string) (Config, error) {
 func buildSSH(d sshRule) (SSHRule, error) {
 	if strings.TrimSpace(d.Host) == "" {
 		return SSHRule{}, errors.New("host is required")
+	}
+	if err := noWhitespace("host", d.Host); err != nil {
+		return SSHRule{}, err
 	}
 	if d.User != nil && strings.TrimSpace(*d.User) == "" {
 		return SSHRule{}, errors.New("user must not be empty")
@@ -310,11 +314,14 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 	if d.Group == nil {
 		return ResourceRule{}, errors.New(`group is required (use group: "" for the core API group)`)
 	}
-	if *d.Group != "" && strings.TrimSpace(*d.Group) == "" {
-		return ResourceRule{}, fmt.Errorf("invalid group %q", *d.Group)
+	if err := noWhitespace("group", *d.Group); err != nil {
+		return ResourceRule{}, err
 	}
 	if strings.TrimSpace(d.Resource) == "" {
 		return ResourceRule{}, errors.New("resource is required")
+	}
+	if err := noWhitespace("resource", d.Resource); err != nil {
+		return ResourceRule{}, err
 	}
 	if strings.Contains(d.Resource, "/") && d.Resource != "pods/log" {
 		return ResourceRule{}, fmt.Errorf("unsupported subresource %q (only pods/log is supported)", d.Resource)
@@ -330,6 +337,11 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 	}
 	if d.Namespace != nil && strings.TrimSpace(*d.Namespace) == "" {
 		return ResourceRule{}, errors.New("namespace must not be empty")
+	}
+	if d.Namespace != nil && *d.Namespace != "*" {
+		if errs := validation.IsDNS1123Label(*d.Namespace); len(errs) > 0 {
+			return ResourceRule{}, fmt.Errorf("invalid namespace %q (%s)", *d.Namespace, strings.Join(errs, ", "))
+		}
 	}
 	if len(d.Verbs) == 0 {
 		return ResourceRule{}, errors.New("verbs is required (empty permission)")
@@ -362,12 +374,18 @@ func buildAWS(d awsRule) (AWSRule, error) {
 	if strings.TrimSpace(d.Profile) == "" {
 		return AWSRule{}, errors.New("profile is required")
 	}
+	if err := noWhitespace("profile", d.Profile); err != nil {
+		return AWSRule{}, err
+	}
 	if d.RoleARN != "" && !awsproxy.ValidRoleARN(d.RoleARN) {
 		return AWSRule{}, fmt.Errorf("invalid roleArn %q", d.RoleARN)
 	}
 	for i, region := range d.Regions {
 		if strings.TrimSpace(region) == "" {
 			return AWSRule{}, fmt.Errorf("region %d: must not be empty", i)
+		}
+		if err2 := noWhitespace("region", region); err2 != nil {
+			return AWSRule{}, fmt.Errorf("region %d: %w", i, err2)
 		}
 	}
 	if len(d.Services) == 0 {
@@ -408,7 +426,24 @@ func buildMount(d mountEntry) (Mount, error) {
 	if !filepath.IsAbs(d.Target) {
 		return Mount{}, fmt.Errorf("target must be an absolute path: %q", d.Target)
 	}
-	return Mount{Source: source, Target: d.Target, ReadOnly: d.ReadOnly}, nil
+	// The target is compared for duplicates and nesting as a container
+	// path: /work/ and /other/../work are the same mount as /work, and
+	// mounting over the container root is not a mount at all.
+	target := filepath.Clean(d.Target)
+	if target == "/" {
+		return Mount{}, errors.New(`target must not be "/"`)
+	}
+	return Mount{Source: source, Target: target, ReadOnly: d.ReadOnly}, nil
+}
+
+// noWhitespace rejects values that cannot match a real name: patterns are
+// matched with util.Match, which trims and compares against names that
+// never contain whitespace, so a whitespace pattern never matches anything.
+func noWhitespace(field, value string) error {
+	if strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("invalid %s %q (must not contain whitespace)", field, value)
+	}
+	return nil
 }
 
 func validateEnvKey(key string) error {
@@ -417,6 +452,9 @@ func validateEnvKey(key string) error {
 	}
 	if strings.ContainsAny(key, " \t\r\n") {
 		return errors.New("key must not contain whitespace")
+	}
+	if strings.Contains(key, "=") {
+		return errors.New(`key must not contain "="`)
 	}
 	return nil
 }
@@ -442,7 +480,7 @@ func validateRuntime(runtime string) error {
 }
 
 func loadAll(path string) ([]loadedDoc, error) {
-	main, err := loadFile(path, true)
+	main, err := loadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
@@ -481,7 +519,7 @@ func loadConfDir(dir string, files *[]loadedDoc) error {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		doc, err := loadFile(filepath.Join(dir, name), false)
+		doc, err := loadFile(filepath.Join(dir, name))
 		if err != nil {
 			return fmt.Errorf("%s: %w", filepath.Join(dir, name), err)
 		}
@@ -490,7 +528,16 @@ func loadConfDir(dir string, files *[]loadedDoc) error {
 	return nil
 }
 
-func loadFile(path string, requireVersion bool) (document, error) {
+// parseErr wraps a yaml decoding error; strict decoding failures point at
+// the migration guide (v2 config is not accepted).
+func parseErr(err error) error {
+	if errors.As(err, new(*yaml.TypeError)) {
+		return fmt.Errorf("parse config: %w\n(v2 config is not accepted; see docs/migration.md)", err)
+	}
+	return fmt.Errorf("parse config: %w", err)
+}
+
+func loadFile(path string) (document, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return document{}, fmt.Errorf("read config: %w", err)
@@ -499,15 +546,21 @@ func loadFile(path string, requireVersion bool) (document, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
-		if errors.As(err, new(*yaml.TypeError)) {
-			return document{}, fmt.Errorf("parse config: %w\n(v2 config is not accepted; see docs/migration.md)", err)
-		}
-		return document{}, fmt.Errorf("parse config: %w", err)
+		return document{}, parseErr(err)
 	}
-	if requireVersion && doc.Version == nil {
+	// A file is exactly one yaml document: a second document, even a
+	// valid or v2-formatted one, is rejected instead of silently ignored.
+	var second document
+	if err2 := decoder.Decode(&second); !errors.Is(err2, io.EOF) {
+		if err2 == nil {
+			return document{}, errors.New("parse config: multiple yaml documents (only one document per file)")
+		}
+		return document{}, parseErr(err2)
+	}
+	if doc.Version == nil {
 		return document{}, errors.New("version is required: sb reads v3 config only (version: 3); v2 config is not accepted (see docs/migration.md)")
 	}
-	if doc.Version != nil && *doc.Version != 3 {
+	if *doc.Version != 3 {
 		return document{}, fmt.Errorf("unsupported version %d (want 3)", *doc.Version)
 	}
 	return doc, nil

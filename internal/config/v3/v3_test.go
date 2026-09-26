@@ -166,6 +166,24 @@ func TestLoadValid(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:   "ssh host wildcards",
+			config: "version: 3\nssh:\n  - host: \"*.example.net\"\n    access: full\n  - host: \"*\"\n    access: full\n",
+			check: func(t *testing.T, cfg Config) {
+				if cfg.SSH[0].Host != "*.example.net" || cfg.SSH[1].Host != "*" {
+					t.Errorf("SSH = %+v, want wildcard patterns", cfg.SSH)
+				}
+			},
+		},
+		{
+			name:   "aws profile and region patterns",
+			config: "version: 3\naws:\n  - profile: \"dev-*\"\n    regions: [\"eu-*\"]\n    services:\n      - name: dynamodb\n        mode: ro\n",
+			check: func(t *testing.T, cfg Config) {
+				if cfg.AWS[0].Profile != "dev-*" || len(cfg.AWS[0].Regions) != 1 || cfg.AWS[0].Regions[0] != "eu-*" {
+					t.Errorf("AWS = %+v, want pattern profile and region", cfg.AWS)
+				}
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -241,6 +259,19 @@ func TestLoadInvalid(t *testing.T) {
 		{"env empty value", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: \"\"}\n", "set either inherit or value"},
 		{"env key with whitespace", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    \"FOO BAR\": {value: bar}\n", "key must not contain whitespace"},
 		{"env yaml duplicate key", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: bar}\n    FOO: {value: baz}\n", "already defined at line"},
+		{"env key with equals", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    A=B: {value: bar}\n", `key must not contain "="`},
+		{"ssh host with whitespace", "version: 3\nssh:\n  - host: bad host\n    access: full\n", "must not contain whitespace"},
+		{"k8s namespace with slash", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: bad/name\n        verbs: [get]\n", "invalid namespace"},
+		{"k8s namespace uppercase", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: Default\n        verbs: [get]\n", "invalid namespace"},
+		{"k8s namespace too long", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: " + strings.Repeat("a", 64) + "\n        verbs: [get]\n", "invalid namespace"},
+		{"k8s resource with whitespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: bad resource\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"k8s group with whitespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: bad group\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"aws profile with whitespace", "version: 3\naws:\n  - profile: bad profile\n    services: []\n", "must not contain whitespace"},
+		{"aws region with whitespace", "version: 3\naws:\n  - profile: dev\n    regions: [\"eu west\"]\n    services: []\n", "must not contain whitespace"},
+		{"container image whitespace only", "version: 3\ncontainer:\n  runtime: docker\n  image: \"   \"\n", "image is required when the container section is set"},
+		{"second yaml document", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    access: full\n", "multiple yaml documents"},
+		{"second document v2 format", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    commands: [cat]\n", "field commands not found"},
+		{"trailing syntax error", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh: [unclosed\n", "parse config"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -330,8 +361,8 @@ func TestLoadConfD(t *testing.T) {
 	t.Run("appends entries in file order", func(t *testing.T) {
 		dir := t.TempDir()
 		writeFile(t, filepath.Join(dir, "config.yaml"), "version: 3\nssh:\n  - host: main.example\n    access: full\n")
-		writeFile(t, filepath.Join(dir, "conf.d", "20-b.yaml"), "ssh:\n  - host: b.example\n    access: full\n")
-		writeFile(t, filepath.Join(dir, "conf.d", "10-a.yaml"), "ssh:\n  - host: a.example\n    access: full\n")
+		writeFile(t, filepath.Join(dir, "conf.d", "20-b.yaml"), "version: 3\nssh:\n  - host: b.example\n    access: full\n")
+		writeFile(t, filepath.Join(dir, "conf.d", "10-a.yaml"), "version: 3\nssh:\n  - host: a.example\n    access: full\n")
 		cfg, err := Load(filepath.Join(dir, "config.yaml"))
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
@@ -364,17 +395,14 @@ func TestLoadConfD(t *testing.T) {
 			t.Fatalf("SSH len = %d, want 1", len(cfg.SSH))
 		}
 	})
-	t.Run("drop-in without version is fine", func(t *testing.T) {
+	t.Run("drop-in without version", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
 		writeFile(t, path, "version: 3\nssh:\n  - host: github.com\n    access: full\n")
 		writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), "ssh:\n  - host: work.example\n    access: full\n")
-		cfg, err := Load(path)
-		if err != nil {
-			t.Fatalf("Load() error = %v", err)
-		}
-		if len(cfg.SSH) != 2 || cfg.SSH[1].Host != "work.example" {
-			t.Fatalf("SSH = %+v, want the drop-in appended", cfg.SSH)
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "version is required") || !strings.Contains(err.Error(), "conf.d/work.yaml") {
+			t.Fatalf("Load() error = %v, want version-required error mentioning conf.d/work.yaml", err)
 		}
 	})
 	t.Run("drop-in with wrong version", func(t *testing.T) {
@@ -403,9 +431,14 @@ func TestLoadMountAmbiguity(t *testing.T) {
 	tests := []struct {
 		name   string
 		mounts string
+		wantIn string
 	}{
-		{"nested targets", "  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /work/data\n"},
-		{"deep nested targets", "  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /work/x/y\n"},
+		{"nested targets", "  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /work/data\n", "is nested under"},
+		{"deep nested targets", "  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /work/x/y\n", "is nested under"},
+		{"same target with trailing slash", "  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /work/\n", `target "/work" is already defined in`},
+		{"same target via parent jump", "  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /other/../work\n", `target "/work" is already defined in`},
+		{"nested targets with trailing slash", "  mounts:\n    - source: /srv/a\n      target: /work/\n    - source: /srv/b\n      target: /work/data\n", "is nested under"},
+		{"root target", "  mounts:\n    - source: /srv/a\n      target: /\n", `target must not be "/"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -413,8 +446,8 @@ func TestLoadMountAmbiguity(t *testing.T) {
 			path := filepath.Join(dir, "config.yaml")
 			writeFile(t, path, "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n"+tt.mounts)
 			_, err := Load(path)
-			if err == nil || !strings.Contains(err.Error(), "is nested under") {
-				t.Fatalf("Load() error = %v, want nested-under error", err)
+			if err == nil || !strings.Contains(err.Error(), tt.wantIn) {
+				t.Fatalf("Load() error = %v, want containing %q", err, tt.wantIn)
 			}
 		})
 	}

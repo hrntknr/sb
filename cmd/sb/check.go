@@ -31,6 +31,10 @@ func newConfigCheckCommand(opts *options) *cobra.Command {
 		Long: `Validate the config and list the issuance targets (ssh hosts, k8s
 contexts, aws profiles) and the permissions granted to each.
 
+ssh access: full covers the shell, any exec, subsystem, and TCP
+forwarding. k8s rules list the resource, the namespace (or scope:
+cluster), and the verbs; aws rules list the region, service, and mode.
+
 Checks are static only: no credentials are read and no cluster is
 contacted. Connect to the upstreams by running sb itself.`,
 		SilenceUsage:  true,
