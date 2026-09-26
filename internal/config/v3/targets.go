@@ -6,32 +6,40 @@ import (
 	"github.com/hrntknr/sb/internal/sshproxy"
 )
 
-// SSHTargets converts the ssh rules to proxy targets. v3 grants access: full
-// (shell, any exec, subsystem, and TCP forwarding), which the proxy enforces
-// with its unrestricted capability set; the per-request user/port
-// restrictions are Phase 3.
+// SSHTargets converts the ssh rules to proxy targets. The Host pattern is
+// matched against the hostname the host-side ssh client resolves for each
+// request; User and Port, when set, additionally restrict the upstream
+// connection's user and port.
 func (c Config) SSHTargets() sshproxy.Targets {
 	targets := make(sshproxy.Targets, 0, len(c.SSH))
 	for _, rule := range c.SSH {
 		targets = append(targets, sshproxy.Target{
-			Host:     rule.Host,
-			Commands: []string{"*"},
-			Shell:    true,
-			Forward:  true,
+			Host: rule.Host,
+			User: rule.User,
+			Port: rule.Port,
 		})
 	}
 	return targets
 }
 
-// K8sTargets converts the k8s rules to proxy targets. The enumerated
-// resources become the proxy's coarse read level until Phase 3 implements
-// the per-resource classification; namespaces are unrestricted.
+// K8sTargets converts the k8s rules to proxy targets: the context with the
+// resources granted on it, each as one proxy resource.
 func (c Config) K8sTargets() k8sproxy.Targets {
 	targets := make(k8sproxy.Targets, 0, len(c.K8s))
 	for _, rule := range c.K8s {
+		resources := make([]k8sproxy.Resource, 0, len(rule.Resources))
+		for _, resource := range rule.Resources {
+			resources = append(resources, k8sproxy.Resource{
+				Group:     resource.Group,
+				Resource:  resource.Resource,
+				Namespace: resource.Namespace,
+				Scope:      resource.Scope,
+				Verbs:      resource.Verbs,
+			})
+		}
 		targets = append(targets, k8sproxy.Target{
-			Mode:    k8sproxy.Read,
-			Context: rule.Context,
+			Context:   rule.Context,
+			Resources: resources,
 		})
 	}
 	return targets

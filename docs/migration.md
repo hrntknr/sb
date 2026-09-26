@@ -39,9 +39,9 @@ aws:
         mode: ro
 ```
 
-## Phase 1 scope
+## Config scope
 
-The v3 config is read by `sb config check` only. `sb run` and `sb proxy` still use the v2 parser and reject a v3 config (`version: 3`); they switch to the v3 config in a later phase. Until then a v3 config works only with `sb config check` — keep the v2 config for `sb run` and `sb proxy`.
+sb reads the v3 config everywhere: `sb config check`, `sb run`, and `sb proxy` all reject the v2 config (`version` absent or the old structure) and read the v3 config (`version: 3`). Convert the v2 config manually (below); `sb config check` confirms the result.
 
 ## v2 config is rejected, not converted
 
@@ -199,4 +199,4 @@ To remove or replace a definition, edit the file that defines it. Overlapping mo
 $ sb config check [--config path]
 ```
 
-It validates the form, names, supported ranges, and conflicts statically, then lists every issuance target (ssh hosts, k8s contexts, aws profiles) and the permissions granted to each. It reads no credentials and contacts no cluster; connecting to the upstreams is done by running sb itself — which today still reads the v2 config (see Phase 1 scope above).
+It validates the form, names, supported ranges, and conflicts statically, then lists every issuance target (ssh hosts, k8s contexts, aws profiles) and the permissions granted to each. It reads no credentials and contacts no cluster; connecting to the upstreams is done by running sb itself.

@@ -240,7 +240,7 @@ func TestForwardGlobalRequestsRelaysPayload(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forwardGlobalRequests(innerReqs, upstream, true)
+		forwardGlobalRequests(innerReqs, upstream)
 		close(done)
 	}()
 
@@ -250,30 +250,5 @@ func TestForwardGlobalRequestsRelaysPayload(t *testing.T) {
 	}
 	if string(payload) != "bound-port" {
 		t.Fatalf("reply payload = %q, want %q", payload, "bound-port")
-	}
-}
-
-// forwardGlobalRequests must reject downstream global requests when
-// forwarding is not allowed.
-func TestForwardGlobalRequestsRejectsWhenDisallowed(t *testing.T) {
-	addr := startUpstream(t, []byte("bound-port"))
-	upstream, err := cryptossh.Dial("tcp", addr, testClientConfig(t))
-	if err != nil {
-		t.Fatalf("Dial() error = %v", err)
-	}
-	defer upstream.Close()
-
-	innerAddr, innerReqs := startInner(t)
-	downstream, err := cryptossh.Dial("tcp", innerAddr, testClientConfig(t))
-	if err != nil {
-		t.Fatalf("Dial() error = %v", err)
-	}
-	defer downstream.Close()
-
-	go forwardGlobalRequests(innerReqs, upstream, false)
-
-	ok, _, err := downstream.SendRequest("ping", true, []byte("hello"))
-	if err != nil || ok {
-		t.Fatalf("SendRequest() = %v, %v; want rejected reply", ok, err)
 	}
 }

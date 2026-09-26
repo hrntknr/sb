@@ -16,10 +16,10 @@ import (
 
 const testProxyPort = 12222
 
-func TestCapabilityHostGlobs(t *testing.T) {
+func TestPolicyHostGlobs(t *testing.T) {
 	targets := Targets{
-		{Host: "github.com", Shell: true, Forward: true},
-		{Host: "*.example.net", Shell: true, Forward: true},
+		{Host: "github.com"},
+		{Host: "*.example.net"},
 	}
 
 	tests := []struct {
@@ -33,88 +33,31 @@ func TestCapabilityHostGlobs(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := !targets.Capability(tt.host).Empty(); got != tt.want {
-			t.Fatalf("Capability(%q) non-empty = %v, want %v", tt.host, got, tt.want)
+		if got := targets.Allows(tt.host, "", 0); got != tt.want {
+			t.Fatalf("Allows(%q) = %v, want %v", tt.host, got, tt.want)
 		}
-	}
-}
-
-func TestCapabilityAllowsExec(t *testing.T) {
-	targets := Targets{
-		{Host: "github.com", Commands: []string{"*"}, Shell: true, Forward: true},
-		{Host: "*", Commands: []string{"cat", "kubectl get"}},
-	}
-
-	tests := []struct {
-		host    string
-		command string
-		want    bool
-	}{
-		{"github.com", "git-upload-pack 'repo.git'", true}, // "*" allows any command
-		{"node.internal", "cat /etc/hosts", true},
-		{"node.internal", "cat", true},
-		{"node.internal", "cata /etc/hosts", false},    // first token must match exactly
-		{"node.internal", "kubectl get pods", true},    // multi-token pattern
-		{"node.internal", "kubectl delete pod", false}, // subcommand not allowed
-		{"node.internal", "kubectl", false},            // too few tokens for pattern
-		{"node.internal", "rm -rf /", false},
-		{"node.internal", "cat a && cat b", true}, // every sub-command allowed
-		{"node.internal", "cat a | kubectl get pods", true},
-		{"node.internal", "cat a; rm -rf /", false}, // one sub-command denied
-		{"node.internal", "cat a && kubectl delete x", false},
-		{"node.internal", "cat $(rm -rf /)", false}, // command substitution evaluated
-		{"node.internal", "cat `rm -rf /`", false},  // backtick substitution evaluated
-		{"node.internal", "(cat a; rm b)", false},   // subshell evaluated
-		{"node.internal", "cat 'a b'", true},        // quoting handled
-		{"node.internal", "$CMD a", false},          // non-literal command name denied
-		{"node.internal", "cat a > out", false},     // write redirection denied
-		{"node.internal", "cat a >> out", false},    // append redirection denied
-		{"node.internal", "cat < in", false},        // read redirection denied
-		{"node.internal", "cat a && kubectl get pods", true},
-		{"node.internal", "cat &&", false}, // parse error
-		{"node.internal", "", false},
-	}
-
-	for _, tt := range tests {
-		if got := targets.Capability(tt.host).AllowsExec(tt.command); got != tt.want {
-			t.Fatalf("Capability(%q).AllowsExec(%q) = %v, want %v", tt.host, tt.command, got, tt.want)
-		}
-	}
-}
-
-func TestCapabilityShellAndForwardOnlyWhenUnrestricted(t *testing.T) {
-	targets := Targets{
-		{Host: "github.com", Shell: true, Forward: true},
-		{Host: "*", Commands: []string{"cat"}},
-	}
-
-	if c := targets.Capability("github.com"); !c.Shell || !c.Forward {
-		t.Fatalf("Capability(github.com) = %+v, want shell and forward", c)
-	}
-	if c := targets.Capability("node.internal"); c.Shell || c.Forward {
-		t.Fatalf("Capability(node.internal) = %+v, want no shell/forward", c)
 	}
 }
 
 func TestEmptyTargetsDenyAll(t *testing.T) {
 	var targets Targets
-	if c := targets.Capability("github.com"); !c.Empty() {
-		t.Fatalf("empty targets produced capability: %+v", c)
+	if targets.Allows("github.com", "git", 22) {
+		t.Fatal("empty targets allowed an upstream")
 	}
 }
 
 func TestSetTargetsUpdatesPolicy(t *testing.T) {
-	proxy := New(Targets{{Host: "a.example", Commands: []string{"*"}}}, nil)
-	if proxy.capability("a.example").Empty() {
+	proxy := New(Targets{{Host: "a.example"}}, nil)
+	if !proxy.allowsTarget(sshConfig{Host: "a.example"}) {
 		t.Fatal("initial target should be allowed")
 	}
 
-	proxy.SetTargets(Targets{{Host: "b.example", Commands: []string{"*"}}})
+	proxy.SetTargets(Targets{{Host: "b.example"}})
 
-	if !proxy.capability("a.example").Empty() {
+	if proxy.allowsTarget(sshConfig{Host: "a.example"}) {
 		t.Fatal("old target should be denied after SetTargets")
 	}
-	if proxy.capability("b.example").Empty() {
+	if !proxy.allowsTarget(sshConfig{Host: "b.example"}) {
 		t.Fatal("new target should be allowed after SetTargets")
 	}
 }
@@ -396,18 +339,53 @@ func TestValidPort(t *testing.T) {
 }
 
 func TestResolveTargetMatchesResolvedHostname(t *testing.T) {
+	fakeSSH(t, "hostname gateway.example.net\nuser alice\nport 22\n")
+	proxy := New(Targets{{Host: "*.example.net"}}, nil)
+	cfg, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22")
+	if !ok || cfg.Host != "gateway.example.net" || cfg.RequestedHost != "gw" {
+		t.Fatalf("resolveTarget() = %+v, %v; want the resolved host permitted", cfg, ok)
+	}
+	proxy.SetTargets(Targets{{Host: "gw"}})
+	if _, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22"); ok {
+		t.Fatal("requested alias granted access to an unlisted resolved hostname")
+	}
+}
+
+// User and port restrictions are additional limits on the upstream
+// connection: the resolved config's user and port must equal them, and a
+// request resolving differently is rejected. Without a restriction the
+// resolved values are used.
+func TestResolveTargetRestrictsUserAndPort(t *testing.T) {
+	fakeSSH(t, "hostname gateway.example.net\nuser alice\nport 22\n")
+	proxy := New(Targets{{Host: "*.example.net", User: "alice", Port: 22}}, nil)
+
+	// The resolved user (alice) and port (22) equal the restrictions'.
+	cfg, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22")
+	if !ok || cfg.User != "alice" || cfg.Port != "22" {
+		t.Fatalf("resolveTarget() = %+v, %v; want the resolved user and port permitted", cfg, ok)
+	}
+
+	// A downstream request for another port resolves differently: the
+	// restriction rejects it.
+	proxy.SetTargets(Targets{{Host: "*.example.net", User: "alice", Port: 2222}})
+	if _, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22"); ok {
+		t.Fatal("resolved port 22 granted access to a restricted port 2222")
+	}
+
+	// A restriction on another user rejects the resolved one.
+	proxy.SetTargets(Targets{{Host: "*.example.net", User: "git"}})
+	if _, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22"); ok {
+		t.Fatal("resolved user alice granted access to a restricted user git")
+	}
+}
+
+// fakeSSH installs a fake ssh binary resolving every request to the config
+// printed, so resolution follows it.
+func fakeSSH(t *testing.T, config string) {
+	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nprintf 'hostname gateway.example.net\\nuser alice\\nport 22\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte("#!/bin/sh\nprintf '"+config+"'"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	proxy := New(Targets{{Host: "*.example.net", Commands: []string{"cat"}}}, nil)
-	cfg, capability, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22")
-	if !ok || cfg.Host != "gateway.example.net" || cfg.RequestedHost != "gw" || !capability.AllowsExec("cat /etc/hosts") {
-		t.Fatalf("resolveTarget() = %+v, %+v, %v", cfg, capability, ok)
-	}
-	proxy.SetTargets(Targets{{Host: "gw", Commands: []string{"*"}}})
-	if _, _, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22"); ok {
-		t.Fatal("requested alias granted access to an unlisted resolved hostname")
-	}
 }

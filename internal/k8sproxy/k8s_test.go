@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,176 +19,330 @@ import (
 	"testing"
 	"time"
 
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"gopkg.in/yaml.v3"
 )
 
 const testProxyPort = 16443
 
-func TestTargetsAllowReadWriteToIncludeRead(t *testing.T) {
+// testTarget builds a policy target granting the resources to one context.
+func testTarget(context string, resources ...Resource) Target {
+	return Target{Context: context, Resources: resources}
+}
+
+// testResource builds a core-group resource rule: verbs on resource in
+// namespace ("*" is all namespaces).
+func testResource(resource, namespace string, verbs ...string) Resource {
+	return Resource{Group: "", Resource: resource, Namespace: namespace, Verbs: verbs}
+}
+
+// testPolicy builds a policy granting get/list/watch on core pods in
+// namespace default for the named contexts: the shape the serve tests
+// need, every request they make is covered by it.
+func testPolicy(contexts ...string) Targets {
+	targets := make(Targets, 0, len(contexts))
+	for _, context := range contexts {
+		targets = append(targets, testTarget(context, testResource("pods", "default", "get", "list", "watch")))
+	}
+	return targets
+}
+
+// allowsClassified classifies the request as the API server would and
+// reports whether the policy permits it for context.
+func allowsClassified(t *testing.T, targets Targets, context, method, path, query string) bool {
+	t.Helper()
+	info, err := classifyRequest(method, path, query)
+	if err != nil {
+		t.Fatalf("classifyRequest(%q, %q) error = %v", method, path, err)
+	}
+	return targets.Allows(context, info)
+}
+
+// TestTargetsAllowsClassifiedRequests covers the strict classification:
+// what the API server would authorize decides what the proxy forwards.
+// The verbs of a granted resource are enumerated, pods does not inherit
+// to pods/log, and unknown or non-granted operations are rejected.
+func TestTargetsAllowsClassifiedRequests(t *testing.T) {
 	targets := Targets{
-		{Mode: ReadWrite, Context: "pear", ClusterScope: true},
-		{Mode: Read, Context: "*", ClusterScope: true},
+		testTarget("dev",
+			testResource("pods", "default", "get", "list", "watch"),
+		),
+		testTarget("prod",
+			testResource("pods/log", "default", "get"),
+		),
 	}
 
 	tests := []struct {
-		verb      Verb
-		context   string
-		namespace string
-		want      bool
+		name, context, method, path, query string
+		want bool
 	}{
-		{Read, "pear", "default", true},
-		{ReadWrite, "pear", "default", true},
-		{Read, "test", "default", true},
-		{ReadWrite, "test", "default", false},
-		{Read, "pear", "", true},
-		{ReadWrite, "test", "", false},
+		// dev: the enumerated verbs on the granted resource
+		{"dev get pod", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", "", true},
+		{"dev list pods", "dev", http.MethodGet, "/api/v1/namespaces/default/pods", "", true},
+		{"dev list pods by name selector", "dev", http.MethodGet, "/api/v1/namespaces/default/pods", "fieldSelector=metadata.name%3Dnginx", true},
+		{"dev watch pods", "dev", http.MethodGet, "/api/v1/namespaces/default/pods", "watch=true", true},
+		// pods does not inherit to pods/log
+		{"dev get pod log (no inheritance)", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "", false},
+		{"dev get pod log follow (no inheritance)", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "follow=true", false},
+		// unlisted operations are not granted
+		{"dev create pod", "dev", http.MethodPost, "/api/v1/namespaces/default/pods", "", false},
+		{"dev delete pods", "dev", http.MethodDelete, "/api/v1/namespaces/default/pods", "", false},
+		{"dev patch pod", "dev", http.MethodPatch, "/api/v1/namespaces/default/pods/nginx", "", false},
+		{"dev exec", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/exec", "", false},
+		{"dev attach", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/attach", "", false},
+		{"dev portforward", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/portforward", "", false},
+		{"dev proxy subresource", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/proxy", "", false},
+		{"dev node proxy", "dev", http.MethodGet, "/api/v1/nodes/node-1/proxy/stats", "", false},
+		{"dev create self subject access review", "dev", http.MethodPost, "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", "", false},
+		// namespace restrictions
+		{"dev other namespace", "dev", http.MethodGet, "/api/v1/namespaces/other/pods/nginx", "", false},
+		{"dev all-namespaces list (not \"*\")", "dev", http.MethodGet, "/api/v1/pods", "", false},
+		{"dev all-namespaces list of logs (not \"*\")", "dev", http.MethodGet, "/api/v1/pods/nginx/log", "", false},
+		{"dev cluster-scoped (no scope rule)", "dev", http.MethodGet, "/api/v1/nodes", "", false},
+		// discovery paths: GET only, fixed paths
+		{"dev discovery /api", "dev", http.MethodGet, "/api", "", true},
+		{"dev discovery /api/v1", "dev", http.MethodGet, "/api/v1", "", true},
+		{"dev discovery /apis", "dev", http.MethodGet, "/apis", "", true},
+		{"dev discovery /version", "dev", http.MethodGet, "/version", "", true},
+		{"dev discovery /openapi/v2", "dev", http.MethodGet, "/openapi/v2", "", true},
+		{"dev discovery POST /api", "dev", http.MethodPost, "/api", "", false},
+		{"dev discovery /healthz", "dev", http.MethodGet, "/healthz", "", false},
+		{"dev discovery /metrics", "dev", http.MethodGet, "/metrics", "", false},
+		// prod: pods/log with get only
+		{"prod get pod log", "prod", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "", true},
+		{"prod get pod log follow", "prod", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "follow=true", true},
+		{"prod list pods", "prod", http.MethodGet, "/api/v1/namespaces/default/pods", "", false},
+		{"prod get pods", "prod", http.MethodGet, "/api/v1/namespaces/default/pods", "", false},
+		// unknown group
+		{"dev apps group", "dev", http.MethodGet, "/apis/apps/v1/namespaces/default/deployments", "", false},
 	}
 
 	for _, tt := range tests {
-		if got := targets.Allows(tt.verb, tt.context, tt.namespace); got != tt.want {
-			t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.context, tt.namespace, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowsClassified(t, targets, tt.context, tt.method, tt.path, tt.query); got != tt.want {
+				t.Fatalf("Allows(%s %s%s) = %v, want %v", tt.method, tt.path, querySuffix(tt.query), got, tt.want)
+			}
+		})
+	}
+}
+
+func querySuffix(query string) string {
+	if query == "" {
+		return ""
+	}
+	return "?" + query
+}
+
+// TestTargetsAllNamespacesAndClusterScope covers the namespace forms: a
+// namespaced rule covers one namespace, "*" covers every namespace and the
+// all-namespaces list, and scope: cluster covers the cluster-scoped
+// requests instead of a namespace.
+func TestTargetsAllNamespacesAndClusterScope(t *testing.T) {
+	targets := Targets{
+		testTarget("dev",
+			testResource("pods", "*", "get", "list"),
+			Resource{Group: "", Resource: "namespaces", Scope: "cluster", Verbs: []string{"get", "list"}},
+		),
+		testTarget("prod",
+			testResource("pods", "default", "get", "list"),
+		),
+	}
+
+	tests := []struct {
+		name, context, method, path string
+		want bool
+	}{
+		// dev: "*" covers every namespace and the all-namespaces list
+		{"dev pods in default", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", true},
+		{"dev pods in other", "dev", http.MethodGet, "/api/v1/namespaces/other/pods/nginx", true},
+		{"dev all-namespaces list", "dev", http.MethodGet, "/api/v1/pods", true},
+		// dev: scope cluster covers the cluster-scoped collection; the
+		// named GET carries the namespace of the path, which no
+		// cluster-scoped rule covers
+		{"dev list namespaces (cluster-scoped)", "dev", http.MethodGet, "/api/v1/namespaces", true},
+		{"dev get one named namespace", "dev", http.MethodGet, "/api/v1/namespaces/foo", false},
+		// prod: one named namespace only
+		{"prod pods in default", "prod", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", true},
+		{"prod pods in other", "prod", http.MethodGet, "/api/v1/namespaces/other/pods/nginx", false},
+		{"prod all-namespaces list", "prod", http.MethodGet, "/api/v1/pods", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowsClassified(t, targets, tt.context, tt.method, tt.path, ""); got != tt.want {
+				t.Fatalf("Allows(%s %s) = %v, want %v", tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTargetsIsolateSameClusterDifferentContexts covers the context
+// partition: two contexts pointing at the same cluster stay isolated, the
+// rules of one context never apply to another, and matching a context name
+// is exact.
+func TestTargetsIsolateSameClusterDifferentContexts(t *testing.T) {
+	// Both contexts point at the same cluster; dev grants pods, prod
+	// grants pods/log only.
+	targets := Targets{
+		testTarget("dev", testResource("pods", "default", "get", "list", "watch")),
+		testTarget("prod", testResource("pods/log", "default", "get")),
+	}
+
+	tests := []struct {
+		name, context, path string
+		want bool
+	}{
+		{"dev list pods", "dev", "/api/v1/namespaces/default/pods", true},
+		{"dev get pod log (no inheritance from prod)", "dev", "/api/v1/namespaces/default/pods/nginx/log", false},
+		{"prod list pods (no inheritance from dev)", "prod", "/api/v1/namespaces/default/pods", false},
+		{"prod get pod log", "prod", "/api/v1/namespaces/default/pods/nginx/log", true},
+		{"prod get pod log (not case-identical)", "Prod", "/api/v1/namespaces/default/pods/nginx/log", false},
+		{"unknown context", "stage", "/api/v1/namespaces/default/pods", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowsClassified(t, targets, tt.context, http.MethodGet, tt.path, ""); got != tt.want {
+				t.Fatalf("Allows(%s %s) = %v, want %v", http.MethodGet, tt.path, got, tt.want)
+			}
+		})
 	}
 }
 
 func TestEmptyTargetsDenyAll(t *testing.T) {
 	var targets Targets
-	for _, tt := range []struct {
-		verb      Verb
-		namespace string
-	}{
-		{Read, ""},
-		{Read, "default"},
-		{ReadWrite, "default"},
-	} {
-		if targets.Allows(tt.verb, "pear", tt.namespace) {
-			t.Fatalf("empty targets allowed (%q, %q)", tt.verb, tt.namespace)
-		}
+	tests := []struct{ context, path string }{
+		{"pear", "/api/v1/namespaces/default/pods"},
+		{"pear", "/api"},
+		{"pear", "/healthz"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if allowsClassified(t, targets, tt.context, http.MethodGet, tt.path, "") {
+				t.Fatalf("empty targets allowed (%q, %q)", tt.context, tt.path)
+			}
+		})
 	}
 }
 
 func TestSetTargetsUpdatesPolicy(t *testing.T) {
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "proxy.local")
-	if !proxy.allows(Read, "dev", "") {
+	proxy := New(testPolicy("dev"), "proxy.local")
+	if !proxy.allows("dev", mustClassify(t, http.MethodGet, "/api/v1/namespaces/default/pods", "")) {
 		t.Fatal("initial target should be allowed")
 	}
 
-	proxy.SetTargets(Targets{{Mode: Read, Context: "prod", ClusterScope: true}})
+	proxy.SetTargets(testPolicy("prod"))
 
-	if proxy.allows(Read, "dev", "") {
+	if proxy.allows("dev", mustClassify(t, http.MethodGet, "/api/v1/namespaces/default/pods", "")) {
 		t.Fatal("old context should be denied after SetTargets")
 	}
-	if !proxy.allows(Read, "prod", "") {
+	if !proxy.allows("prod", mustClassify(t, http.MethodGet, "/api/v1/namespaces/default/pods", "")) {
 		t.Fatal("new context should be allowed after SetTargets")
 	}
 }
 
-func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
-	targets := Targets{{Mode: ReadWrite, Context: "pear", ClusterScope: true}}
-
-	if got := targets.Allows(Read, "Pear", "default"); got {
-		t.Fatalf("Allows(%q, %q) = %v, want false", Read, "Pear", got)
+// mustClassify classifies for the policy checks.
+func mustClassify(t *testing.T, method, path, query string) *apirequest.RequestInfo {
+	t.Helper()
+	info, err := classifyRequest(method, path, query)
+	if err != nil {
+		t.Fatalf("classifyRequest(%q, %q) error = %v", method, path, err)
 	}
+	return info
 }
 
-func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
-	targets := Targets{
-		{Mode: ReadWrite, Context: "prod", Namespaces: []string{"team-*"}},
-		{Mode: Read, Context: "*", ClusterScope: true},
-	}
-
+// TestClassifyRequest covers the classification: the proxy authorizes
+// what the API server would authorize for the same request.
+func TestClassifyRequest(t *testing.T) {
 	tests := []struct {
-		name      string
-		verb      Verb
-		context   string
-		namespace string
-		want      bool
+		name, method, path, query string
+		wantVerb, wantResource, wantSubresource, wantNamespace, wantName string
+		wantResourceRequest bool
 	}{
-		{"rw in allowed namespace", ReadWrite, "prod", "team-alpha", true},
-		{"rw in other namespace denied", ReadWrite, "prod", "other", false},
-		{"read in other namespace allowed by wildcard", Read, "prod", "other", true},
-		{"cluster-scoped rw denied", ReadWrite, "prod", "", false},
-		{"cluster-scoped read allowed by wildcard", Read, "prod", "", true},
+		// Regular resources: get on a named object, list and watch on
+		// collections (name empty turns get into list, watch comes
+		// from the query).
+		{"get pod", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", "", "get", "pods", "", "default", "nginx", true},
+		{"list pods", http.MethodGet, "/api/v1/namespaces/default/pods", "", "list", "pods", "", "default", "", true},
+		{"watch pods", http.MethodGet, "/api/v1/namespaces/default/pods", "watch=true", "watch", "pods", "", "default", "", true},
+		{"create pod", http.MethodPost, "/api/v1/namespaces/default/pods", "", "create", "pods", "", "default", "", true},
+		// Subresources: log with a name, the watch path verb.
+		{"get pod log", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "", "get", "pods", "log", "default", "nginx", true},
+		{"get pod log follow", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "follow=true", "get", "pods", "log", "default", "nginx", true},
+		{"watch path prefix", http.MethodGet, "/api/v1/watch/namespaces/default/pods", "", "watch", "pods", "", "default", "", true},
+		{"watch path all namespaces", http.MethodGet, "/api/v1/watch/pods", "", "watch", "pods", "", "", "", true},
+		// Cluster-scoped and all-namespaces requests carry no namespace.
+		{"list nodes", http.MethodGet, "/api/v1/nodes", "", "list", "nodes", "", "", "", true},
+		{"list all namespaces pods", http.MethodGet, "/api/v1/pods", "", "list", "pods", "", "", "", true},
+		// Non-resource requests: the fixed discovery paths only.
+		{"discovery /api", http.MethodGet, "/api", "", "get", "", "", "", "", false},
+		{"discovery /healthz", http.MethodGet, "/healthz", "", "get", "", "", "", "", false},
+		{"group discovery", http.MethodGet, "/apis/apps/v1", "", "get", "", "", "", "", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := targets.Allows(tt.verb, tt.context, tt.namespace); got != tt.want {
-				t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.context, tt.namespace, got, tt.want)
+			info, err := classifyRequest(tt.method, tt.path, tt.query)
+			if err != nil {
+				t.Fatalf("classifyRequest(%q, %q) error = %v", tt.method, tt.path, err)
+			}
+			if info.Verb != tt.wantVerb || info.Resource != tt.wantResource || info.Subresource != tt.wantSubresource {
+				t.Fatalf("classifyRequest(%q, %q) verb/resource/subresource = %q/%q/%q, want %q/%q/%q",
+					tt.method, tt.path, info.Verb, info.Resource, info.Subresource, tt.wantVerb, tt.wantResource, tt.wantSubresource)
+			}
+			if info.Namespace != tt.wantNamespace || info.Name != tt.wantName {
+				t.Fatalf("classifyRequest(%q, %q) namespace/name = %q/%q, want %q/%q",
+					tt.method, tt.path, info.Namespace, info.Name, tt.wantNamespace, tt.wantName)
+			}
+			if info.IsResourceRequest != tt.wantResourceRequest {
+				t.Fatalf("classifyRequest(%q, %q) IsResourceRequest = %v, want %v", tt.method, tt.path, info.IsResourceRequest, tt.wantResourceRequest)
 			}
 		})
 	}
 }
 
-// Regression: contexts pointing at the same cluster must be isolated by
-// context name, so a read-only context cannot gain write access just because
-// another context to the same cluster allows it.
-func TestTargetsIsolateSameClusterDifferentContexts(t *testing.T) {
-	targets := Targets{
-		{Mode: ReadWrite, Context: "dev", ClusterScope: true},
-		{Mode: Read, Context: "prod", ClusterScope: true},
+// TestAllowedDiscoveryPath covers the fixed discovery paths a
+// non-resource GET may take: /api, /apis, the core /api/v1, the discovery
+// of a group, openapi, and the version endpoint. Everything else —
+// /healthz, /metrics, arbitrary paths — is not granted.
+func TestAllowedDiscoveryPath(t *testing.T) {
+	allowed := []string{"/api", "/apis", "/api/v1", "/apis/apps/v1", "/version", "/openapi/v2", "/openapi/v3"}
+	for _, path := range allowed {
+		if !allowedDiscoveryPath(path) {
+			t.Fatalf("allowedDiscoveryPath(%q) = false, want true", path)
+		}
 	}
-
-	if !targets.Allows(ReadWrite, "dev", "") {
-		t.Fatal("dev context should allow read-write")
-	}
-	if targets.Allows(ReadWrite, "prod", "") {
-		t.Fatal("prod context should deny read-write even though dev shares its cluster")
-	}
-}
-
-func TestRequestVerbClassifiesKubernetesActions(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		path   string
-		want   Verb
-	}{
-		{name: "list pods", method: http.MethodGet, path: "/api/v1/namespaces/default/pods", want: Read},
-		{name: "watch pods", method: http.MethodGet, path: "/api/v1/namespaces/default/pods", want: Read},
-		{name: "get pod logs", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/log", want: Read},
-		{name: "create pod", method: http.MethodPost, path: "/api/v1/namespaces/default/pods", want: ReadWrite},
-		{name: "get pod exec", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/exec", want: ReadWrite},
-		{name: "post pod exec", method: http.MethodPost, path: "/api/v1/namespaces/default/pods/nginx/exec", want: ReadWrite},
-		{name: "get pod attach", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/attach", want: ReadWrite},
-		{name: "get pod portforward", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/portforward", want: ReadWrite},
-		{name: "get pod proxy path", method: http.MethodGet, path: "/api/v1/namespaces/default/pods/nginx/proxy/api", want: ReadWrite},
-		{name: "get service proxy", method: http.MethodGet, path: "/api/v1/namespaces/default/services/web/proxy", want: ReadWrite},
-		{name: "get node proxy", method: http.MethodGet, path: "/api/v1/nodes/node-1/proxy/stats", want: ReadWrite},
-		{name: "get custom resource status", method: http.MethodGet, path: "/apis/example.com/v1/namespaces/default/widgets/widget-1/status", want: Read},
-		{name: "patch custom resource status", method: http.MethodPatch, path: "/apis/example.com/v1/namespaces/default/widgets/widget-1/status", want: ReadWrite},
-		{name: "create self subject access review", method: http.MethodPost, path: "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", want: Read},
-		{name: "create subject access review", method: http.MethodPost, path: "/apis/authorization.k8s.io/v1/subjectaccessreviews", want: ReadWrite},
-		{name: "create local subject access review", method: http.MethodPost, path: "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews", want: ReadWrite},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := classifyRequest(tt.method, tt.path); got != tt.want {
-				t.Fatalf("classifyRequest(%q, %q) verb = %q, want %q", tt.method, tt.path, got, tt.want)
-			}
-		})
+	denied := []string{"/", "/api/v2", "/apis/apps", "/healthz", "/healthz/ready", "/metrics", "/openapi", "/openapi/v3/foo", "/logs", "/zzz"}
+	for _, path := range denied {
+		if allowedDiscoveryPath(path) {
+			t.Fatalf("allowedDiscoveryPath(%q) = true, want false", path)
+		}
 	}
 }
 
-func TestClassifyRequestNamespace(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		path   string
-		want   string
-	}{
-		{"namespaced", http.MethodGet, "/api/v1/namespaces/default/pods", "default"},
-		{"namespaced resource", http.MethodPost, "/api/v1/namespaces/apps/pods", "apps"},
-		{"cluster-scoped", http.MethodGet, "/api/v1/nodes", ""},
-		{"all namespaces", http.MethodGet, "/api/v1/pods", ""},
-		{"non-resource", http.MethodGet, "/healthz", ""},
+// TestRejectedRequest covers the requests the proxy cannot forward: an
+// impersonation header would have it speak for another identity, and an
+// upgraded connection is something it relays unchecked.
+func TestRejectedRequest(t *testing.T) {
+	plain := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev/api", nil)
+	if rejectedRequest(plain) {
+		t.Fatal("a plain request was rejected")
 	}
 
+	tests := []struct {
+		name, key, value string
+	}{
+		{"impersonation header", "Impersonate-User", "alice"},
+		{"impersonation group header", "Impersonate-Group", "system:masters"},
+		{"upgrade header", "Upgrade", "SPDY/3.0"},
+		{"connection upgrade", "Connection", "keep-alive, Upgrade"},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, got := classifyRequest(tt.method, tt.path); got != tt.want {
-				t.Fatalf("classifyRequest(%q, %q) namespace = %q, want %q", tt.method, tt.path, got, tt.want)
+			req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev/api/v1/namespaces/default/pods/nginx/log", nil)
+			req.Header.Set(tt.key, tt.value)
+			if !rejectedRequest(req) {
+				t.Fatalf("rejectedRequest() = false for %s: %s", tt.key, tt.value)
 			}
 		})
 	}
@@ -195,24 +350,37 @@ func TestClassifyRequestNamespace(t *testing.T) {
 
 func TestUpstreamRequestPath(t *testing.T) {
 	tests := []struct {
-		path string
-		want string
-		ok   bool
+		path, context string
+		wantDecoded, wantRaw string
+		wantWrong, wantOK bool
 	}{
-		{"/dev/api/v1/namespaces/default/pods", "/api/v1/namespaces/default/pods", true},
-		{"/dev/api", "/api", true},
-		{"/dev/apis", "/apis", true},
-		{"/team%2Fdev/api/v1/namespaces/default/pods/nginx/exec", "/api/v1/namespaces/default/pods/nginx/exec", true},
-		{"/dev", "", false},
-		{"/dev/foo", "/foo", true},
-		{"/", "", false},
+		// The prefix names the context: the token's context.
+		{"/dev/api/v1/namespaces/default/pods", "dev", "/api/v1/namespaces/default/pods", "/api/v1/namespaces/default/pods", false, true},
+		{"/dev/api", "dev", "/api", "/api", false, true},
+		{"/team%2Fdev/api/v1/namespaces/default/pods/nginx/log", "team/dev", "/api/v1/namespaces/default/pods/nginx/log", "/api/v1/namespaces/default/pods/nginx/log", false, true},
+		// No API path after the context prefix.
+		{"/dev", "dev", "", "", false, false},
+		{"/", "dev", "", "", false, false},
+		// Non-API paths pass through and are classified as non-resource.
+		{"/dev/foo", "dev", "/foo", "/foo", false, true},
+		{"/dev/api/../secrets", "dev", "/api/../secrets", "/api/../secrets", false, true},
+		// The token is used on another context's URL.
+		{"/prod/api", "dev", "", "", true, false},
+		{"/dev/api", "prod", "", "", true, false},
+		// Another context on the same URL prefix.
+		{"/team%2Fdev/api", "team%2Fdev", "", "", true, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
-			got, ok := upstreamRequestPath(tt.path)
-			if got != tt.want || ok != tt.ok {
-				t.Fatalf("upstreamRequestPath(%q) = %q, %v; want %q, %v", tt.path, got, ok, tt.want, tt.ok)
+			u, err := url.ParseRequestURI("https://proxy.local" + tt.path)
+			if err != nil {
+				t.Fatalf("ParseRequestURI() error = %v", err)
+			}
+			decoded, raw, wrong, ok := upstreamRequestPath(u, tt.context)
+			if decoded != tt.wantDecoded || raw != tt.wantRaw || wrong != tt.wantWrong || ok != tt.wantOK {
+				t.Fatalf("upstreamRequestPath(%q, %q) = %q, %q, %v, %v; want %q, %q, %v, %v",
+					tt.path, tt.context, decoded, raw, wrong, ok, tt.wantDecoded, tt.wantRaw, tt.wantWrong, tt.wantOK)
 			}
 		})
 	}
@@ -293,7 +461,7 @@ func TestSyncConfigWritesEmptyKubeconfigWithoutContexts(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
 
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
+	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -314,7 +482,8 @@ func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
+	proxy := New(testPolicy("dev"), "proxy.local")
+	cancel := runSyncConfig(t, proxy, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -323,6 +492,9 @@ func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/dev")
 	})
 
+	// prod enters through a policy reload: the re-render the source
+	// change triggers then carries it.
+	proxy.SetTargets(testPolicy("dev", "prod"))
 	writeSourceKubeconfig(t, sourcePath, "prod")
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
@@ -335,7 +507,7 @@ func TestSyncConfigUsesUpstreamCurrentContextInitially(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev")
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
+	cancel := runSyncConfig(t, New(testPolicy("prod", "dev"), "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -350,7 +522,8 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev")
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
+	proxy := New(testPolicy("prod", "dev"), "proxy.local")
+	cancel := runSyncConfig(t, proxy, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -368,6 +541,9 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
+	// stage enters through a policy reload: the re-render the source
+	// change triggers then carries it.
+	proxy.SetTargets(testPolicy("prod", "dev", "stage"))
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev", "stage")
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
@@ -382,7 +558,7 @@ func TestSyncConfigUsesUpstreamNamespaceInitially(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "apps"}, "dev")
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
+	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -397,7 +573,7 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "apps"}, "dev")
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), dir)
+	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -442,7 +618,7 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
-	cancel := runSyncConfig(t, New(nil, "proxy.local"), "")
+	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), "")
 	defer cancel()
 
 	waitFor(t, func() bool {
@@ -452,7 +628,7 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 }
 
 func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
-	proxy := New(Targets{{Mode: ReadWrite, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev", nil)
@@ -466,7 +642,7 @@ func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
 }
 
 func TestServeRejectsInvalidToken(t *testing.T) {
-	proxy := New(Targets{{Mode: ReadWrite, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev/api", nil)
@@ -495,7 +671,10 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -540,9 +719,12 @@ func TestServeIsolatesSameClusterDifferentContexts(t *testing.T) {
 	writeSharedClusterSourceKubeconfig(t, sourcePath, upstream.URL)
 
 	proxy := New(Targets{
-		{Mode: ReadWrite, Context: "dev", ClusterScope: true},
-		{Mode: Read, Context: "prod", ClusterScope: true},
+		testTarget("dev", testResource("pods", "default", "create")),
+		testTarget("prod", testResource("pods", "default", "get", "list", "watch")),
 	}, "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"dev-token": "dev", "prod-token": "prod"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -584,6 +766,79 @@ func TestServeIsolatesSameClusterDifferentContexts(t *testing.T) {
 	}
 }
 
+// TestServeProxiesKubectlLogs covers the kubectl logs flow at the protocol
+// level: an explicitly granted pods/log get passes (logs and logs -f),
+// without the explicit grant the same request is denied, and a token of
+// another context on the URL is rejected before the upstream.
+func TestServeProxiesKubectlLogs(t *testing.T) {
+	seen := make(chan string, 4)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.URL.Path + "?" + r.URL.RawQuery
+		fmt.Fprint(w, "log line")
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeSharedClusterSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{
+		testTarget("dev",
+			testResource("pods", "default", "get"),
+			testResource("pods/log", "default", "get"),
+		),
+	}, "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
+	proxy.tokens = map[string]string{"downstream-token": "dev", "other-token": "prod"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	logsStatus := func(context, token, query string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+"/"+context+"/api/v1/namespaces/default/pods/nginx/log"+query, nil)
+		if err != nil {
+			t.Fatalf("NewRequest() error = %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// granted: kubectl logs and kubectl logs -f both reach the upstream
+	for _, query := range []string{"", "?follow=true"} {
+		if got := logsStatus("dev", "downstream-token", query); got != http.StatusOK {
+			t.Fatalf("logs %q status = %d, want %d", query, got, http.StatusOK)
+		}
+		if got := <-seen; got != "/api/v1/namespaces/default/pods/nginx/log?"+strings.TrimPrefix(query, "?") {
+			t.Fatalf("upstream request = %q, want the log path with %q", got, query)
+		}
+	}
+
+	// denied by policy: without the explicit pods/log rule
+	proxy.SetTargets(Targets{testTarget("dev", testResource("pods", "default", "get"))})
+	if got := logsStatus("dev", "downstream-token", ""); got != http.StatusForbidden {
+		t.Fatalf("logs status = %d, want %d (denied without pods/log)", got, http.StatusForbidden)
+	}
+
+	// a token of another context on the URL is rejected before the upstream
+	if got := logsStatus("dev", "other-token", ""); got != http.StatusForbidden {
+		t.Fatalf("logs status with another context's token = %d, want %d", got, http.StatusForbidden)
+	}
+}
+
 func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	idToken := testIDToken(t, time.Now().Add(time.Hour))
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -598,7 +853,10 @@ func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, idToken)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -639,7 +897,10 @@ func TestServeProxiesOIDCAuthProviderPerContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCMultiContextSourceKubeconfig(t, sourcePath, upstream.URL, adminToken, pfnToken)
 
-	proxy := New(Targets{{Mode: Read, Context: "*", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("pfcp-yh1-01", "pfcp-pfn-yh1-01"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{
 		"downstream-admin-token": "pfcp-yh1-01",
 		"downstream-pfn-token":   "pfcp-pfn-yh1-01",
@@ -699,7 +960,10 @@ func TestServeRefreshesOIDCAuthProviderAndPersistsUpstreamConfig(t *testing.T) {
 	issuerCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.Certificate().Raw})
 	writeOIDCRefreshSourceKubeconfig(t, sourcePath, upstream.URL, issuer.URL, base64.StdEncoding.EncodeToString(issuerCA), testIDToken(t, time.Now().Add(-time.Hour)))
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -742,7 +1006,10 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, oldToken)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -759,10 +1026,21 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 		t.Fatalf("first upstream Authorization = %q, want old token", got)
 	}
 
+	// The session's connection is fixed: the rewritten source does not
+	// change the auth settings already resolved, the next session
+	// resolves them anew.
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, newToken)
 	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+	if got := <-seen; got != "Bearer "+oldToken {
+		t.Fatalf("second upstream Authorization = %q, want the token fixed for the session", got)
+	}
+
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
+	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
 	if got := <-seen; got != "Bearer "+newToken {
-		t.Fatalf("second upstream Authorization = %q, want new token", got)
+		t.Fatalf("third upstream Authorization = %q, want new token", got)
 	}
 }
 
@@ -868,7 +1146,10 @@ func TestServeTLSVerifiedAgainstEmbeddedCA(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	content, _, err := proxy.renderKubeconfig(testProxyPort, []kubeconfigContext{{Name: "dev"}}, "dev")
 	if err != nil {
@@ -902,14 +1183,15 @@ func TestServeTLSVerifiedAgainstEmbeddedCA(t *testing.T) {
 
 // Regression: existing contexts keep their tokens across syncs so clients
 // reading the old kubeconfig are not rejected, while new contexts get fresh
-// tokens.
+// tokens. The prod context enters through a policy reload: the session's
+// connections stay fixed, only the generated kubeconfig follows.
 func TestSyncConfigReusesTokensForExistingContexts(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
 
-	proxy := New(nil, "proxy.local")
+	proxy := New(testPolicy("dev"), "proxy.local")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ready := make(chan error, 1)
@@ -928,6 +1210,9 @@ func TestSyncConfigReusesTokensForExistingContexts(t *testing.T) {
 	})
 	devToken := contextToken(t, path, "dev")
 
+	// The policy gains prod before the source does: the re-render the
+	// source change triggers then carries both contexts.
+	proxy.SetTargets(testPolicy("dev", "prod"))
 	writeSourceKubeconfig(t, sourcePath, "dev", "prod")
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
@@ -1029,17 +1314,24 @@ func writeSourceKubeconfig(t *testing.T, path string, contexts ...string) {
 
 func writeSourceKubeconfigWithNamespaces(t *testing.T, path string, namespaces map[string]string, contexts ...string) {
 	t.Helper()
+	// The source resolves: each context references a cluster and a user
+	// entry, so a session start resolving the policy's contexts succeeds
+	// without a live upstream (resolution builds the transport only).
 	var b strings.Builder
-	b.WriteString("apiVersion: v1\nkind: Config\ncontexts:\n")
+	b.WriteString("apiVersion: v1\nkind: Config\nclusters:\n")
+	b.WriteString("- name: shared\n  cluster:\n    server: https://upstream.example.test\n")
+	b.WriteString("users:\n")
+	b.WriteString("- name: shared\n  user:\n    token: upstream-token\n")
+	b.WriteString("contexts:\n")
 	for _, context := range contexts {
 		b.WriteString("- name: ")
 		b.WriteString(context)
 		if namespace := namespaces[context]; namespace != "" {
-			b.WriteString("\n  context:\n    namespace: ")
+			b.WriteString("\n  context:\n    cluster: shared\n    user: shared\n    namespace: ")
 			b.WriteString(namespace)
 			b.WriteString("\n")
 		} else {
-			b.WriteString("\n  context: {}\n")
+			b.WriteString("\n  context:\n    cluster: shared\n    user: shared\n")
 		}
 	}
 	if len(contexts) > 0 {
@@ -1220,7 +1512,10 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1287,7 +1582,10 @@ func TestRequestsAfterTheStopNeverReachUpstream(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

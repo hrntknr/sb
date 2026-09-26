@@ -15,17 +15,12 @@ import (
 	"strings"
 
 	"github.com/hrntknr/sb/internal/util"
-	"k8s.io/apimachinery/pkg/util/sets"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd/api"
 )
-
-var requestInfoFactory = &apirequest.RequestInfoFactory{
-	APIPrefixes:          sets.NewString("api", "apis"),
-	GrouplessAPIPrefixes: sets.NewString("api"),
-}
 
 // Serve accepts downstream requests whose path prefix names the kubeconfig
 // context ("/<context>/api/...") and whose bearer token was issued for that
@@ -123,11 +118,50 @@ func (p *Proxy) SetTargets(targets Targets) {
 }
 
 // allows reports whether the current policy permits the request.
-func (p *Proxy) allows(verb Verb, context, namespace string) bool {
+func (p *Proxy) allows(context string, info *apirequest.RequestInfo) bool {
 	p.mu.RLock()
 	targets := p.Targets
 	p.mu.RUnlock()
-	return targets.Allows(verb, context, namespace)
+	return targets.Allows(context, info)
+}
+
+// resolveConnections loads the source kubeconfig and resolves the policy's
+// upstream connections from it, fixing them for the session. A context the
+// policy names that is missing from the source — or whose cluster or user
+// entry does not resolve — is an error.
+func (p *Proxy) resolveConnections() error {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	raw, err := loadingRules.Load()
+	if err != nil {
+		return fmt.Errorf("load upstream kubeconfig: %w", err)
+	}
+	return p.resolveConnectionsFrom(raw, loadingRules)
+}
+
+// resolveConnectionsFrom resolves the policy's upstream connections from
+// an already-loaded source kubeconfig and stores them, fixing the session's
+// connections. A context that does not resolve — one missing from the
+// source kubeconfig — is an error.
+func (p *Proxy) resolveConnectionsFrom(raw *api.Config, loadingRules *clientcmd.ClientConfigLoadingRules) error {
+	p.mu.RLock()
+	targets := p.Targets
+	p.mu.RUnlock()
+	connections, err := resolveUpstreams(raw, loadingRules, policyContexts(targets))
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.connections = connections
+	p.mu.Unlock()
+	return nil
+}
+
+// connection returns the connection resolved for context, nil when the
+// policy does not name it.
+func (p *Proxy) connection(context string) *upstream {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.connections[context]
 }
 
 func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -140,65 +174,57 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	upstreamPath, ok := upstreamRequestPath(r.URL.EscapedPath())
-	if !ok {
+	if rejectedRequest(r) {
+		slog.Warn("rejected k8s request with unexpected headers", "context", context, "method", r.Method, "path", r.URL.EscapedPath())
+		http.Error(w, "unsupported request", http.StatusBadRequest)
+		return
+	}
+	decodedPath, rawPath, wrongContext, ok := upstreamRequestPath(r.URL, context)
+	switch {
+	case wrongContext:
+		// The token is used on another context's URL: a token works
+		// only on its own context's URL.
+		slog.Warn("rejected k8s request on another context's URL", "context", context, "method", r.Method, "path", r.URL.EscapedPath())
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	case !ok:
 		slog.Warn("rejected k8s request with bad path", "context", context, "method", r.Method, "path", r.URL.EscapedPath())
 		http.Error(w, "bad request path", http.StatusBadRequest)
 		return
 	}
-	verb, namespace := classifyRequest(r.Method, upstreamPath)
-	if !p.allows(verb, context, namespace) {
-		slog.Warn("rejected k8s request by policy", "context", context, "method", r.Method, "path", upstreamPath)
+	info, err := classifyRequest(r.Method, decodedPath, r.URL.RawQuery)
+	if err != nil {
+		slog.Warn("rejected k8s request with bad path", "context", context, "method", r.Method, "path", decodedPath)
+		http.Error(w, "bad request path", http.StatusBadRequest)
+		return
+	}
+	if !p.allows(context, info) {
+		slog.Warn("rejected k8s request by policy", "context", context, "method", r.Method, "path", decodedPath)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	rawConfig, err := loadingRules.Load()
-	if err != nil {
-		slog.Error("failed to load upstream kubeconfig", "context", context, "error", err)
+	conn := p.connection(context)
+	if conn == nil {
+		slog.Error("no resolved upstream connection", "context", context, "method", r.Method, "path", decodedPath)
 		http.Error(w, "bad upstream config", http.StatusBadGateway)
 		return
 	}
-	config, err := clientcmd.NewNonInteractiveClientConfig(
-		*rawConfig,
-		context,
-		&clientcmd.ConfigOverrides{},
-		loadingRules,
-	).ClientConfig()
-	if err != nil {
-		slog.Error("failed to resolve upstream kubeconfig context", "context", context, "error", err)
-		http.Error(w, "bad upstream config", http.StatusBadGateway)
-		return
-	}
-	transport, err := rest.TransportFor(transportConfigForContext(config, context))
-	if err != nil {
-		slog.Error("failed to create upstream k8s transport", "context", context, "error", err)
-		http.Error(w, "bad upstream transport", http.StatusBadGateway)
-		return
-	}
-
-	target, err := url.Parse(config.Host)
-	if err != nil {
-		slog.Error("failed to parse upstream k8s host", "context", context, "host", config.Host, "error", err)
-		http.Error(w, "bad upstream host", http.StatusBadGateway)
-		return
-	}
-	slog.Debug("proxying k8s request", "context", context, "method", r.Method, "path", upstreamPath, "target", target.Host)
+	slog.Debug("proxying k8s request", "context", context, "method", r.Method, "path", decodedPath, "target", conn.target.Host)
 	proxy := &httputil.ReverseProxy{
-		Transport: transport,
+		Transport: conn.transport,
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			slog.Error("k8s upstream request failed", "context", context, "method", r.Method, "path", upstreamPath, "error", err)
+			slog.Error("k8s upstream request failed", "context", context, "method", r.Method, "path", decodedPath, "error", err)
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
 		},
 		Rewrite: func(req *httputil.ProxyRequest) {
-			req.Out.URL.Scheme = target.Scheme
-			req.Out.URL.Host = target.Host
-			req.Out.URL.Path = upstreamPath
-			req.Out.Host = target.Host
+			req.Out.URL.Scheme = conn.target.Scheme
+			req.Out.URL.Host = conn.target.Host
+			req.Out.URL.Path = decodedPath
+			req.Out.URL.RawPath = rawPath
+			req.Out.Host = conn.target.Host
 			req.Out.Header.Del("Authorization")
-			if config.BearerToken != "" {
-				req.Out.Header.Set("Authorization", "Bearer "+config.BearerToken)
+			if conn.bearerToken != "" {
+				req.Out.Header.Set("Authorization", "Bearer "+conn.bearerToken)
 			}
 		},
 	}
@@ -232,44 +258,4 @@ func oidcCacheHost(host, context string, authProviderConfig map[string]string) s
 		_, _ = hash.Write([]byte{0})
 	}
 	return host + "#" + url.PathEscape(context) + ":" + hex.EncodeToString(hash.Sum(nil))
-}
-
-// classifyRequest maps a request to its policy verb and namespace. Read covers
-// get/list/watch and self-subject access reviews; everything else (including
-// exec/attach/portforward/proxy subresources) is read-write.
-func classifyRequest(method, path string) (Verb, string) {
-	info, err := requestInfoFactory.NewRequestInfo(&http.Request{
-		Method: method,
-		URL:    &url.URL{Path: path},
-	})
-	if err != nil || !info.IsResourceRequest {
-		if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
-			return Read, ""
-		}
-		return ReadWrite, ""
-	}
-
-	if info.APIGroup == "authorization.k8s.io" && info.Resource == "selfsubjectaccessreviews" && info.Verb == "create" {
-		return Read, info.Namespace
-	}
-	switch info.Subresource {
-	case "attach", "exec", "portforward", "proxy":
-		return ReadWrite, info.Namespace
-	}
-	switch info.Verb {
-	case "get", "list", "watch":
-		return Read, info.Namespace
-	default:
-		return ReadWrite, info.Namespace
-	}
-}
-
-// upstreamRequestPath strips the context prefix: "/dev/api/v1/..." becomes
-// "/api/v1/...".
-func upstreamRequestPath(path string) (string, bool) {
-	path = strings.TrimPrefix(path, "/")
-	if _, rest, ok := strings.Cut(path, "/"); ok {
-		return "/" + rest, true
-	}
-	return "", false
 }

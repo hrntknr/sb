@@ -4,104 +4,36 @@ import (
 	"strings"
 
 	"github.com/hrntknr/sb/internal/util"
-	"mvdan.cc/sh/v3/syntax"
 )
 
-// Target grants access to hosts matching the Host glob. Commands lists allowed
-// command patterns; when empty, any command, shell, and forwarding are allowed.
+// Target grants access to one upstream: the Host pattern is matched
+// against the hostname the host-side ssh client resolves for the request,
+// with the resolved user and port when User and Port are set.
 type Target struct {
-	Host     string
-	Commands []string
-	Shell    bool
-	Forward  bool
+	Host string
+	User string
+	Port int
 }
 
 type Targets []Target
 
-// Capability is the combined access granted to a host by all matching targets.
-type Capability struct {
-	Commands []string
-	Shell    bool
-	Forward  bool
-}
-
-func (t Targets) Capability(host string) Capability {
+// Allows reports whether the upstream connection the resolved ssh config
+// describes is covered: the resolved hostname must match the Host pattern,
+// and a restricted user or port must equal the connection's. An empty
+// target set denies everything.
+func (t Targets) Allows(host, user string, port int) bool {
 	host = strings.TrimSpace(host)
-	var c Capability
 	for _, rule := range t {
 		if !util.Match(rule.Host, host) {
 			continue
 		}
-		c.Commands = append(c.Commands, rule.Commands...)
-		c.Shell = c.Shell || rule.Shell
-		c.Forward = c.Forward || rule.Forward
-	}
-	return c
-}
-
-func (c Capability) Empty() bool {
-	return len(c.Commands) == 0 && !c.Shell && !c.Forward
-}
-
-// AllowsExec reports whether the shell command is allowed: every sub-command
-// must match a pattern, and redirections and non-literal words are rejected.
-func (c Capability) AllowsExec(command string) bool {
-	for _, pattern := range c.Commands {
-		if strings.TrimSpace(pattern) == "*" {
-			return true
-		}
-	}
-	file, err := syntax.NewParser().Parse(strings.NewReader(command), "")
-	if err != nil {
-		return false
-	}
-	seen, allowed := false, true
-	syntax.Walk(file, func(node syntax.Node) bool {
-		switch n := node.(type) {
-		case *syntax.Redirect:
-			allowed = false // restricted hosts: pure command execution only
-		case *syntax.CallExpr:
-			if len(n.Args) == 0 {
-				return true
-			}
-			seen = true
-			if !c.allowsTokens(callTokens(n)) {
-				allowed = false
-			}
-		}
-		return true
-	})
-	return seen && allowed
-}
-
-func callTokens(call *syntax.CallExpr) []string {
-	var tokens []string
-	for _, w := range call.Args {
-		lit, ok := util.ShellWord(w)
-		if !ok {
-			break
-		}
-		tokens = append(tokens, lit)
-	}
-	return tokens
-}
-
-func (c Capability) allowsTokens(tokens []string) bool {
-	for _, pattern := range c.Commands {
-		patternTokens := strings.Fields(pattern)
-		if len(patternTokens) == 0 || len(tokens) < len(patternTokens) {
+		if rule.User != "" && rule.User != user {
 			continue
 		}
-		ok := true
-		for i, pt := range patternTokens {
-			if !util.Match(pt, tokens[i]) {
-				ok = false
-				break
-			}
+		if rule.Port != 0 && rule.Port != port {
+			continue
 		}
-		if ok {
-			return true
-		}
+		return true
 	}
 	return false
 }

@@ -83,17 +83,9 @@ func forwardRequest(channel cryptossh.Channel, req *cryptossh.Request) {
 
 // forwardGlobalRequests relays connection-global requests (remote port
 // forwarding, keepalives) to the upstream connection, including reply
-// payloads such as the port assigned by "tcpip-forward 0". When forwarding
-// is not allowed, requests are rejected so remote forwarding does not
-// silently pass.
-func forwardGlobalRequests(requests <-chan *cryptossh.Request, upstream *cryptossh.Client, allow bool) {
+// payloads such as the port assigned by "tcpip-forward 0".
+func forwardGlobalRequests(requests <-chan *cryptossh.Request, upstream *cryptossh.Client) {
 	for req := range requests {
-		if !allow {
-			if req.WantReply {
-				req.Reply(false, nil)
-			}
-			continue
-		}
 		ok, payload, err := upstream.SendRequest(req.Type, req.WantReply, req.Payload)
 		if req.WantReply {
 			req.Reply(err == nil && ok, payload)
