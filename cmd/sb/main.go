@@ -22,11 +22,46 @@ func main() {
 	if err := newRootCommand().Execute(); err != nil {
 		var code *exitCodeError
 		if errors.As(err, &code) {
+			// The container's exit code is sb's. What failed around it
+			// (a reclamation that could not finish) is still shown.
+			if rest := withoutExitCode(err); rest != nil {
+				fmt.Fprintln(os.Stderr, rest)
+			}
 			os.Exit(code.code)
 		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// withoutExitCode returns err without the exit-code part of a joined
+// error: what is left is what failed around the container's exit — the
+// reclamation — which the user still needs to see. The exit code alone
+// (a container that exited cleanly as far as sb is concerned) shows
+// nothing.
+func withoutExitCode(err error) error {
+	var rest []error
+	dropExitCode(err, &rest)
+	return errors.Join(rest...)
+}
+
+// dropExitCode flattens err, dropping the exit-code parts: they are kept
+// by their code, not shown with the rest.
+func dropExitCode(err error, rest *[]error) {
+	if err == nil {
+		return
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, part := range joined.Unwrap() {
+			dropExitCode(part, rest)
+		}
+		return
+	}
+	var code *exitCodeError
+	if errors.As(err, &code) {
+		return
+	}
+	*rest = append(*rest, err)
 }
 
 // options carries the flags of the root command, which are shared by all

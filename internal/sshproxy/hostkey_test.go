@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	cryptossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -289,7 +291,7 @@ func TestSSHAgentSignersReturnsConnection(t *testing.T) {
 		}
 	}()
 
-	signers, conn := sshAgentSigners(listener.Addr().String())
+	signers, conn := sshAgentSigners(context.Background(), listener.Addr().String())
 	if len(signers) != 0 {
 		t.Fatalf("signers = %v, want none", signers)
 	}
@@ -299,7 +301,7 @@ func TestSSHAgentSignersReturnsConnection(t *testing.T) {
 }
 
 func TestSSHAgentSignersNoSocket(t *testing.T) {
-	if signers, conn := sshAgentSigners(""); signers != nil || conn != nil {
+	if signers, conn := sshAgentSigners(context.Background(), ""); signers != nil || conn != nil {
 		t.Fatalf("sshAgentSigners(\"\") = %v, %v; want nil, nil", signers, conn)
 	}
 }
@@ -308,3 +310,49 @@ type testAddr struct{}
 
 func (testAddr) Network() string { return "tcp" }
 func (testAddr) String() string  { return "127.0.0.1:22" }
+
+// TestAgentSignersReturnsWhenTheAgentDoesNotAnswer covers the agent wait:
+// a socket that accepts connections but never answers the key list request.
+// The Signers call waits on it; the stop (the context cancelled) closes the
+// connection, the wait ends — the call returns, it does not hang on the
+// agent's answer.
+func TestAgentSignersReturnsWhenTheAgentDoesNotAnswer(t *testing.T) {
+	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "agent.sock"))
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	held := make(chan struct{})
+	defer close(held)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() { // accepted, never answered: the read waits forever
+				<-held
+				conn.Close()
+			}()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { // the Signers call is in flight when the stop begins
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	returned := make(chan struct{})
+	go func() {
+		signers, agentConn := sshAgentSigners(ctx, listener.Addr().String())
+		if signers != nil || agentConn != nil {
+			t.Errorf("sshAgentSigners() = %v, %v; want nil, nil (the answer never came)", signers, agentConn)
+		}
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sshAgentSigners() did not return when the stop began")
+	}
+}

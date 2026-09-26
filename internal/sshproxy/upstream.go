@@ -139,15 +139,17 @@ func currentUsername(fallback string) string {
 
 // dialUpstream connects to the upstream host, honoring a ProxyCommand if the
 // user's ssh config requires one. agentSocketPath is resolved per call so
-// restarted agents are followed. The connection — its dial, handshake, and
-// ProxyCommand child — is cut when ctx is (the shutdown began).
+// restarted agents are followed. The connection — its resolution, the agent
+// wait, the dial and handshake, the ProxyCommand child — is cut when ctx
+// is (the shutdown began).
 func dialUpstream(ctx context.Context, config sshConfig, agentSocketPath string) (*cryptossh.Client, error) {
-	auth, agentConn, err := upstreamAuthMethods(config, agentSocketPath)
+	auth, agentConn, err := upstreamAuthMethods(ctx, config, agentSocketPath)
 	if err != nil {
 		return nil, config.wrapError(err)
 	}
 	if agentConn != nil {
-		// The agent connection is only needed to sign during the handshake.
+		// The agent connection is only needed to sign during the
+		// handshake.
 		defer agentConn.Close()
 	}
 	clientConfig := &cryptossh.ClientConfig{

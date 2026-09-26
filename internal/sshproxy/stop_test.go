@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"net"
@@ -86,42 +87,70 @@ func TestShutdownCutsStuckUpstreamHandshake(t *testing.T) {
 
 // TestStoppedProxyCommandCutsTheChild covers a ProxyCommand child that does
 // not stop: the stop start (the stop context cancelled) kills it — the child
-// is gone within the stop deadline, not waited for. The child publishes its
-// pid on stdout so the test can see it die.
+// is gone within the stop deadline, not waited for. The child publishes the
+// shell's pid and its own (a `sleep` it started and waits for): both must
+// die — the stop kills the whole process group, not just the shell that
+// started it, or the shell's children outlive it holding the pipes.
 func TestStoppedProxyCommandCutsTheChild(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	conn, err := startProxyCommand(ctx, "echo $$; while :; do sleep 3600; done", "target.example:22")
+	conn, err := startProxyCommand(ctx, "echo $$; sleep 3600 & echo $!; wait", "target.example:22")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
 
-	// The child's pid on the wire.
-	head := make([]byte, 16)
-	n, err := conn.Read(head)
-	if err != nil {
-		t.Fatal(err)
+	// Both pids on the wire: the shell's, then the child it waits for.
+	lines := bufio.NewReader(conn)
+	shellPid, childPid := 0, 0
+	for i := 0; i < 2; i++ {
+		line, err := lines.ReadString('\n')
+		if err != nil {
+			t.Fatalf("the child did not publish its pid: %v", err)
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil {
+			t.Fatalf("the published pid %q is not a pid: %v", line, err)
+		}
+		if i == 0 {
+			shellPid = pid
+		} else {
+			childPid = pid
+		}
 	}
-	pid, err := strconv.ParseUint(strings.TrimSpace(string(head[:n])), 10, 32)
-	if err != nil {
-		t.Fatalf("the child did not publish its pid: %q", string(head[:n]))
+	if shellPid == 0 || childPid == 0 || shellPid == childPid {
+		t.Fatalf("pids: shell=%d child=%d; want two distinct", shellPid, childPid)
 	}
-	if proc, err := os.FindProcess(int(pid)); err != nil || proc == nil {
-		t.Skip("process lookup not available")
-	} else if err := proc.Signal(syscall.Signal(0)); err != nil {
-		t.Skip("the child already exited")
+	for _, pid := range []int{shellPid, childPid} {
+		if proc, err := os.FindProcess(pid); err != nil || proc == nil {
+			t.Skip("process lookup not available")
+		} else if err := proc.Signal(syscall.Signal(0)); err != nil {
+			t.Skip("the process already exited")
+		}
 	}
+	// A failing test would leak the group; kill both best-effort at the
+	// end so no orphan outlives the test either way.
+	t.Cleanup(func() {
+		_ = syscall.Kill(shellPid, syscall.SIGKILL)
+		_ = syscall.Kill(childPid, syscall.SIGKILL)
+	})
 
-	// The stop start: the child is killed by the connection's owner.
+	// The stop start: the child's process group is killed by the
+	// connection's owner.
 	cancel()
+	pidsGone := func() bool {
+		for _, pid := range []int{shellPid, childPid} {
+			if err := syscall.Kill(pid, syscall.Signal(0)); err == nil {
+				return false
+			}
+		}
+		return true
+	}
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(int(pid), syscall.Signal(0)); err != nil {
-			// The child is gone: the stop flow does not wait for it.
-			return
+	for !pidsGone() {
+		if time.Now().After(deadline) {
+			t.Fatalf("the ProxyCommand child survived the stop: shell=%d child=%d", shellPid, childPid)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatal("the ProxyCommand child survived the stop")
 }

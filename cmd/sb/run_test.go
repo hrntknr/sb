@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -347,6 +348,64 @@ func TestRunContainerRefusesUnreclaimedRecord(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal = %q, want it to contain %q", err.Error(), want)
 		}
+	}
+}
+
+// TestRunContainerExitWithFailedRemovalShowsRecovery covers the failed
+// run: the container exits 42 and the removal fails. The run's error keeps
+// the container's exit code (sb's own) and what failed around it: what
+// main prints on stderr — withoutExitCode — carries the recovery steps,
+// while the exit code part is kept for sb's exit, not stderr.
+func TestRunContainerExitWithFailedRemovalShowsRecovery(t *testing.T) {
+	setupRunTest(t)
+	// The removal answers without removing: the containers stay behind
+	// the call, the reclamation fails.
+	linger := filepath.Join(t.TempDir(), "linger")
+	if err := os.WriteFile(linger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_RM_LINGER", linger)
+	// The container exits 42 once its wait is over.
+	t.Setenv("SB_FAKE_RUN_EXIT_CODE", "42")
+
+	done := make(chan error, 1)
+	go func() {
+		cmd := &cobra.Command{}
+		cmd.SetContext(context.Background())
+		done <- runContainer(cmd, testOptions(t), "default", "", false, nil)
+	}()
+	waitForSessionRecord(t, "default")
+	if err := os.Remove(os.Getenv("SB_FAKE_RUN_LIFETIME")); err != nil {
+		t.Fatal(err)
+	}
+	err := <-done
+	if err == nil {
+		t.Fatal("run: want the joined failure")
+	}
+
+	// The container's exit code is sb's.
+	var code *exitCodeError
+	if !errors.As(err, &code) {
+		t.Fatalf("run %v: no exit code kept", err)
+	}
+	if code.code != 42 {
+		t.Fatalf("run %v: exit code %d kept, want 42", err, code.code)
+	}
+
+	// What failed around it still shows: the stderr part (without the
+	// exit code) carries the recovery steps.
+	rest := withoutExitCode(err)
+	if rest == nil {
+		t.Fatal("withoutExitCode: nothing; want the reclamation failure")
+	}
+	for _, want := range []string{"reclaim them by hand", "docker ps -aq --filter label=sb.session.id="} {
+		if !strings.Contains(rest.Error(), want) {
+			t.Fatalf("stderr part = %q, want it to contain %q", rest.Error(), want)
+		}
+	}
+	// The exit code part is not the stderr's: what sb keeps for itself.
+	if strings.Contains(rest.Error(), "exit status 42") {
+		t.Fatalf("stderr part = %q; want the exit code kept out of it", rest.Error())
 	}
 }
 

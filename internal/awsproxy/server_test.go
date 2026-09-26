@@ -763,3 +763,133 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 		t.Fatal("the lingering request was not cut at the deadline")
 	}
 }
+
+// TestRequestsAfterTheStopNeverReachUpstream covers the stop state: a
+// request issued after the stop began (the credentials load skipped, the
+// final upstream call next) inherits the stop's cancellation — the upstream
+// it would reach never learns about it.
+func TestRequestsAfterTheStopNeverReachUpstream(t *testing.T) {
+	p, _ := awsTestProxy(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// The session exists, so the credentials load is skipped: the request
+	// goes straight to the final upstream call.
+	p.mu.Lock()
+	p.sessions["dev"] = session{role: "arn:aws:iam::123456789012:role/dev", credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		return aws.Credentials{}, nil
+	})}
+	p.mu.Unlock()
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		// The transport refuses what the stop cancelled: the wait ends
+		// when the cancellation reaches the request, before anything
+		// goes upstream. A request the stop did not cancel hangs here
+		// — it is never delivered, whatever it carries.
+		select {
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	})
+	go func() { _ = p.Serve(listener) }()
+
+	// The stop begins before the request exists: whatever it issues from
+	// here carries the stop.
+	p.BeginStop()
+
+	request := httestSignedAWSRequest(t, listener, p)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	done := make(chan struct{})
+	go func() {
+		response, err := client.Do(request)
+		if err != nil {
+			t.Errorf("Do() after the stop began: %v", err)
+		} else {
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d; want %d (the request must fail before the upstream)", response.StatusCode, http.StatusBadGateway)
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		// The request completed without reaching the upstream: the
+		// transport refused what the stop cancelled, and the request
+		// never went past it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("a request issued after the stop began did not complete")
+	}
+}
+
+// TestRequestsStoppedMidCredentialsNeverReachUpstream covers a request
+// stuck in its credentials load when the stop begins: the load is cut there
+// — the request never resolves the upstream call it was heading for, so
+// the upstream never learns about it.
+func TestRequestsStoppedMidCredentialsNeverReachUpstream(t *testing.T) {
+	p, _ := awsTestProxy(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// No session: the credentials load runs per request. It waits for its
+	// context — cut by the stop, never completed by a source.
+	p.loadSource = func(ctx context.Context, profile string) (aws.Config, error) {
+		select {
+		case <-ctx.Done():
+			return aws.Config{}, ctx.Err()
+		}
+	}
+	hits := int32(0)
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		atomic.AddInt32(&hits, 1)
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString("ok"))}, nil
+	})
+	go func() { _ = p.Serve(listener) }()
+
+	// The stop begins before the request exists: the load's context is
+	// cancelled from its first use.
+	p.BeginStop()
+
+	request := httestSignedAWSRequest(t, listener, p)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	done := make(chan struct{})
+	go func() {
+		response, err := client.Do(request)
+		if err == nil {
+			defer response.Body.Close()
+			if hits != 0 {
+				t.Errorf("a request stopped mid-credentials reached the upstream %d times", hits)
+			}
+			if response.StatusCode != http.StatusBadGateway {
+				t.Errorf("status = %d; want %d (the credentials load must fail before the upstream)", response.StatusCode, http.StatusBadGateway)
+			}
+		} else {
+			t.Errorf("Do() stopped mid-credentials: %v", err)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a request whose load was cut by the stop did not complete")
+	}
+}
+
+// httestSignedAWSRequest builds a signed downstream request against the
+// proxy's listener, the way TestShutdownCutsLingeringRequestAtDeadline
+// does: the same request for each of the stop tests.
+func httestSignedAWSRequest(t *testing.T, listener net.Listener, p *Proxy) *http.Request {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "https://"+listener.Addr().String()+"/", strings.NewReader(`{}`))
+	request.RequestURI = ""
+	request.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	request.Header.Set("X-Amz-Target", "DynamoDB_20120810.GetItem")
+	hash := sha256.Sum256([]byte(`{}`))
+	if err := v4.NewSigner().SignHTTP(context.Background(), aws.Credentials{AccessKeyID: p.keys["dev"].ID, SecretAccessKey: p.keys["dev"].Secret}, request, hex.EncodeToString(hash[:]), "dynamodb", "eu-west-1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return request
+}

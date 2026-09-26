@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1267,5 +1268,56 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the request lingered past the stop")
+	}
+}
+
+// TestRequestsAfterTheStopNeverReachUpstream covers the stop state: a
+// request issued after the stop began (the upstream kubeconfig resolved,
+// the final upstream call next) inherits the stop's cancellation — the
+// upstream it would reach never learns about it.
+func TestRequestsAfterTheStopNeverReachUpstream(t *testing.T) {
+	hits := int32(0)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	// The stop begins before the request exists: whatever it issues from
+	// here carries the stop.
+	proxy.BeginStop()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/dev/api", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	req.URL.Scheme = "https"
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do() after the stop began: %v", err)
+	}
+	defer resp.Body.Close()
+	if hits != 0 {
+		t.Fatalf("a request issued after the stop began reached the upstream %d times", hits)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d; want %d (the request must fail before the upstream)", resp.StatusCode, http.StatusBadGateway)
 	}
 }

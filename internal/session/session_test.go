@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hrntknr/sb/internal/fakeruntime"
+	"golang.org/x/sys/unix"
 )
 
 func testSessionsDir(t *testing.T) string {
@@ -324,6 +326,122 @@ func startLockHolder(t *testing.T, dir, name, ready, done string) *exec.Cmd {
 	return cmd
 }
 
+// TestDeleteRecordKeepsTheNamesClaim covers the record deletion through
+// the lock it runs on: with the lock file unlinked here, another process
+// holding the old inode's lock would not keep a later acquirer out — the
+// name could be taken twice. The claim (the lock file) must survive the
+// deletion.
+func TestDeleteRecordKeepsTheNamesClaim(t *testing.T) {
+	dir := testSessionsDir(t)
+	signals := t.TempDir()
+	ready := filepath.Join(signals, "ready")
+	lockSignal := filepath.Join(signals, "lock")
+	held := filepath.Join(signals, "held")
+	done := filepath.Join(signals, "done")
+
+	// sb holds the name; the lock file is the claim on it.
+	lock, err := Acquire(dir, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Another process opens the same lock file's inode — what a second sb
+	// (or a restarted runtime) would have while the file exists — and
+	// waits.
+	opener := startLockOpener(t, dir, "default", ready, lockSignal, held, done)
+	waitForFile(t, ready)
+
+	// The stop flow's record deletion: it runs with the old inode open.
+	if err := lock.DeleteRecord(dir, "default"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The opener takes the lock on the same inode: the claim must still
+	// hold the name — the deletion must not have unlinked it.
+	writeFile(t, lockSignal)
+	waitForFile(t, held)
+	if _, err := Acquire(dir, "default"); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("Acquire() while another process holds the deleted record's lock file: %v; want a refusal", err)
+	}
+
+	// Released: the name may be taken again, through the same file.
+	writeFile(t, done)
+	waitForExit(t, opener)
+	after, err := Acquire(dir, "default")
+	if err != nil {
+		t.Fatalf("Acquire() after the opener released: %v", err)
+	}
+	after.Release()
+}
+
+// TestHelperLockOpener is not a test; the session tests run it as a
+// subprocess to keep a session lock file open from another process. It
+// opens the named session's lock file (the same inode), touches ready,
+// waits for the lock signal, then takes the lock, touches held, waits for
+// the done signal, and closes without deleting anything.
+func TestHelperLockOpener(t *testing.T) {
+	dir := os.Getenv("SB_TEST_HELPER_DIR")
+	name := os.Getenv("SB_TEST_HELPER_NAME")
+	ready := os.Getenv("SB_TEST_HELPER_READY")
+	lockSignal := os.Getenv("SB_TEST_HELPER_LOCK")
+	held := os.Getenv("SB_TEST_HELPER_HELD")
+	done := os.Getenv("SB_TEST_HELPER_DONE")
+	if dir == "" || name == "" || ready == "" || lockSignal == "" || held == "" || done == "" {
+		return // not running as a helper
+	}
+	f, err := os.OpenFile(LockPath(dir, name), unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		os.Exit(2)
+	}
+	if err := os.WriteFile(ready, []byte("open"), 0o600); err != nil {
+		os.Exit(3)
+	}
+	helperWaitFor(lockSignal)
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		os.Exit(4)
+	}
+	if err := os.WriteFile(held, []byte("held"), 0o600); err != nil {
+		os.Exit(5)
+	}
+	helperWaitFor(done)
+	f.Close()
+}
+
+// helperWaitFor waits for a signal file to appear, polling the way the
+// lock helpers do.
+func helperWaitFor(path string) {
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// startLockOpener runs the lock opener helper: it opens the named session's
+// lock file (the same inode), takes the lock at the lock signal, holds it
+// until the done signal, then closes without deleting anything.
+func startLockOpener(t *testing.T, dir, name, ready, lockSignal, held, done string) *exec.Cmd {
+	t.Helper()
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(testExe, "-test.run=^TestHelperLockOpener$", "-test.v=false")
+	cmd.Env = append(os.Environ(),
+		"SB_TEST_HELPER_DIR="+dir,
+		"SB_TEST_HELPER_NAME="+name,
+		"SB_TEST_HELPER_READY="+ready,
+		"SB_TEST_HELPER_LOCK="+lockSignal,
+		"SB_TEST_HELPER_HELD="+held,
+		"SB_TEST_HELPER_DONE="+done,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return cmd
+}
+
 func writeFile(t *testing.T, path string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte("done"), 0o600); err != nil {
@@ -359,17 +477,30 @@ func waitForExit(t *testing.T, cmd *exec.Cmd) {
 
 // TestSessionsDirFallsBackPerUser covers the fallback: without a usable
 // XDG_RUNTIME_DIR, the sessions live under this user's own subtree of the
-// temp dir — never a shared path another user could write into.
+// temp dir — never a shared path another user could write into. The test
+// runs in its own temp root: the real <tmp>/sb-<uid> (a running sb's
+// records, issuances, and lock paths) is outside it and survives the run
+// untouched.
 func TestSessionsDirFallsBackPerUser(t *testing.T) {
+	// The real temp dir is where a running sb's fallback lives; the test
+	// falls back inside its own root instead.
+	realTemp := os.TempDir()
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
 	t.Setenv("XDG_RUNTIME_DIR", "") // set but empty: not a usable runtime dir
-	base := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", os.Getuid()))
-	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	real := filepath.Join(realTemp, fmt.Sprintf("sb-%d", os.Getuid()))
+	before := dirSnapshot(real)
+	t.Cleanup(func() {
+		if after := dirSnapshot(real); !slices.Equal(after, before) {
+			t.Errorf("the real %s changed: %v -> %v", real, before, after)
+		}
+	})
 
 	dir, err := SessionsDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(base, "sb", "sessions"); dir != want {
+	if want := filepath.Join(root, fmt.Sprintf("sb-%d", os.Getuid()), "sb", "sessions"); dir != want {
 		t.Fatalf("SessionsDir() = %q, want %q", dir, want)
 	}
 	// What the run created is this user's and 0700.
@@ -383,6 +514,26 @@ func TestSessionsDirFallsBackPerUser(t *testing.T) {
 	if owner, ok := ownerOf(info); !ok || owner != uid() {
 		t.Fatalf("sessions dir owner is %d (ok=%v), want uid %d", owner, ok, uid())
 	}
+}
+
+// dirSnapshot lists a directory's entry names, sorted; a nil result is a
+// directory that does not exist.
+func dirSnapshot(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		// Unreadable for another reason: report nothing — the caller's
+		// comparison flags the change.
+		return nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	slices.Sort(names)
+	return names
 }
 
 // TestSessionsDirRefusesAWiderDir covers the existing-dir condition: a
@@ -403,6 +554,48 @@ func TestSessionsDirRefusesAWiderDir(t *testing.T) {
 	}
 }
 
+// TestSessionsDirRefusesAWrongParentMode covers the fallback's parent: a
+// <tmp>/sb-<uid> left too open (0755 — say another user umask'ed it) is
+// refused — what sb writes under it would sit in a too-open tree.
+func TestSessionsDirRefusesAWrongParentMode(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	parent := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", os.Getuid()))
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "mode is 755, want 0700") {
+		t.Fatalf("SessionsDir() with a 0755 parent: %v; want a refusal", err)
+	}
+}
+
+// TestSessionsDirRefusesAWrongParentOwner covers the fallback's parent: a
+// <tmp>/sb-<uid> that exists as another user's (uid 1 here) is refused —
+// what sb writes under it would sit in another user's tree, where a rename
+// could swap sb's own subtree under it.
+func TestSessionsDirRefusesAWrongParentOwner(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("changing the parent's owner needs root")
+	}
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	parent := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", os.Getuid()))
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "not this user's (uid 1)") {
+		t.Fatalf("SessionsDir() with another user's parent: %v; want a refusal", err)
+	}
+}
+
 // TestNewSessionNameGeneratesUniqueNames covers the generator: two calls
 // give two names, each the shape a user can type into sb exec --name.
 func TestNewSessionNameGeneratesUniqueNames(t *testing.T) {
@@ -414,5 +607,40 @@ func TestNewSessionNameGeneratesUniqueNames(t *testing.T) {
 		if !strings.HasPrefix(name, "sb-") || len(name) != len("sb-")+16 {
 			t.Fatalf("NewSessionName() = %q; want sb- + 16 hex", name)
 		}
+	}
+}
+
+// TestAcquireRefusesAnUnreadableRecord covers the record's readability: a
+// record that cannot be read (corrupt json) is not the same as no record —
+// the name is not free while the record is there, whatever a reuse would
+// need the record for.
+func TestAcquireRefusesAnUnreadableRecord(t *testing.T) {
+	dir := testSessionsDir(t)
+	if err := os.WriteFile(RecordPath(dir, "default"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Acquire(dir, "default"); err == nil || !strings.Contains(err.Error(), "read session record") {
+		t.Fatalf("Acquire() with a corrupt record: %v; want a refusal", err)
+	}
+}
+
+// TestReclaimErrorAdvisesPerRuntime covers the recovery advice: each
+// runtime's listing is what the advice says for it — the apple CLI lists
+// as JSON, docker and podman by label.
+func TestReclaimErrorAdvisesPerRuntime(t *testing.T) {
+	// The apple runtime needs its CLI on PATH: the fake provides it, so
+	// the advice names the runtime's own binary.
+	fakeruntime.Install(t, t.TempDir())
+	issue := "/issue"
+	appleErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "apple", IssueDir: issue}, "records")
+	if !strings.Contains(appleErr.Error(), "container ls --all --format json") {
+		t.Fatalf("ReclaimError(apple) = %v; want the apple listing", appleErr)
+	}
+	if strings.Contains(appleErr.Error(), "ps -aq --filter") {
+		t.Fatalf("ReclaimError(apple) = %v; advises the docker/podman listing", appleErr)
+	}
+	dockerErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "docker", IssueDir: issue}, "records")
+	if !strings.Contains(dockerErr.Error(), "docker ps -aq --filter label=sb.session.id=sid") {
+		t.Fatalf("ReclaimError(docker) = %v; want the ps --filter listing", dockerErr)
 	}
 }

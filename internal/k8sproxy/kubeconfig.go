@@ -42,9 +42,12 @@ type Proxy struct {
 	certOne sync.Once
 	server  *http.Server
 
-	// stopCancels: the upstream requests' cancellation, begun by BeginStop.
-	stopMu      sync.Mutex
-	stopCancels []context.CancelFunc
+	// stopCtx is cancelled when the shutdown begins: what the upstream
+	// requests started is cut there. Requests issued after the shutdown
+	// began inherit its cancellation.
+	stopMu     sync.Mutex
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 }
 
 func New(targets Targets, host string) *Proxy { return &Proxy{Targets: targets, host: host} }
@@ -140,9 +143,12 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 		return err
 	}
 
+	// The loop's stop: the proxy's own stop state (BeginStop), or the
+	// run ending, whichever comes first.
+	stop := p.stopContext(ctx)
 	for {
 		select {
-		case <-ctx.Done():
+		case <-stop.Done():
 			return nil
 		case event := <-watcher.Events:
 			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {

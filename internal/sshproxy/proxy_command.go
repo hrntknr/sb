@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 	"time"
 
 	cryptossh "golang.org/x/crypto/ssh"
@@ -26,9 +27,13 @@ func dialUpstreamProxyCommand(ctx context.Context, command, addr string, config 
 }
 
 // startProxyCommand runs the ssh ProxyCommand and connects to it via stdio.
-// The child is killed when ctx is (the shutdown began).
+// The child runs in its own process group; its whole group — the shell and
+// everything it started — is killed when ctx is (the shutdown began).
 func startProxyCommand(ctx context.Context, command, addr string) (net.Conn, error) {
 	cmd := exec.Command("/bin/sh", "-c", command)
+	// The process group is the shell's: the kill reaches the shell's
+	// children too, not just the shell.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -75,12 +80,16 @@ func (c *commandConn) Close() error {
 		_ = c.stdin.Close()
 		_ = c.stdout.Close()
 		if c.cmd.Process != nil {
-			_ = c.cmd.Process.Kill()
-		}
-		go func() {
-			_ = c.cmd.Wait()
+			// The process group dies with the shell: children left
+			// holding the pipes keep the caller's read open.
+			_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGKILL)
+			go func() {
+				_ = c.cmd.Wait()
+				close(c.done)
+			}()
+		} else {
 			close(c.done)
-		}()
+		}
 	})
 	select {
 	case <-c.done:

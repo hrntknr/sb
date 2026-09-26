@@ -44,9 +44,8 @@ func newProxyCommand(opts *options) *cobra.Command {
 			defer stop()
 			proxy, err := startProxy(ctx, cfg, *opts, opts.host, args[0])
 			if err != nil {
-				// Half of the credentials may be on disk already; nothing
-				// sb issued stays behind a failed start.
-				removeIssued(args[0])
+				// startProxy stops the issuances and removes what they
+				// issued; nothing is left to do here.
 				return err
 			}
 			err = proxy.Wait()
@@ -107,8 +106,8 @@ func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir stri
 	if err != nil {
 		return nil, err
 	}
-	// Everything from here on is undone on failure: the listeners close,
-	// nothing sb issued stays behind a failed start.
+	// Everything after this point is undone on failure: the listeners
+	// close, nothing sb issued stays behind a failed start.
 	fail := func(err error) (*proxyServer, error) {
 		sshListener.Close()
 		k8sListener.Close()
@@ -116,23 +115,50 @@ func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir stri
 		return nil, err
 	}
 	if err := sshProxy.WriteConfig(host, listenerPort(sshListener), dir); err != nil {
+		// The ssh issuance failed midway: nothing sb issued stays
+		// behind a failed start.
+		removeIssued(dir)
 		return fail(err)
 	}
 
 	server := &proxyServer{ctx: ctx, errc: make(chan error, 6), ssh: sshProxy, k8s: k8sProxy, aws: awsProxy}
-	// k8s and AWS signal the initial issuance's own result: nil is a
-	// success, anything else fails the start.
+	// The k8s and AWS issuances signal their initial write's own result
+	// (nil: the initial issuance succeeded) through their ready channel;
+	// the goroutine's return (a component's exit before its issuance
+	// was ready) is not that result.
 	k8sReady, awsReady := make(chan error, 1), make(chan error, 1)
-	go func() { server.errc <- k8sProxy.SyncConfig(ctx, listenerPort(k8sListener), dir, k8sReady) }()
-	go func() { server.errc <- awsProxy.SyncConfig(ctx, listenerPort(awsListener), dir, awsReady) }()
+	k8sDone, awsDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		server.errc <- k8sProxy.SyncConfig(ctx, listenerPort(k8sListener), dir, k8sReady)
+		close(k8sDone)
+	}()
+	go func() {
+		server.errc <- awsProxy.SyncConfig(ctx, listenerPort(awsListener), dir, awsReady)
+		close(awsDone)
+	}()
+	// A failure anywhere stops both issuances and waits for their
+	// exit: the removal happens after what the other side issued
+	// landed, not before it.
+	failStartup := func(err error) (*proxyServer, error) {
+		k8sProxy.BeginStop()
+		awsProxy.BeginStop()
+		<-k8sDone
+		<-awsDone
+		removeIssued(dir)
+		return fail(err)
+	}
 	for _, ready := range []chan error{k8sReady, awsReady} {
-		select {
-		case err := <-ready:
-			if err != nil {
-				return fail(err)
-			}
-		case err := <-server.errc:
-			return fail(err)
+		if err := ctx.Err(); err != nil {
+			// The run was cancelled mid-startup: not a success.
+			// The components exit (their loops are cut by the
+			// ctx), what they issued is gone, nothing starts.
+			return failStartup(err)
+		}
+		if err := <-ready; err != nil {
+			// The issuance that failed is not the only one
+			// running: both stop here, and what they issued
+			// is gone once they have exited.
+			return failStartup(err)
 		}
 	}
 

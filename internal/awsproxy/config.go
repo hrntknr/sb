@@ -95,9 +95,12 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 	if err != nil {
 		return err
 	}
+	// The loop's stop: the proxy's own stop state (BeginStop), or the
+	// run ending, whichever comes first.
+	stop := p.stopContext(ctx)
 	for {
 		select {
-		case <-ctx.Done():
+		case <-stop.Done():
 			return nil
 		case event := <-watcher.Events:
 			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {

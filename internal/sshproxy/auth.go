@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -11,12 +12,14 @@ import (
 )
 
 // upstreamAuthMethods collects public key auth from the identity files and
-// certificates and the ssh-agent listening on agentSocketPath. The returned
-// agent connection (if any) must be closed once the upstream handshake is
-// done; the signers sign through it.
-func upstreamAuthMethods(config sshConfig, agentSocketPath string) ([]cryptossh.AuthMethod, net.Conn, error) {
+// certificates and the ssh-agent listening on agentSocketPath. The agent
+// connection is watched: a stop that begins while the auth waits closes
+// it, unblocking the reads it is stuck on. The returned connection (if
+// any) must be closed once the upstream handshake is done; the signers
+// sign through it.
+func upstreamAuthMethods(ctx context.Context, config sshConfig, agentSocketPath string) ([]cryptossh.AuthMethod, net.Conn, error) {
 	identitySigners := identityFileSigners(config.IdentityFiles)
-	agentSigners, agentConn := sshAgentSigners(agentSocketPath)
+	agentSigners, agentConn := sshAgentSigners(ctx, agentSocketPath)
 	signers := append(append([]cryptossh.Signer{}, identitySigners...), agentSigners...)
 
 	var auth []cryptossh.AuthMethod
@@ -53,7 +56,10 @@ func identityFileSigners(identityFiles []string) []cryptossh.Signer {
 	return signers
 }
 
-func sshAgentSigners(socketPath string) ([]cryptossh.Signer, net.Conn) {
+// sshAgentSigners lists the agent's signers. The agent connection is
+// watched: a stop that begins while the Signers call waits closes the
+// connection, unblocking the read it is stuck on.
+func sshAgentSigners(ctx context.Context, socketPath string) ([]cryptossh.Signer, net.Conn) {
 	if socketPath == "" {
 		return nil, nil
 	}
@@ -61,6 +67,10 @@ func sshAgentSigners(socketPath string) ([]cryptossh.Signer, net.Conn) {
 	if err != nil {
 		return nil, nil
 	}
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
 	signers, err := agent.NewClient(conn).Signers()
 	if err != nil {
 		conn.Close()

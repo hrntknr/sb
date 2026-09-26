@@ -220,3 +220,43 @@ func TestRemoveSessionDetectsLingeringRuntime(t *testing.T) {
 		t.Fatalf("state = %q; the lingering removal dropped the containers", state)
 	}
 }
+
+// TestRuntimeCallsReturnWhenChildrenHoldThePipes covers the wait past the
+// CLI's exit: the CLI answers, exits, and leaves a child holding its
+// stdio. Without a wait deadline the caller would wait for the child's EOF
+// forever; with it the call returns — the runtime call is bounded on both
+// ends (the context kills the CLI, the deadline returns the pipes).
+func TestRuntimeCallsReturnWhenChildrenHoldThePipes(t *testing.T) {
+	Install(t, t.TempDir())
+	setState(t, "cid1 sb.session.id=sidA\n")
+	// While this exists the CLI answers, exits, and leaves a child
+	// holding its stdio: the caller's read waits for the child's EOF
+	// past the CLI's exit.
+	pipeChild := filepath.Join(t.TempDir(), "pipe-child")
+	if err := os.WriteFile(pipeChild, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_PIPE_CHILD", pipeChild)
+	t.Cleanup(func() {
+		_ = os.Remove(pipeChild) // the child exits, the pipes are released
+	})
+
+	listDone, rmDone := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := containers.ListSession(context.Background(), containers.Docker, "sidA")
+		listDone <- err
+	}()
+	go func() {
+		rmDone <- containers.RemoveByID(context.Background(), containers.Docker, "cid1")
+	}()
+	for _, done := range []chan error{listDone, rmDone} {
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("the call returned cleanly; want the wait deadline's failure")
+			}
+		case <-time.After(3 * containers.WaitDeadline):
+			t.Fatal("the call did not return within the wait deadline")
+		}
+	}
+}

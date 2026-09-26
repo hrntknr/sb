@@ -50,9 +50,12 @@ type Proxy struct {
 	server     *http.Server
 	client     *http.Client
 
-	// stopCtx: the upstream requests' cancellation, begun by BeginStop.
-	stopMu      sync.Mutex
-	stopCancels []context.CancelFunc
+	// stopCtx is cancelled when the shutdown begins: what the upstream
+	// requests started is cut there. Requests issued after the shutdown
+	// began inherit its cancellation.
+	stopMu     sync.Mutex
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 }
 
 func New(targets []Target, host string) *Proxy {
@@ -107,22 +110,31 @@ func (p *Proxy) Shutdown(ctx context.Context) {
 // cancelled here, so the streams the shutdown would wait for are cut
 // before it. Shutdown then waits for the connections' cleanups.
 func (p *Proxy) BeginStop() {
+	p.stopState()
 	p.stopMu.Lock()
-	cancels := p.stopCancels
+	cancel := p.stopCancel
 	p.stopMu.Unlock()
-	for _, cancel := range cancels {
+	if cancel != nil {
 		cancel()
 	}
+}
+
+// stopState returns the proxy's shared stop state: a context cancelled
+// when the shutdown begins. It is created on first use, so requests
+// issued after the shutdown began inherit its cancellation.
+func (p *Proxy) stopState() context.Context {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	if p.stopCtx == nil {
+		p.stopCtx, p.stopCancel = context.WithCancel(context.Background())
+	}
+	return p.stopCtx
 }
 
 // stopContext returns a context that is cancelled when the shutdown begins
 // (BeginStop), or when base is — whichever comes first.
 func (p *Proxy) stopContext(base context.Context) context.Context {
-	ctx, cancel := context.WithCancel(base)
-	p.stopMu.Lock()
-	p.stopCancels = append(p.stopCancels, cancel)
-	p.stopMu.Unlock()
-	return ctx
+	return util.StoppedContext(p.stopState(), base)
 }
 
 func (p *Proxy) setServer(server *http.Server) {

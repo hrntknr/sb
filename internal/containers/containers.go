@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Runtime is a supported container runtime.
@@ -164,16 +165,24 @@ func ListSession(ctx context.Context, r Runtime, sessionID string) ([]string, er
 	return nonEmpty(out), nil
 }
 
-// output runs the runtime CLI for its output, killed at ctx's deadline.
+// output runs the runtime CLI for its output. The wait past the command's
+// exit is bounded by WaitDeadline: without it a child of the CLI holding
+// the pipes keeps the read open past the context's kill.
 func output(ctx context.Context, r Runtime, args []string) ([]byte, error) {
 	var out bytes.Buffer
 	cmd := exec.CommandContext(ctx, r.Binary(), args...)
+	cmd.WaitDelay = WaitDeadline
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil
 }
+
+// WaitDeadline bounds each runtime CLI call's wait past its exit: a child
+// of the CLI holding stdout/stderr open keeps the call waiting for EOF
+// past the context's kill — this returns it.
+const WaitDeadline = 5 * time.Second
 
 // labelMatches selects container IDs whose labels carry the session ID from
 // the apple CLI's JSON list output.
@@ -235,9 +244,11 @@ func RemoveSession(ctx context.Context, r Runtime, sessionID string) error {
 // RemoveByID stops and removes the container with the given ID. The output
 // is included verbatim: it is the recovery hint for a manual retry. ctx
 // bounds the call: a runtime that does not answer is killed at its
-// deadline.
+// deadline, and WaitDeadline returns the pipe wait past it.
 func RemoveByID(ctx context.Context, r Runtime, id string) error {
-	out, err := exec.CommandContext(ctx, r.Binary(), "rm", "-f", id).CombinedOutput()
+	cmd := exec.CommandContext(ctx, r.Binary(), "rm", "-f", id)
+	cmd.WaitDelay = WaitDeadline
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: remove %s: %w: %s", r, id, err, strings.TrimSpace(string(out)))
 	}

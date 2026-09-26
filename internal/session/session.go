@@ -38,15 +38,21 @@ type Record struct {
 
 // baseDir returns sb's per-boot base directory. With XDG_RUNTIME_DIR it is
 // <XDG_RUNTIME_DIR>/sb; without it a per-uid directory under the temp dir
-// (<tmp>/sb-<uid>/sb) keeps users apart. The existing directory must be
-// this user's and 0700: a directory another user created (or a wider
-// mode) is refused, not adopted.
+// (<tmp>/sb-<uid>/sb) keeps users apart. Each directory sb creates must
+// be this user's and 0700: a directory another user created (or left
+// too open) is refused, not adopted.
 func baseDir() (string, error) {
 	var dir string
 	if runtime, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok && filepath.IsAbs(runtime) {
 		dir = filepath.Join(runtime, "sb")
 	} else {
-		dir = filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", uid()), "sb")
+		// The fallback's parent is created and verified first: another
+		// user claiming <tmp>/sb-<uid> must not carry sb's subtree.
+		parent := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", uid()))
+		if err := secureMkdir(parent); err != nil {
+			return "", err
+		}
+		dir = filepath.Join(parent, "sb")
 	}
 	if err := secureMkdir(dir); err != nil {
 		return "", err
@@ -167,7 +173,9 @@ func NewSessionName() string {
 // when a live session holds it, and — once the lock is taken — when the
 // name still has a record from a removal that failed: that record is
 // what the next removal needs, and its containers are unreclaimed; the
-// name may not be reused until they are gone by hand.
+// name may not be reused until they are gone by hand. A record that
+// cannot be read at all (corrupt, unreadable) is not the same as no
+// record: it is refused too, as what the retry needs is in it.
 func Acquire(dir, name string) (*Lock, error) {
 	path := LockPath(dir, name)
 	f, err := openLockFile(path, true)
@@ -178,9 +186,19 @@ func Acquire(dir, name string) (*Lock, error) {
 		f.Close()
 		return nil, fmt.Errorf("session %q is already running", name)
 	}
-	if rec, err := LoadRecord(dir, name); err == nil {
+	rec, err := LoadRecord(dir, name)
+	switch {
+	case err == nil:
 		f.Close()
+		// The lock is this process's, but the name is not: its
+		// containers are unreclaimed and the record is what the
+		// removal needs.
 		return nil, ReclaimError(rec, dir)
+	case errors.Is(err, fs.ErrNotExist):
+		// No record: the name is free.
+	default:
+		f.Close()
+		return nil, fmt.Errorf("acquire %q: %w", name, err)
 	}
 	return &Lock{f: f}, nil
 }
@@ -335,17 +353,24 @@ const RuntimeWait = 5 * time.Second
 // record stays so the next sweep retries with it.
 func ReclaimError(rec Record, dir string) error {
 	binary := rec.Runtime
+	var runtime containers.Runtime
 	if rt, err := containers.Parse(rec.Runtime); err == nil {
-		binary = rt.Binary()
+		runtime, binary = rt, rt.Binary()
+	}
+	list := fmt.Sprintf("%s ps -aq --filter label=%s=%s", binary, containers.LabelSession, rec.ID)
+	if runtime == containers.Apple {
+		// The apple CLI lists as JSON: the containers carrying the
+		// session label are picked out of it by hand.
+		list = fmt.Sprintf("%s ls --all --format json", binary)
 	}
 	return fmt.Errorf("session %q: containers left behind by a failed removal\n"+
 		"(runtime %s, session id %s, container id %q);\n"+
 		"reclaim them by hand, then start again:\n"+
-		"  %s ps -aq --filter label=%s=%s\n"+
+		"  %s\n"+
 		"  %s rm -f <the ids it lists>\n"+
 		"  rm -rf %s\n"+
 		"  rm %s",
 		rec.Name, binary, rec.ID, rec.ContainerID,
-		binary, containers.LabelSession, rec.ID,
+		list,
 		binary, rec.IssueDir, RecordPath(dir, rec.Name))
 }

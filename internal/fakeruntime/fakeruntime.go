@@ -89,6 +89,12 @@ const fakeScript = `#!/bin/sh
 #                            stay behind the call (a runtime that leaves them)
 #   SB_FAKE_RUN_IGNORE_SIGNALS  run ignores TERM/INT and never exits by
 #                            itself: the caller must kill the CLI
+#   SB_FAKE_RUN_EXIT_CODE  the code run exits with once its wait is over
+#                            (the container's exit: sb keeps it as its own)
+#   SB_FAKE_PIPE_CHILD      while this path exists the CLI answers, exits,
+#                            and leaves a child holding its stdio (a runtime
+#                            whose grandchildren keep the pipes open past
+#                            the CLI's exit: sb's wait deadline bounds it)
 set -eu
 state=@STATE@
 counter=@COUNTER@
@@ -102,6 +108,14 @@ printf '%s\n' "$cmd $*" >>"$log"
 # keep the caller's read open after the kill.
 if [ -e "${SB_FAKE_STALL:-}" ]; then
 	while :; do sleep 3600 >/dev/null 2>&1; done
+fi
+
+# SB_FAKE_PIPE_CHILD: while this path exists, the CLI answers and exits
+# normally but leaves a child holding its stdio behind: the caller's read
+# stays open past the CLI's exit. The child dies with the path: taking the
+# path away ends the loop, so no orphan outlives the test.
+if [ -e "${SB_FAKE_PIPE_CHILD:-}" ]; then
+	(while [ -e "${SB_FAKE_PIPE_CHILD:-}" ]; do sleep 0.05; done) &
 fi
 
 case $cmd in
@@ -196,6 +210,8 @@ run)
 		# Alive until stdin closes: the container command ended.
 		cat >/dev/null
 	fi
+	# The CLI's exit: the container's exit code, sb's to keep as its own.
+	exit "${SB_FAKE_RUN_EXIT_CODE:-0}"
 	;;
 exec)
 	# exec <args>: the container id is the first arg the state knows; the
