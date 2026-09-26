@@ -41,8 +41,8 @@ func Install(t testing.TB, binDir string) Files {
 	}
 	f := Files{
 		State:   filepath.Join(binDir, "state"),
-		Counter:  filepath.Join(binDir, "counter"),
-		Calls:    filepath.Join(binDir, "calls"),
+		Counter: filepath.Join(binDir, "counter"),
+		Calls:   filepath.Join(binDir, "calls"),
 	}
 	for _, path := range []string{f.State, f.Counter, f.Calls} {
 		if err := os.WriteFile(path, nil, 0o600); err != nil {
@@ -81,8 +81,14 @@ const fakeScript = `#!/bin/sh
 #   SB_FAKE_STATE      containers the runtime "has": "<id> <label>" lines
 #   SB_FAKE_COUNTER    where run takes its ids from
 #   SB_TEST_CALLS_LOG  one line per call: "<subcommand> <args joined>"
-#   SB_FAKE_RUN_LIFETIME  while this file exists a run stays alive; without
-#                      it, run lives until stdin closes
+#   SB_FAKE_RUN_LIFETIME     while this file exists a run stays alive; without
+#                            it, run lives until stdin closes
+#   SB_FAKE_STALL           while this path exists the CLI never answers
+#                            (a runtime that hangs: sb's deadline kills it)
+#   SB_FAKE_RM_LINGER       rm -f answers without removing: the containers
+#                            stay behind the call (a runtime that leaves them)
+#   SB_FAKE_RUN_IGNORE_SIGNALS  run ignores TERM/INT and never exits by
+#                            itself: the caller must kill the CLI
 set -eu
 state=@STATE@
 counter=@COUNTER@
@@ -90,6 +96,13 @@ log=@CALLS@
 cmd=$1
 shift
 printf '%s\n' "$cmd $*" >>"$log"
+
+# SB_FAKE_STALL: while this file exists, no call is answered. The sleeping
+# loop redirects its children: an orphan holding the caller's pipes would
+# keep the caller's read open after the kill.
+if [ -e "${SB_FAKE_STALL:-}" ]; then
+	while :; do sleep 3600 >/dev/null 2>&1; done
+fi
 
 case $cmd in
 info)
@@ -121,11 +134,22 @@ ps)
 	done <"$state"
 	;;
 rm)
-	# rm -f <id>...: drop the containers from the state.
+	# rm -f <id>...: drop the containers from the state. Mutations are
+	# serialized the way the real runtime serializes them: concurrent
+	# removals of disjoint labels do not lose updates.
+	if [ -e "${SB_FAKE_RM_LINGER:-}" ]; then
+		# Answers without removing: the containers stay behind the call,
+		# and the listing after it still finds them.
+		exit 0
+	fi
+	exec 9>>"$state.lock"
+	flock 9
 	for id do
 		grep -v "^$id " "$state" >"$state.tmp" || true
 		mv "$state.tmp" "$state"
 	done
+	flock -u 9
+	exec 9>&-
 	;;
 ls)
 	# ls --all --format json: the whole container list as JSON, the sb label
@@ -163,6 +187,11 @@ run)
 		# Alive until the lifetime file is gone: the caller ends the
 		# session at its own pace.
 		while [ -e "$SB_FAKE_RUN_LIFETIME" ]; do sleep 0.05; done
+	elif [ -n "${SB_FAKE_RUN_IGNORE_SIGNALS:-}" ]; then
+		# Ignores TERM and INT and never exits by itself: ending the
+		# run is the caller's to do, not the CLI's.
+		trap '' TERM INT
+		while :; do sleep 3600 >/dev/null 2>&1; done
 	else
 		# Alive until stdin closes: the container command ended.
 		cat >/dev/null

@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -127,12 +129,9 @@ func TestRunContainerReclaimsOnExit(t *testing.T) {
 	}
 	dir := sessionsDir(t)
 
-	// The session's files are gone: record, lock, issue dir.
+	// The session's files are gone: the record, the issue dir.
 	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
 		t.Fatalf("record survived the stop: %v", err)
-	}
-	if _, err := os.Stat(session.LockPath(dir, "default")); !os.IsNotExist(err) {
-		t.Fatalf("lock survived the stop: %v", err)
 	}
 	issues, err := os.ReadDir(filepath.Join(filepath.Dir(dir), "issues"))
 	if err != nil {
@@ -141,6 +140,13 @@ func TestRunContainerReclaimsOnExit(t *testing.T) {
 	if len(issues) != 0 {
 		t.Fatalf("issue dirs survived the stop: %v", issues)
 	}
+	// The lock file stays (the name's stable claim); the lock on it is
+	// released: a second run may take the name.
+	second, err := session.Acquire(dir, "default")
+	if err != nil {
+		t.Fatalf("lock file still held after the stop: %v", err)
+	}
+	second.Release()
 	// The session's containers are gone: the fake's state has no container
 	// carrying the session label (the run registered exactly one).
 	if state := stateText(t); strings.Contains(state, "sb.session.id=") {
@@ -233,5 +239,188 @@ func TestRunContainerKeepsLiveSessions(t *testing.T) {
 	}
 	if state := stateText(t); !strings.Contains(state, "cidLive sb.session.id=sidLive\n") {
 		t.Fatalf("live session's container swept: %q", state)
+	}
+}
+
+// waitForStateLine polls the fake runtime's state until it holds a line
+// carrying text, so a test never races the CLI's registration.
+func waitForStateLine(t *testing.T, text string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(stateText(t), text) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("fake runtime state never held %q: %q", text, stateText(t))
+}
+
+// TestRunContainerStopsWhenOnlySbGetsTheSignal covers the blocker: SIGTERM
+// to sb's PID only — the child CLI never exits voluntarily (it ignores
+// signals), so nothing but the stop flow may end it. The stop flow must
+// complete: communication cut, containers reclaimed, child collected,
+// the name free again.
+func TestRunContainerStopsWhenOnlySbGetsTheSignal(t *testing.T) {
+	setupRunTest(t)
+	// The run never ends by itself: the CLI ignores TERM and INT and
+	// stays alive until its caller kills it.
+	t.Setenv("SB_FAKE_RUN_IGNORE_SIGNALS", "ignore")
+	os.Unsetenv("SB_FAKE_RUN_LIFETIME")
+
+	done := make(chan error, 1)
+	go func() {
+		cmd := &cobra.Command{}
+		cmd.SetContext(context.Background())
+		done <- runContainer(cmd, testOptions(t), "default", "", false, nil)
+	}()
+	// The child registered the session's container: the run is live past
+	// its signal handler — only sb's PID receiving the signal ends it.
+	waitForStateLine(t, "sb.session.id=")
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run after the signal: %v", err)
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatal("the stop flow did not complete after the signal")
+	}
+
+	dir := sessionsDir(t)
+	// The stop flow completed: the session's record and issue dir are
+	// gone, its container is removed, and the name is free again.
+	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
+		t.Fatalf("record survived the stop: %v", err)
+	}
+	if state := stateText(t); strings.Contains(state, "sb.session.id=") {
+		t.Fatalf("container survived the stop: %q", state)
+	}
+	if lock, err := session.Acquire(dir, "default"); err != nil {
+		t.Fatalf("lock still held after the stop: %v", err)
+	} else {
+		lock.Release()
+	}
+}
+
+// TestRunContainerRefusesUnreclaimedRecord covers the reuse refusal through
+// the run flow: a name whose record survived a failed sweep (a runtime the
+// sweep cannot even name) is refused — its containers are unreclaimed, and
+// the record is what a retry needs. Another name still runs fine.
+func TestRunContainerRefusesUnreclaimedRecord(t *testing.T) {
+	setupRunTest(t)
+	dir := sessionsDir(t)
+
+	// An orphan with an unresolvable runtime: the sweep fails before
+	// touching its containers and keeps the record.
+	if err := session.SaveRecord(dir, session.Record{Name: "orphan", ID: "sidOrphan", Runtime: "banana", IssueDir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
+
+	// A run of another name sweeps at startup: the sweep fails, the
+	// orphan's record stays — and the run proceeds on its own name.
+	if err := runUntilDone(t, "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.LoadRecord(dir, "orphan"); err != nil {
+		t.Fatalf("orphan record dropped by the failed sweep: %v", err)
+	}
+
+	// The unreclaimed name is refused: its record stays until the
+	// containers are gone by hand.
+	_, err := session.Acquire(dir, "orphan")
+	if err == nil {
+		t.Fatal("Acquire() for an unreclaimed name, want a refusal")
+	}
+	// The refusal carries what a hand-recovery needs: the recovery
+	// steps with the session's own label, whatever runtime it names.
+	for _, want := range []string{
+		"reclaim them by hand",
+		"runtime banana",
+		"session id sidOrphan",
+		"--filter label=sb.session.id=sidOrphan",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+}
+
+// recordNames returns the names the session records in dir carry.
+func recordNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rec session.Record
+		if json.Unmarshal(data, &rec) == nil && rec.Name != "" {
+			names = append(names, rec.Name)
+		}
+	}
+	return names
+}
+
+// TestRunContainerGeneratesNamesWhenOmitted covers the name generation: a
+// run without --name gets its own generated name, so a second run the
+// same way runs beside the first instead of refusing its name.
+func TestRunContainerGeneratesNamesWhenOmitted(t *testing.T) {
+	setupRunTest(t)
+	lifetime := os.Getenv("SB_FAKE_RUN_LIFETIME")
+	dir := sessionsDir(t)
+
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			done <- runContainer(cmd, testOptions(t), "", "", false, nil)
+		}()
+	}
+
+	// Both runs are live at once: two records, two different names.
+	deadline := time.Now().Add(10 * time.Second)
+	var names []string
+	for time.Now().Before(deadline) {
+		if names = recordNames(t, dir); len(names) == 2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(names) != 2 {
+		t.Fatalf("two nameless runs: %d records, want 2", len(names))
+	}
+	if names[0] == names[1] {
+		t.Fatalf("two nameless runs share the name %q", names[0])
+	}
+
+	// Both runs end when the lifetime file goes.
+	if err := os.Remove(lifetime); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No name is left claimed and no container is left behind.
+	if names = recordNames(t, dir); len(names) != 0 {
+		t.Fatalf("records survived the stop: %v", names)
+	}
+	if state := stateText(t); strings.Contains(state, "sb.session.id=") {
+		t.Fatalf("containers survived the stop: %q", state)
 	}
 }

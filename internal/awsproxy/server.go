@@ -48,7 +48,11 @@ type Proxy struct {
 	cert       tls.Certificate
 	certErr    error
 	server     *http.Server
-	client      *http.Client
+	client     *http.Client
+
+	// stopCtx: the upstream requests' cancellation, begun by BeginStop.
+	stopMu      sync.Mutex
+	stopCancels []context.CancelFunc
 }
 
 func New(targets []Target, host string) *Proxy {
@@ -87,7 +91,8 @@ func (p *Proxy) Serve(listener net.Listener) error {
 
 // Shutdown stops the server: it stops accepting new requests, waits for
 // active ones to finish, and closes the rest at ctx's deadline (streams
-// that never go idle are cut there).
+// that never go idle are cut there). Call BeginStop first to cancel the
+// upstream requests at the start of the shutdown.
 func (p *Proxy) Shutdown(ctx context.Context) {
 	server := p.getServer()
 	if server == nil {
@@ -96,6 +101,28 @@ func (p *Proxy) Shutdown(ctx context.Context) {
 	if err := server.Shutdown(ctx); err != nil {
 		server.Close()
 	}
+}
+
+// BeginStop starts the shutdown: each upstream request still running is
+// cancelled here, so the streams the shutdown would wait for are cut
+// before it. Shutdown then waits for the connections' cleanups.
+func (p *Proxy) BeginStop() {
+	p.stopMu.Lock()
+	cancels := p.stopCancels
+	p.stopMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// stopContext returns a context that is cancelled when the shutdown begins
+// (BeginStop), or when base is — whichever comes first.
+func (p *Proxy) stopContext(base context.Context) context.Context {
+	ctx, cancel := context.WithCancel(base)
+	p.stopMu.Lock()
+	p.stopCancels = append(p.stopCancels, cancel)
+	p.stopMu.Unlock()
+	return ctx
 }
 
 func (p *Proxy) setServer(server *http.Server) {
@@ -161,7 +188,9 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	credentials, err := p.upstreamCredentials(r.Context(), profile, targets)
+	// The stop context: the credentials load and the upstream request it
+	// leads to are cancelled when the stop starts (BeginStop).
+	credentials, err := p.upstreamCredentials(p.stopContext(r.Context()), profile, targets)
 	if err != nil {
 		slog.Error("aws upstream credentials failed", "profile", profile, "error", err)
 		http.Error(w, "upstream credentials unavailable", http.StatusBadGateway)
@@ -169,7 +198,10 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	host := strings.ReplaceAll(endpoint.Host, "{region}", region)
 	upstreamURL := &url.URL{Scheme: "https", Host: host, Path: "/"}
-	upstream, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), bytes.NewReader(body))
+	// The upstream request carries the stop context: cancelled when the
+	// shutdown begins, it cuts the streams the graceful shutdown would
+	// otherwise wait for.
+	upstream, err := http.NewRequestWithContext(p.stopContext(r.Context()), r.Method, upstreamURL.String(), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return

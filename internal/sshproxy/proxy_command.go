@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
@@ -11,8 +12,8 @@ import (
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
-func dialUpstreamProxyCommand(command, addr string, config *cryptossh.ClientConfig) (*cryptossh.Client, error) {
-	conn, err := startProxyCommand(command, addr)
+func dialUpstreamProxyCommand(ctx context.Context, command, addr string, config *cryptossh.ClientConfig) (*cryptossh.Client, error) {
+	conn, err := startProxyCommand(ctx, command, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -25,7 +26,8 @@ func dialUpstreamProxyCommand(command, addr string, config *cryptossh.ClientConf
 }
 
 // startProxyCommand runs the ssh ProxyCommand and connects to it via stdio.
-func startProxyCommand(command, addr string) (net.Conn, error) {
+// The child is killed when ctx is (the shutdown began).
+func startProxyCommand(ctx context.Context, command, addr string) (net.Conn, error) {
 	cmd := exec.Command("/bin/sh", "-c", command)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -39,14 +41,21 @@ func startProxyCommand(command, addr string) (net.Conn, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	return &commandConn{
+	conn := &commandConn{
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: stdout,
 		addr:   addr,
 		once:   sync.Once{},
 		done:   make(chan struct{}),
-	}, nil
+	}
+	// A shutdown that begins while the child runs kills it here: the
+	// connection's owner reaps what it started.
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+	return conn, nil
 }
 
 type commandConn struct {

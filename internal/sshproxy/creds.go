@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	_ "embed"
@@ -48,6 +49,13 @@ type Proxy struct {
 
 	// conns tracks open downstream connections for Shutdown.
 	conns connSet
+
+	// stopCtx is cancelled when the shutdown begins: what one connection
+	// started (an upstream dial, a handshake, a ProxyCommand child) is
+	// cut there.
+	stopMu     sync.Mutex
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 }
 
 func New(targets Targets, agentSocket func() string) *Proxy {
@@ -55,6 +63,31 @@ func New(targets Targets, agentSocket func() string) *Proxy {
 		agentSocket = func() string { return os.Getenv("SSH_AUTH_SOCK") }
 	}
 	return &Proxy{Targets: targets, AgentSocket: agentSocket}
+}
+
+// stopContext returns the context that is cancelled when the shutdown
+// begins. What it covers: the resolution (ssh -G), the dial and handshake,
+// the ProxyCommand child — everything one connection starts upstream.
+func (p *Proxy) stopContext() context.Context {
+	p.stopMu.Lock()
+	defer p.stopMu.Unlock()
+	if p.stopCtx == nil {
+		p.stopCtx, p.stopCancel = context.WithCancel(context.Background())
+	}
+	return p.stopCtx
+}
+
+// BeginStop starts the shutdown: everything the open connections started
+// upstream — dials, handshakes, ProxyCommand children — is cancelled
+// here, once. The connections themselves are closed by Shutdown.
+func (p *Proxy) BeginStop() {
+	p.stopContext()
+	p.stopMu.Lock()
+	cancel := p.stopCancel
+	p.stopMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // WriteConfig issues downstream credentials and writes the ssh config, private

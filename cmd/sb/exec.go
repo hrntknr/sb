@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -83,7 +84,9 @@ func execCommand(opts options, name, workdir string, command []string) error {
 	if err != nil {
 		return err
 	}
-	ok, err := containers.VerifySession(rt, rec.ContainerID, rec.ID)
+	ctx, cancel := context.WithTimeout(context.Background(), session.RuntimeWait)
+	defer cancel()
+	ok, err := containers.VerifySession(ctx, rt, rec.ContainerID, rec.ID)
 	if err != nil {
 		return err
 	}

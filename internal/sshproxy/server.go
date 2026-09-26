@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
@@ -56,6 +57,10 @@ func (p *Proxy) serveOuterConn(conn net.Conn, config *cryptossh.ServerConfig) {
 	defer server.Close()
 	go cryptossh.DiscardRequests(reqs)
 
+	// This connection's stop context: cancelled when the shutdown begins,
+	// cutting what it starts upstream — the resolution, the dial and
+	// handshake, the ProxyCommand child.
+	ctx := p.stopContext()
 	for ch := range chans {
 		if ch.ChannelType() != "session" {
 			ch.Reject(cryptossh.UnknownChannelType, "session required")
@@ -65,11 +70,11 @@ func (p *Proxy) serveOuterConn(conn net.Conn, config *cryptossh.ServerConfig) {
 		if err != nil {
 			continue
 		}
-		go p.serveOuterSession(channel, requests)
+		go p.serveOuterSession(ctx, channel, requests)
 	}
 }
 
-func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cryptossh.Request) {
+func (p *Proxy) serveOuterSession(ctx context.Context, channel cryptossh.Channel, requests <-chan *cryptossh.Request) {
 	defer channel.Close()
 	for req := range requests {
 		if req.Type != "exec" {
@@ -83,7 +88,7 @@ func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cr
 			req.Reply(false, nil)
 			return
 		}
-		cfg, capability, ok := p.resolveTarget(payload.Command)
+		cfg, capability, ok := p.resolveTarget(ctx, payload.Command)
 		if !ok {
 			slog.Warn("rejected ssh proxy command", "command", payload.Command)
 			req.Reply(false, nil)
@@ -91,7 +96,7 @@ func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cr
 		}
 		slog.Info("proxying ssh connection", "requested_user", cfg.User, "host", cfg.Host, "port", cfg.Port)
 		req.Reply(true, nil)
-		p.serveInnerSSH(channel, cfg, capability)
+		p.serveInnerSSH(ctx, channel, cfg, capability)
 		return
 	}
 }
@@ -113,12 +118,12 @@ func (p *Proxy) capability(host string) Capability {
 
 // resolveTarget parses a "proxy-ssh <user> <host> <port>" exec payload,
 // resolves the upstream ssh config, and checks that the host has a capability.
-func (p *Proxy) resolveTarget(command string) (cfg sshConfig, capability Capability, ok bool) {
+func (p *Proxy) resolveTarget(ctx context.Context, command string) (cfg sshConfig, capability Capability, ok bool) {
 	fields := strings.Fields(command)
 	if len(fields) != 4 || fields[0] != "proxy-ssh" || fields[1] == "" || fields[2] == "" || !validPort(fields[3]) {
 		return sshConfig{}, Capability{}, false
 	}
-	cfg, err := upstreamConfig(fields[1], fields[2], fields[3])
+	cfg, err := upstreamConfig(ctx, fields[1], fields[2], fields[3])
 	if err != nil {
 		return sshConfig{}, Capability{}, false
 	}
@@ -137,7 +142,7 @@ func validPort(port string) bool {
 // serveInnerSSH terminates the inner SSH handshake on the outer session
 // channel (presenting a host certificate for the requested host) and forwards
 // channels to the upstream connection.
-func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, cfg sshConfig, capability Capability) {
+func (p *Proxy) serveInnerSSH(ctx context.Context, channel cryptossh.Channel, cfg sshConfig, capability Capability) {
 	serverConfig, err := p.innerServerConfig(cfg.RequestedHost)
 	if err != nil {
 		return
@@ -148,7 +153,7 @@ func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, cfg sshConfig, capabili
 	}
 	defer server.Close()
 
-	upstream, err := dialUpstream(cfg, p.AgentSocket())
+	upstream, err := dialUpstream(ctx, cfg, p.AgentSocket())
 	if err != nil {
 		slog.Error("failed to dial ssh upstream", "host", cfg.Host, "port", cfg.Port, "error", err)
 		return

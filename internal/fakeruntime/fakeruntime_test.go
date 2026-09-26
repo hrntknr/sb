@@ -1,6 +1,8 @@
 package fakeruntime
 
 import (
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,15 +20,15 @@ func TestFakesAnswerRuntimeCalls(t *testing.T) {
 	setState(t, "cid1 sb.session.id=sidA\n")
 
 	// ListSession by label finds it; another session's label does not.
-	if ids, err := containers.ListSession(containers.Docker, "sidA"); err != nil || len(ids) != 1 || ids[0] != "cid1" {
+	if ids, err := containers.ListSession(context.Background(), containers.Docker, "sidA"); err != nil || len(ids) != 1 || ids[0] != "cid1" {
 		t.Fatalf("ListSession(docker, sidA) = %v, %v; want [cid1]", ids, err)
 	}
-	if ids, err := containers.ListSession(containers.Docker, "sidB"); err != nil || len(ids) != 0 {
+	if ids, err := containers.ListSession(context.Background(), containers.Docker, "sidB"); err != nil || len(ids) != 0 {
 		t.Fatalf("ListSession(docker, sidB) = %v, %v; want empty", ids, err)
 	}
 
 	// RemoveSession stops and removes by label.
-	if err := containers.RemoveSession(containers.Docker, "sidA"); err != nil {
+	if err := containers.RemoveSession(context.Background(), containers.Docker, "sidA"); err != nil {
 		t.Fatalf("RemoveSession: %v", err)
 	}
 	if state := stateText(t); strings.Contains(state, "cid1") {
@@ -74,7 +76,7 @@ func TestFakesAppleListsJSON(t *testing.T) {
 	Install(t, t.TempDir())
 	setState(t, "cid1 sb.session.id=sidA\ncidX other-label\n")
 
-	if ids, err := containers.ListSession(containers.Apple, "sidA"); err != nil || len(ids) != 1 || ids[0] != "cid1" {
+	if ids, err := containers.ListSession(context.Background(), containers.Apple, "sidA"); err != nil || len(ids) != 1 || ids[0] != "cid1" {
 		t.Fatalf("ListSession(apple, sidA) = %v, %v; want [cid1] only", ids, err)
 	}
 }
@@ -161,5 +163,60 @@ func TestFakesRunWithLifetime(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("run never ended after the lifetime file was removed")
+	}
+}
+
+// TestRemoveSessionKillsStalledRuntime covers a runtime that does not
+// answer: the listing by label never returns, so sb's deadline kills the
+// CLI and the removal fails — the containers stay for the recovery path.
+func TestRemoveSessionKillsStalledRuntime(t *testing.T) {
+	Install(t, t.TempDir())
+	setState(t, "cid1 sb.session.id=sidA\n")
+	// The CLI never answers while this exists.
+	stall := filepath.Join(t.TempDir(), "stall")
+	if err := os.WriteFile(stall, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_STALL", stall)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := containers.RemoveSession(ctx, containers.Docker, "sidA")
+	if err == nil {
+		t.Fatal("RemoveSession() with a stalled runtime, want error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "killed") {
+		t.Fatalf("RemoveSession() error = %v; want the deadline kill", err)
+	}
+	// The call reached the CLI before it stalled.
+	if calls := callsText(t); !strings.Contains(calls, "ps -aq --filter label=sb.session.id=sidA") {
+		t.Fatalf("calls log %q: no listing by label", calls)
+	}
+	// The containers stay for the recovery path.
+	if state := stateText(t); !strings.Contains(state, "cid1 sb.session.id=sidA\n") {
+		t.Fatalf("state = %q; the stalled removal dropped the containers", state)
+	}
+}
+
+// TestRemoveSessionDetectsLingeringRuntime covers a runtime that answers
+// without removing: the listing after the call still finds the containers,
+// which is a failed removal — the containers stay for the recovery path.
+func TestRemoveSessionDetectsLingeringRuntime(t *testing.T) {
+	Install(t, t.TempDir())
+	setState(t, "cid1 sb.session.id=sidA\n")
+	linger := filepath.Join(t.TempDir(), "linger")
+	if err := os.WriteFile(linger, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_RM_LINGER", linger)
+
+	if err := containers.RemoveSession(context.Background(), containers.Docker, "sidA"); err == nil {
+		t.Fatal("RemoveSession() with a lingering runtime, want error")
+	} else if !strings.Contains(err.Error(), "left containers behind") {
+		t.Fatalf("RemoveSession() error = %q; want the leftover containers", err.Error())
+	}
+	// The containers stay behind the call.
+	if state := stateText(t); !strings.Contains(state, "cid1 sb.session.id=sidA\n") {
+		t.Fatalf("state = %q; the lingering removal dropped the containers", state)
 	}
 }

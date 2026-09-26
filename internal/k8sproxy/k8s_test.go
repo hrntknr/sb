@@ -911,12 +911,14 @@ func TestSyncConfigReusesTokensForExistingContexts(t *testing.T) {
 	proxy := New(nil, "proxy.local")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ready := make(chan struct{})
+	ready := make(chan error, 1)
 	errc := make(chan error, 1)
 	go func() {
 		errc <- proxy.SyncConfig(ctx, testProxyPort, dir, ready)
 	}()
-	<-ready
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
 
 	path := filepath.Join(dir, ".kube", "config")
 	waitFor(t, func() bool {
@@ -982,11 +984,13 @@ func runSyncConfig(t *testing.T, proxy *Proxy, dir string) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
-	ready := make(chan struct{})
+	ready := make(chan error, 1)
 	go func() {
 		errc <- proxy.SyncConfig(ctx, testProxyPort, dir, ready)
 	}()
-	<-ready
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -1194,10 +1198,18 @@ func testIDTokenWithSubject(t *testing.T, expiry time.Time, subject string) stri
 
 // TestShutdownCutsLingeringRequestAtDeadline covers the deadline of the stop
 // flow: a watch the upstream never completes is cut at the deadline, not
-// waited for.
+// waited for. The stop start (BeginStop) is what cuts the upstream request
+// itself; the lingering downstream connection is closed at the deadline.
 func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
+	aborted := make(chan struct{})
 	release := make(chan struct{})
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		go func() {
+			// The upstream request the proxy opened carries the stop
+			// context: BeginStop cancels it here.
+			<-r.Context().Done()
+			close(aborted)
+		}()
 		<-release // the watch never completes while this is held open
 	}))
 	defer upstream.Close()
@@ -1231,21 +1243,29 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 
 	// Let the request reach the hanging upstream.
 	time.Sleep(100 * time.Millisecond)
+	// The stop start: the upstream request is cancelled here — before
+	// anything waits on it.
+	proxy.BeginStop()
+	select {
+	case <-aborted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the upstream request was not cancelled by the stop start")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	start := time.Now()
 	proxy.Shutdown(ctx)
 	if waited := time.Since(start); waited > 2*time.Second {
-		t.Fatalf("Shutdown waited %v; want it cut at the deadline", waited)
+		t.Fatalf("Shutdown waited %v; want it bounded by the deadline", waited)
 	}
 
-	// The lingering request is cut: its connection is closed.
+	// The request does not linger past the stop: it ended here — the
+	// aborted upstream gives the downstream an error (upstream
+	// unavailable) or a closed connection, whichever came first.
 	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("the lingering request completed; want it cut")
-		}
+	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("the lingering request was not cut at the deadline")
+		t.Fatal("the request lingered past the stop")
 	}
 }

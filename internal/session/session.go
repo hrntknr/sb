@@ -7,6 +7,7 @@
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/hrntknr/sb/internal/containers"
 	"github.com/hrntknr/sb/internal/util"
@@ -33,18 +36,56 @@ type Record struct {
 	ContainerID string `json:"containerId,omitempty"`
 }
 
-// baseDir returns sb's per-boot base directory under XDG_RUNTIME_DIR (or
-// the temp dir when unset or relative), creating it with 0700.
+// baseDir returns sb's per-boot base directory. With XDG_RUNTIME_DIR it is
+// <XDG_RUNTIME_DIR>/sb; without it a per-uid directory under the temp dir
+// (<tmp>/sb-<uid>/sb) keeps users apart. The existing directory must be
+// this user's and 0700: a directory another user created (or a wider
+// mode) is refused, not adopted.
 func baseDir() (string, error) {
-	dir := os.TempDir()
+	var dir string
 	if runtime, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok && filepath.IsAbs(runtime) {
 		dir = filepath.Join(runtime, "sb")
+	} else {
+		dir = filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", uid()), "sb")
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := secureMkdir(dir); err != nil {
 		return "", err
 	}
 	return dir, nil
 }
+
+// secureMkdir creates dir 0700 and verifies what is already there: the
+// directory must be this user's and 0700 before sb writes into it.
+func secureMkdir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	owner, ok := ownerOf(info)
+	if !ok || owner != uid() {
+		return fmt.Errorf("session dir %s: not this user's (uid %d)", dir, owner)
+	}
+	if info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("session dir %s: mode is %o, want 0700", dir, info.Mode().Perm())
+	}
+	return nil
+}
+
+// ownerOf returns the uid owning info's path; ok is false where the
+// owner cannot be read.
+func ownerOf(info os.FileInfo) (uint32, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return stat.Uid, true
+}
+
+// uid is this process's uid.
+func uid() uint32 { return uint32(os.Getuid()) }
 
 // SessionsDir returns the directory holding the session records and locks,
 // creating it with 0700.
@@ -111,8 +152,22 @@ func NewSessionID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Acquire takes the named session's lock for this process, refusing when a
-// live session holds it. The lock is held until DeleteRecord releases it.
+// NewSessionName returns a random session name for a run whose --name was
+// omitted: random enough that a second run does not collide with the
+// first, short enough to type into sb exec.
+func NewSessionName() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(err)
+	}
+	return "sb-" + hex.EncodeToString(b[:])
+}
+
+// Acquire takes the named session's lock for this process. It refuses
+// when a live session holds it, and — once the lock is taken — when the
+// name still has a record from a removal that failed: that record is
+// what the next removal needs, and its containers are unreclaimed; the
+// name may not be reused until they are gone by hand.
 func Acquire(dir, name string) (*Lock, error) {
 	path := LockPath(dir, name)
 	f, err := openLockFile(path, true)
@@ -123,7 +178,11 @@ func Acquire(dir, name string) (*Lock, error) {
 		f.Close()
 		return nil, fmt.Errorf("session %q is already running", name)
 	}
-	return &Lock{f: f, path: path}, nil
+	if rec, err := LoadRecord(dir, name); err == nil {
+		f.Close()
+		return nil, ReclaimError(rec, dir)
+	}
+	return &Lock{f: f}, nil
 }
 
 // LockHeld reports whether a live session holds the named session's lock.
@@ -150,7 +209,7 @@ func tryLock(dir, name string) (*Lock, error) {
 		f.Close()
 		return nil, nil
 	}
-	return &Lock{f: f, path: path}, nil
+	return &Lock{f: f}, nil
 }
 
 // openLockFile opens a session lock file. O_CLOEXEC matters: the runtime CLI
@@ -166,23 +225,22 @@ func openLockFile(path string, create bool) (*os.File, error) {
 
 // Lock is a held session lock.
 type Lock struct {
-	f    *os.File
-	path string
+	f *os.File
 }
 
-// DeleteRecord deletes the record and lock files and releases the lock.
-// Called on the stop path, it must succeed even when the container was
-// already removed by the runtime.
+// DeleteRecord deletes the record file and releases the lock. The lock
+// file stays: deleting it would let two processes hold different inodes
+// of the same name (one with the file already open, one over a freshly
+// created path) and break the name's exclusivity — the file is the
+// name's stable claim, the lock on it is the current owner's.
 func (l *Lock) DeleteRecord(dir, name string) error {
 	if l == nil || l.f == nil {
 		return nil
 	}
 	recordErr := os.Remove(RecordPath(dir, name))
-	lockErr := os.Remove(l.path)
 	l.Release()
-	if (recordErr != nil && !errors.Is(recordErr, fs.ErrNotExist)) ||
-		(lockErr != nil && !errors.Is(lockErr, fs.ErrNotExist)) {
-		return fmt.Errorf("delete session files: record: %v, lock: %v", recordErr, lockErr)
+	if recordErr != nil && !errors.Is(recordErr, fs.ErrNotExist) {
+		return fmt.Errorf("delete session record %s: %w", RecordPath(dir, name), recordErr)
 	}
 	return nil
 }
@@ -221,35 +279,73 @@ func Sweep(dir string) error {
 		if lock == nil {
 			continue // a live session holds it
 		}
-		if err := sweepSession(dir, name, lock); err != nil {
+		if err := StopSession(dir, name, lock); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// sweepSession reclaims one orphaned session. On any failure the caller
-// retries the whole session next sweep, so the lock is only released here.
-func sweepSession(dir, name string, lock *Lock) error {
+// StopSession stops one session — a running one (its owner stopped it) or
+// an orphan (the sweep found it). Its containers are removed by the session
+// label, the issue dir is deleted, then the record; whatever it is that
+// fails keeps what the retry needs — the record stays — and releases the
+// lock either way: after this, nothing of sb holds the name.
+func StopSession(dir, name string, lock *Lock) error {
 	defer lock.Release()
 	rec, err := LoadRecord(dir, name)
 	if err != nil {
-		return fmt.Errorf("sweep %s: %w", name, err)
+		return ReclaimError(Record{Name: name}, dir)
 	}
-	rt, err := containers.Parse(rec.Runtime)
-	if err == nil {
-		err = containers.RemoveSession(rt, rec.ID)
-	}
-	if err != nil {
-		return fmt.Errorf("sweep %s: remove containers: %w", name, err)
+	if err := removeContainers(&rec); err != nil {
+		return ReclaimError(rec, dir)
 	}
 	if rec.IssueDir != "" {
 		if err := os.RemoveAll(rec.IssueDir); err != nil {
-			return fmt.Errorf("sweep %s: remove issue dir: %w", name, err)
+			return ReclaimError(rec, dir)
 		}
 	}
 	if err := lock.DeleteRecord(dir, name); err != nil {
-		return fmt.Errorf("sweep %s: %w", name, err)
+		return ReclaimError(rec, dir)
 	}
 	return nil
+}
+
+// removeContainers stops and removes the record's containers by session
+// label. Each runtime call is bounded by RuntimeWait: a runtime that does
+// not answer within it is killed, and the removal is a failed one.
+func removeContainers(rec *Record) error {
+	rt, err := containers.Parse(rec.Runtime)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), RuntimeWait)
+	defer cancel()
+	return containers.RemoveSession(ctx, rt, rec.ID)
+}
+
+// RuntimeWait bounds each runtime CLI call a session's stop or check
+// makes: listing by label, removing by id, verifying a container. A
+// runtime that does not answer within it is killed, and the call is a
+// failed one.
+const RuntimeWait = 5 * time.Second
+
+// ReclaimError explains a session whose stop did not finish: what is left
+// behind, and what to run by hand before the name may be used again. The
+// record stays so the next sweep retries with it.
+func ReclaimError(rec Record, dir string) error {
+	binary := rec.Runtime
+	if rt, err := containers.Parse(rec.Runtime); err == nil {
+		binary = rt.Binary()
+	}
+	return fmt.Errorf("session %q: containers left behind by a failed removal\n"+
+		"(runtime %s, session id %s, container id %q);\n"+
+		"reclaim them by hand, then start again:\n"+
+		"  %s ps -aq --filter label=%s=%s\n"+
+		"  %s rm -f <the ids it lists>\n"+
+		"  rm -rf %s\n"+
+		"  rm %s",
+		rec.Name, binary, rec.ID, rec.ContainerID,
+		binary, containers.LabelSession, rec.ID,
+		binary, rec.IssueDir, RecordPath(dir, rec.Name))
 }

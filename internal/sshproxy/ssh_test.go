@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"os"
@@ -401,12 +402,12 @@ func TestResolveTargetMatchesResolvedHostname(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 	proxy := New(Targets{{Host: "*.example.net", Commands: []string{"cat"}}}, nil)
-	cfg, capability, ok := proxy.resolveTarget("proxy-ssh alice gw 22")
+	cfg, capability, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22")
 	if !ok || cfg.Host != "gateway.example.net" || cfg.RequestedHost != "gw" || !capability.AllowsExec("cat /etc/hosts") {
 		t.Fatalf("resolveTarget() = %+v, %+v, %v", cfg, capability, ok)
 	}
 	proxy.SetTargets(Targets{{Host: "gw", Commands: []string{"*"}}})
-	if _, _, ok := proxy.resolveTarget("proxy-ssh alice gw 22"); ok {
+	if _, _, ok := proxy.resolveTarget(context.Background(), "proxy-ssh alice gw 22"); ok {
 		t.Fatal("requested alias granted access to an unlisted resolved hostname")
 	}
 }

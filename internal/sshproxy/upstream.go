@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -40,7 +41,8 @@ func (c sshConfig) matchAddr() string {
 
 // upstreamConfig resolves the effective ssh settings for a target by asking
 // the local ssh client ("ssh -G"), which applies the user's ~/.ssh/config.
-func upstreamConfig(username, host, port string) (sshConfig, error) {
+// The resolution is cut when ctx is (the shutdown began).
+func upstreamConfig(ctx context.Context, username, host, port string) (sshConfig, error) {
 	args := []string{"-G"}
 	if username != "" && username != defaultUserMarker {
 		args = append(args, "-l", username)
@@ -49,7 +51,7 @@ func upstreamConfig(username, host, port string) (sshConfig, error) {
 		args = append(args, "-p", port)
 	}
 	args = append(args, host)
-	output, err := exec.Command("ssh", args...).Output()
+	output, err := exec.CommandContext(ctx, "ssh", args...).Output()
 	if err != nil {
 		return sshConfig{}, err
 	}
@@ -137,8 +139,9 @@ func currentUsername(fallback string) string {
 
 // dialUpstream connects to the upstream host, honoring a ProxyCommand if the
 // user's ssh config requires one. agentSocketPath is resolved per call so
-// restarted agents are followed.
-func dialUpstream(config sshConfig, agentSocketPath string) (*cryptossh.Client, error) {
+// restarted agents are followed. The connection — its dial, handshake, and
+// ProxyCommand child — is cut when ctx is (the shutdown began).
+func dialUpstream(ctx context.Context, config sshConfig, agentSocketPath string) (*cryptossh.Client, error) {
 	auth, agentConn, err := upstreamAuthMethods(config, agentSocketPath)
 	if err != nil {
 		return nil, config.wrapError(err)
@@ -156,9 +159,41 @@ func dialUpstream(config sshConfig, agentSocketPath string) (*cryptossh.Client, 
 		return nil, config.wrapError(err)
 	}
 	if config.ProxyCommand != "" && !strings.EqualFold(config.ProxyCommand, "none") {
-		return config.wrapClient(dialUpstreamProxyCommand(config.ProxyCommand, config.matchAddr(), clientConfig))
+		return config.wrapClient(dialUpstreamProxyCommand(ctx, config.ProxyCommand, config.matchAddr(), clientConfig))
 	}
-	return config.wrapClient(cryptossh.Dial("tcp", config.Addr(), clientConfig))
+	return config.wrapClient(dialUpstreamTCP(ctx, config.Addr(), clientConfig))
+}
+
+// dialUpstreamTCP dials the host and runs the SSH handshake; a handshake
+// that never completes is cut at ctx's deadline (the shutdown began).
+func dialUpstreamTCP(ctx context.Context, addr string, config *cryptossh.ClientConfig) (*cryptossh.Client, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	type result struct {
+		client *cryptossh.Client
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		clientConn, chans, reqs, err := cryptossh.NewClientConn(conn, addr, config)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		done <- result{client: cryptossh.NewClient(clientConn, chans, reqs)}
+	}()
+	select {
+	case r := <-done:
+		return r.client, r.err
+	case <-ctx.Done():
+		// Closing the connection cuts the handshake; its goroutine's
+		// cleanup is the connection owner's.
+		conn.Close()
+		r := <-done
+		return nil, r.err
+	}
 }
 
 func (c sshConfig) Addr() string {

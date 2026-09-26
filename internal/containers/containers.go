@@ -5,6 +5,8 @@
 package containers
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -136,9 +138,10 @@ func labelFilter(sessionID string) string { return "label=" + SessionLabelArg(se
 
 // ListSession returns the IDs of the containers (running or not) that carry
 // the session label: the runtime's own records, not sb's, are the source of
-// truth, so a session's containers are found even if its records were never
-// written.
-func ListSession(r Runtime, sessionID string) ([]string, error) {
+// truth, so a session's containers are found even if its records were
+// never written. ctx bounds the call: a runtime that does not answer is
+// killed at its deadline.
+func ListSession(ctx context.Context, r Runtime, sessionID string) ([]string, error) {
 	var args []string
 	if r == Apple {
 		// The apple CLI's ls has no --filter; ps --filter label= covers
@@ -148,7 +151,7 @@ func ListSession(r Runtime, sessionID string) ([]string, error) {
 	} else {
 		args = []string{"ps", "-aq", "--filter", labelFilter(sessionID)}
 	}
-	out, err := exec.Command(r.Binary(), args...).Output()
+	out, err := output(ctx, r, args)
 	if err != nil {
 		if r == Apple {
 			return nil, fmt.Errorf("%s: cannot list by session label: %w", r, err)
@@ -161,11 +164,22 @@ func ListSession(r Runtime, sessionID string) ([]string, error) {
 	return nonEmpty(out), nil
 }
 
+// output runs the runtime CLI for its output, killed at ctx's deadline.
+func output(ctx context.Context, r Runtime, args []string) ([]byte, error) {
+	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, r.Binary(), args...)
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
 // labelMatches selects container IDs whose labels carry the session ID from
 // the apple CLI's JSON list output.
 func labelMatches(out []byte, sessionID string) ([]string, error) {
 	var containers []struct {
-		ID string `json:"id"`
+		ID            string `json:"id"`
 		Configuration struct {
 			Labels map[string]string `json:"labels"`
 		} `json:"configuration"`
@@ -195,24 +209,35 @@ func nonEmpty(out []byte) []string {
 // RemoveSession stops and removes the containers that carry the session
 // label (`rm -f`, which stops running containers first). A container that
 // the runtime no longer knows (already removed) is not an error: the
-// listing is the source of truth, not sb's records.
-func RemoveSession(r Runtime, sessionID string) error {
-	ids, err := ListSession(r, sessionID)
+// listing is the source of truth, not sb's records. What the runtime
+// answers without removing is a failed removal: the listing after it
+// must come back empty, and it is an error when it does not.
+func RemoveSession(ctx context.Context, r Runtime, sessionID string) error {
+	ids, err := ListSession(ctx, r, sessionID)
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
-		if err := RemoveByID(r, id); err != nil {
+		if err := RemoveByID(ctx, r, id); err != nil {
 			return err
 		}
+	}
+	left, err := ListSession(ctx, r, sessionID)
+	if err != nil {
+		return err
+	}
+	if len(left) > 0 {
+		return fmt.Errorf("%s: remove left containers behind: %s", r, strings.Join(left, " "))
 	}
 	return nil
 }
 
 // RemoveByID stops and removes the container with the given ID. The output
-// is included verbatim: it is the recovery hint for a manual retry.
-func RemoveByID(r Runtime, id string) error {
-	out, err := exec.Command(r.Binary(), "rm", "-f", id).CombinedOutput()
+// is included verbatim: it is the recovery hint for a manual retry. ctx
+// bounds the call: a runtime that does not answer is killed at its
+// deadline.
+func RemoveByID(ctx context.Context, r Runtime, id string) error {
+	out, err := exec.CommandContext(ctx, r.Binary(), "rm", "-f", id).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: remove %s: %w: %s", r, id, err, strings.TrimSpace(string(out)))
 	}
@@ -222,13 +247,15 @@ func RemoveByID(r Runtime, id string) error {
 // VerifySession reports whether the container with the given ID exists and
 // carries the session label, cross-checking the runtime's records against
 // the session record: a stale or copied record alone connects to nothing.
-func VerifySession(r Runtime, containerID, sessionID string) (bool, error) {
+// ctx bounds the call: a runtime that does not answer is killed at its
+// deadline.
+func VerifySession(ctx context.Context, r Runtime, containerID, sessionID string) (bool, error) {
 	if containerID == "" || strings.ContainsAny(containerID, " \t\n\r") {
 		return false, nil
 	}
 	if r == Apple {
 		args := []string{"ls", "--all", "--format", "json"}
-		out, err := exec.Command(r.Binary(), args...).Output()
+		out, err := output(ctx, r, args)
 		if err != nil {
 			return false, fmt.Errorf("%s: cannot list by session label: %w", r, err)
 		}
@@ -244,7 +271,7 @@ func VerifySession(r Runtime, containerID, sessionID string) (bool, error) {
 		return false, nil
 	}
 	args := []string{"ps", "-aq", "--filter", "id=" + containerID, "--filter", labelFilter(sessionID)}
-	out, err := exec.Command(r.Binary(), args...).Output()
+	out, err := output(ctx, r, args)
 	if err != nil {
 		return false, fmt.Errorf("%s: cannot list by session label (is the runtime running?): %w", r, err)
 	}

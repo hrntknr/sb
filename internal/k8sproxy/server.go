@@ -49,7 +49,9 @@ func (p *Proxy) Serve(l net.Listener) error {
 
 // Shutdown stops the server: it stops accepting new requests, waits for
 // active ones to finish, and closes the rest at ctx's deadline (streams
-// that never go idle, like watch and logs -f, are cut there).
+// that never go idle, like watch and logs -f, are cut there). Call
+// BeginStop first to cancel the upstream requests at the start of the
+// shutdown.
 func (p *Proxy) Shutdown(ctx context.Context) {
 	server := p.getServer()
 	if server == nil {
@@ -58,6 +60,28 @@ func (p *Proxy) Shutdown(ctx context.Context) {
 	if err := server.Shutdown(ctx); err != nil {
 		server.Close()
 	}
+}
+
+// BeginStop starts the shutdown: each upstream request still running is
+// cancelled here, so the streams the shutdown would wait for are cut
+// before it. Shutdown then waits for the connections' cleanups.
+func (p *Proxy) BeginStop() {
+	p.stopMu.Lock()
+	cancels := p.stopCancels
+	p.stopMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// stopContext returns a context that is cancelled when the shutdown begins
+// (BeginStop), or when base is — whichever comes first.
+func (p *Proxy) stopContext(base context.Context) context.Context {
+	ctx, cancel := context.WithCancel(base)
+	p.stopMu.Lock()
+	p.stopCancels = append(p.stopCancels, cancel)
+	p.stopMu.Unlock()
+	return ctx
 }
 
 func (p *Proxy) setServer(server *http.Server) {
@@ -169,7 +193,10 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 	}
-	proxy.ServeHTTP(w, r)
+	// The upstream request carries the stop context: cancelled when the
+	// shutdown begins, it cuts the streams (watch, logs -f) the graceful
+	// shutdown would otherwise wait for.
+	proxy.ServeHTTP(w, r.WithContext(p.stopContext(r.Context())))
 }
 
 // transportConfigForContext tags the rest config host so per-context OIDC

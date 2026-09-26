@@ -699,7 +699,21 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 	defer listener.Close()
 	release := make(chan struct{})
 	defer close(release)
+	// The session exists, so the credentials load is skipped: the request
+	// goes straight to the final upstream call, the one the stop cuts.
+	p.mu.Lock()
+	p.sessions["dev"] = session{role: "arn:aws:iam::123456789012:role/dev", credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+		return aws.Credentials{}, nil
+	})}
+	p.mu.Unlock()
+	aborted := make(chan struct{})
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		go func() {
+			// The upstream request carries the stop context: BeginStop
+			// cancels it here.
+			<-r.Context().Done()
+			close(aborted)
+		}()
 		<-release // the upstream never completes while this is held open
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString("ok"))}, nil
 	})
@@ -722,6 +736,15 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 
 	// Let the request reach the hanging upstream.
 	time.Sleep(100 * time.Millisecond)
+	// The stop start: the upstream request is cancelled here — before
+	// anything waits on it.
+	p.BeginStop()
+	select {
+	case <-aborted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the upstream request was not cancelled by the stop start")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	start := time.Now()

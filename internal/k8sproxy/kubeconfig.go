@@ -41,7 +41,12 @@ type Proxy struct {
 	certErr error
 	certOne sync.Once
 	server  *http.Server
+
+	// stopCancels: the upstream requests' cancellation, begun by BeginStop.
+	stopMu      sync.Mutex
+	stopCancels []context.CancelFunc
 }
+
 func New(targets Targets, host string) *Proxy { return &Proxy{Targets: targets, host: host} }
 
 type kubeconfigFile struct {
@@ -94,10 +99,11 @@ type kubeconfigState struct {
 }
 
 // SyncConfig keeps the proxy kubeconfig under dir in sync with the source
-// kubeconfig. It writes the initial config, signals it once through ready,
-// and then follows source changes. current-context and namespace overrides
-// made inside the generated config are preserved across syncs.
-func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- struct{}) error {
+// kubeconfig. It writes the initial config, signals the write's own result
+// through ready (nil: the initial issuance succeeded), and then follows
+// source changes. current-context and namespace overrides made inside the
+// generated config are preserved across syncs.
+func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- error) error {
 	if port <= 0 {
 		return fmt.Errorf("k8s: invalid proxy port")
 	}
@@ -127,7 +133,8 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 
 	lastKey, err := p.syncConfigOnce(port, dir, ^uint32(0))
 	if ready != nil {
-		close(ready)
+		// The initial issuance's own result, not just its completion.
+		ready <- err
 	}
 	if err != nil {
 		return err

@@ -44,13 +44,16 @@ func newProxyCommand(opts *options) *cobra.Command {
 			defer stop()
 			proxy, err := startProxy(ctx, cfg, *opts, opts.host, args[0])
 			if err != nil {
+				// Half of the credentials may be on disk already; nothing
+				// sb issued stays behind a failed start.
+				removeIssued(args[0])
 				return err
 			}
 			err = proxy.Wait()
-			// The stop flow is the same on every exit: the proxies' open
-			// connections are closed within the deadline, then the issued
-			// credentials are gone.
-			proxy.Shutdown(shutdownCtx())
+			// The stop flow is the same on every exit: the proxies stop
+			// accepting and cancel their upstreams within the deadline,
+			// then the issued credentials are gone.
+			proxy.Stop(shutdownCtx())
 			removeIssued(args[0])
 			return err
 		},
@@ -90,52 +93,49 @@ func removeIssued(dir string) {
 }
 
 // startProxy starts the ssh, k8s and AWS proxies serving credentials under
-// dir and returns once those credentials are on disk. host is the address
-// downstreams use to reach the proxy. Cancel ctx to stop them.
+// dir, and returns once every issuance is on disk: the ssh config and keys
+// (written synchronously), the k8s and AWS credentials (their ready channel
+// carries the initial write's own result — nil is a success). Every failure
+// path closes the listeners. host is the address downstreams use to reach
+// the proxy. Cancel ctx to stop them.
 func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir string) (*proxyServer, error) {
 	sshProxy := sshproxy.New(cfg.SSHTargets(), nil)
 	k8sProxy := k8sproxy.New(cfg.K8sTargets(), host)
 	awsProxy := awsproxy.New(cfg.AWSTargets(), host)
 
-	sshListener, k8sListener, err := listen(opts.sshListen, opts.k8sListen)
+	sshListener, k8sListener, awsListener, err := listenAll(opts.sshListen, opts.k8sListen, opts.awsListen)
 	if err != nil {
 		return nil, err
 	}
-	awsListener, err := net.Listen("tcp", opts.awsListen)
-	if err != nil {
+	// Everything from here on is undone on failure: the listeners close,
+	// nothing sb issued stays behind a failed start.
+	fail := func(err error) (*proxyServer, error) {
 		sshListener.Close()
 		k8sListener.Close()
-		return nil, fmt.Errorf("listen aws: %w", err)
+		awsListener.Close()
+		return nil, err
 	}
 	if err := sshProxy.WriteConfig(host, listenerPort(sshListener), dir); err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	server := &proxyServer{ctx: ctx, errc: make(chan error, 6), ssh: sshProxy, k8s: k8sProxy, aws: awsProxy}
-	// The k8s proxy signals once its kubeconfig (with this process's
-	// certificate) is on disk, so the first request finds valid tokens.
-	ready := make(chan struct{})
-	go func() {
-		server.errc <- k8sProxy.SyncConfig(ctx, listenerPort(k8sListener), dir, ready)
-	}()
-	select {
-	case <-ready:
-	case err := <-server.errc:
-		return nil, err
-	}
-	awsReady := make(chan error, 1)
+	// k8s and AWS signal the initial issuance's own result: nil is a
+	// success, anything else fails the start.
+	k8sReady, awsReady := make(chan error, 1), make(chan error, 1)
+	go func() { server.errc <- k8sProxy.SyncConfig(ctx, listenerPort(k8sListener), dir, k8sReady) }()
 	go func() { server.errc <- awsProxy.SyncConfig(ctx, listenerPort(awsListener), dir, awsReady) }()
-	select {
-	case err := <-awsReady:
-		if err != nil {
-			sshListener.Close()
-			k8sListener.Close()
-			awsListener.Close()
-			return nil, err
+	for _, ready := range []chan error{k8sReady, awsReady} {
+		select {
+		case err := <-ready:
+			if err != nil {
+				return fail(err)
+			}
+		case err := <-server.errc:
+			return fail(err)
 		}
-	case err := <-server.errc:
-		return nil, err
 	}
+
 	go serve(ctx, server.errc, sshListener, sshProxy.Serve)
 	go serve(ctx, server.errc, k8sListener, k8sProxy.Serve)
 	go serve(ctx, server.errc, awsListener, awsProxy.Serve)
@@ -163,26 +163,37 @@ func (s *proxyServer) Wait() error {
 	}
 }
 
-// Shutdown stops the proxies' downstream connections: new requests are
-// rejected, open ones (SSH transfers, k8s watches, logs -f) are closed,
-// and each proxy waits for its cleanup within ctx's deadline.
-func (s *proxyServer) Shutdown(ctx context.Context) {
+// Stop stops the proxies: first they stop accepting and cancel their
+// upstreams (the beginning of the shutdown, every proxy at once), then
+// each waits for its cleanup within ctx's deadline. The deadline is made
+// here, when the shutdown starts, so a long-lived session does not stop
+// with an expired one.
+func (s *proxyServer) Stop(ctx context.Context) {
+	s.ssh.BeginStop()
+	s.k8s.BeginStop()
+	s.aws.BeginStop()
 	s.ssh.Shutdown(ctx)
 	s.k8s.Shutdown(ctx)
 	s.aws.Shutdown(ctx)
 }
 
-func listen(sshAddr, k8sAddr string) (ssh, k8s net.Listener, err error) {
+func listenAll(sshAddr, k8sAddr, awsAddr string) (ssh, k8s, aws net.Listener, err error) {
 	ssh, err = net.Listen("tcp", sshAddr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("listen ssh: %w", err)
+		return nil, nil, nil, fmt.Errorf("listen ssh: %w", err)
 	}
 	k8s, err = net.Listen("tcp", k8sAddr)
 	if err != nil {
 		ssh.Close()
-		return nil, nil, fmt.Errorf("listen k8s: %w", err)
+		return nil, nil, nil, fmt.Errorf("listen k8s: %w", err)
 	}
-	return ssh, k8s, nil
+	aws, err = net.Listen("tcp", awsAddr)
+	if err != nil {
+		ssh.Close()
+		k8s.Close()
+		return nil, nil, nil, fmt.Errorf("listen aws: %w", err)
+	}
+	return ssh, k8s, aws, nil
 }
 
 func listenerPort(l net.Listener) int {

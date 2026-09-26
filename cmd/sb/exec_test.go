@@ -33,15 +33,21 @@ func TestExecCommandCrossChecksTheRuntime(t *testing.T) {
 		t.Fatalf("exec into the live session: %v", err)
 	}
 
-	// The runtime no longer knows the container (it was removed; another
-	// container took over the session's name): the record alone must not
-	// connect. Replace the state with another session's container.
-	if err := rewriteState(t, "cidOther sb.session.id=sidOther\n"); err != nil {
-		t.Fatal(err)
-	}
-	err = execCommand(options{}, "default", "", []string{"true"})
-	if err == nil || !strings.Contains(err.Error(), `has no container "cid1"`) {
-		t.Fatalf("exec with a container the runtime no longer knows: %v; want a refusal", err)
+	// Each half of the cross-check fails on its own: the container known
+	// but carrying another session's label, the session's label on
+	// another container — and neither matching at all.
+	for _, state := range []string{
+		"cid1 sb.session.id=sidX\n",         // the container's, not the session's
+		"cidOther sb.session.id=sid1\n",     // the session's, on another container
+		"cidOther sb.session.id=sidOther\n", // neither matches the record
+	} {
+		if err := rewriteState(t, state); err != nil {
+			t.Fatal(err)
+		}
+		err := execCommand(options{}, "default", "", []string{"true"})
+		if err == nil || !strings.Contains(err.Error(), `has no container "cid1"`) {
+			t.Fatalf("exec with %q: %v; want a refusal", state, err)
+		}
 	}
 
 	// The session's lock is gone (its owner exited): exec must refuse.
