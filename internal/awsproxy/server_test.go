@@ -3,12 +3,17 @@ package awsproxy
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -666,6 +671,7 @@ func TestStopCutsTheSessionUpstream(t *testing.T) {
 	// the connection going when the stop cuts it.
 	reached := make(chan struct{}, 1)
 	cut := make(chan struct{})
+	release := make(chan struct{})
 	var cutOnce sync.Once
 	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The real service consumes the request body: the call it
@@ -680,9 +686,15 @@ func TestStopCutsTheSessionUpstream(t *testing.T) {
 		select {
 		case <-r.Context().Done():
 			cutOnce.Do(func() { close(cut) })
+		case <-release:
+			// The cleanup freed the handler: what the stop did
+			// not cut, the cleanup did — not a success signal.
 		}
 	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
 	defer stsServer.Close()
+	defer close(release)
 	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
 	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
 	dir := t.TempDir()
@@ -713,6 +725,162 @@ func TestStopCutsTheSessionUpstream(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the startup did not return")
+	}
+}
+
+// TestStopCutsTheContainerCredentialsUpstream covers the stop cutting
+// the container credentials fetch: the profile's own credentials — held
+// open by the endpoint — are refused or cut once the stop begins, so
+// what they would send after the stop never goes out and the
+// endpoint sees the connection go.
+func TestStopCutsTheContainerCredentialsUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// No static source credentials: the profile's own fall to the
+	// container endpoint — the chain fetches them there.
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The container credentials endpoint: it holds the fetch open
+	// and reports the connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	release := make(chan struct{})
+	var cutOnce sync.Once
+	credsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real endpoint consumes the request body: the fetch it
+		// carries is what the endpoint reads. Consumed here, the
+		// endpoint watches the connection from then on — until then
+		// it could not see the client go.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			cutOnce.Do(func() { close(cut) })
+		case <-release:
+			// The cleanup freed the handler: what the stop did
+			// not cut, the cleanup did — not a success signal.
+		}
+	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
+	defer credsServer.Close()
+	defer close(release)
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", credsServer.URL)
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: the profile's own fetch hangs
+	// in the held request. The start is bounded: nothing returning is
+	// a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The profile's fetch reached the endpoint: the arrival is what
+	// the stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the credentials fetch did not reach the endpoint")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The endpoint saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight credentials fetch")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut credentials fetch; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
+	}
+}
+
+// TestSyncConfigWithCABundle covers the load with a custom CA bundle:
+// the bundle's certificate authority must resolve into the session's
+// transport — the STS endpoint's certificate it authenticates — or
+// the load that would set it fails.
+func TestSyncConfigWithCABundle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A CA that signs the STS endpoint's certificate, and the bundle
+	// that carries it.
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caKey.Public(), caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caCertificate, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	serverDER, err := x509.CreateCertificate(rand.Reader, serverTemplate, caCertificate, serverKey.Public(), caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The bundle the load reads: the CA's certificate.
+	if err := os.WriteFile(filepath.Join(home, "ca.pem"), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The STS endpoint: its certificate is signed by the CA — the
+	// session's STS call authenticates it with the bundle.
+	stsServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = io.WriteString(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
+	}))
+	stsServer.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{serverDER}, PrivateKey: serverKey}}}
+	stsServer.StartTLS()
+	defer stsServer.Close()
+	t.Setenv("AWS_CA_BUNDLE", filepath.Join(home, "ca.pem"))
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	// The startup resolves the session over TLS: the bundle's CA must
+	// resolve into the transport, and the load must not fail setting it.
+	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
+		t.Fatalf("SyncConfig with a CA bundle: %v", err)
 	}
 }
 
