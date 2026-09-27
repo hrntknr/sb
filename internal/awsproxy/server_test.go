@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -519,10 +520,12 @@ func TestSyncConfigErrorsOnMissingProfile(t *testing.T) {
 }
 
 // TestSyncConfigErrorsOnCredentialFetchFailure covers the source
-// credentials fetch failing at the startup: the source cannot provide
-// the profile's credentials, so the chain falls to the metadata
-// service — pointed at a refused endpoint here — and the fetch's own
-// failure is the start's result, not the first request's.
+// credentials fetch failing at the startup: the chain's provider —
+// whatever the source would resolve it to — cannot provide the
+// profile's credentials, and the fetch's own failure is the start's
+// result, not the first request's.
+var errSourceCredentialsUnavailable = errors.New("source credentials unavailable")
+
 func TestSyncConfigErrorsOnCredentialFetchFailure(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
@@ -530,19 +533,40 @@ func TestSyncConfigErrorsOnCredentialFetchFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte(""), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The metadata service endpoint: a refused connection. The chain
-	// falls to it for the profile's credentials, so the fetch fails here.
-	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:1")
-	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}}}, "localhost")
-	err := p.SyncConfig(context.Background(), 12345, t.TempDir(), nil)
-	if err == nil {
-		t.Fatal("SyncConfig with an unresolvable source; want a failure")
+	// The source cannot provide the profile's credentials: the injected
+	// chain fails deterministically, whatever the environment would fall
+	// to (the container or IMDS endpoints it would otherwise reach).
+	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}}}, "localhost")
+	p.loadSource = func(context.Context, string) (aws.Config, error) {
+		return aws.Config{Region: "us-east-1", Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{}, errSourceCredentialsUnavailable
+		})}, nil
 	}
-	if !strings.Contains(err.Error(), "connection refused") {
+	dir := t.TempDir()
+	// The start is bounded: a startup that waits for a ready that never
+	// comes would hang instead.
+	failure := make(chan error, 1)
+	go func() {
+		failure <- p.SyncConfig(context.Background(), 12345, dir, nil)
+	}()
+	var err error
+	select {
+	case err = <-failure:
+	case <-time.After(10 * time.Second):
+		t.Fatal("SyncConfig did not return: a start that waits for a ready that never comes held it")
+	}
+	if err == nil {
+		t.Fatal("SyncConfig with a failing source; want a failure")
+	}
+	if !strings.Contains(err.Error(), "source credentials unavailable") {
 		t.Fatalf("SyncConfig() = %v; want the credentials fetch's own failure", err)
+	}
+	// Nothing the failed start issued stays behind it.
+	if _, statErr := os.Stat(filepath.Join(dir, ".aws")); !os.IsNotExist(statErr) {
+		t.Fatalf(".aws still exists after the failed start: %v", statErr)
 	}
 }
 
@@ -621,6 +645,74 @@ func TestSessionResolutionDoesNotFollowTheSourceAfterReady(t *testing.T) {
 		}
 	default:
 		t.Fatal("the request was not forwarded")
+	}
+}
+
+// TestStopCutsTheSessionUpstream covers the stop cutting what its
+// sources send: the startup's STS call — held open by the server —
+// is refused or cut once the stop begins, so what it would send after
+// the stop never goes out and the server sees the connection go.
+func TestStopCutsTheSessionUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The STS server: it holds the session's call open and reports
+	// the connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	var cutOnce sync.Once
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real service consumes the request body: the call it
+		// carries is what the server reads. Consumed here, the
+		// server watches the connection from then on — until then it
+		// could not see the client go.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			cutOnce.Do(func() { close(cut) })
+		}
+	}))
+	defer stsServer.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: its STS call hangs in the
+	// held request. The start is bounded: nothing returning is a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The session's STS call reached the server: the arrival is what
+	// the stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the session's STS call did not reach the server")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The server saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight STS call")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut STS call; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
 	}
 }
 
