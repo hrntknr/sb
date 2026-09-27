@@ -20,11 +20,13 @@ import (
 )
 
 // setupRunTest installs the fake runtimes, points sb's session directories
-// at a per-test runtime dir, and returns the session lifetime file whose
+// at per-test dirs (the state dir for the records and locks, the runtime
+// dir for the issue dirs), and returns the session lifetime file whose
 // removal ends a run.
 func setupRunTest(t *testing.T) string {
 	t.Helper()
 	fakeruntime.Install(t, t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	lifetime := filepath.Join(t.TempDir(), "lifetime")
 	if err := os.WriteFile(lifetime, nil, 0o600); err != nil {
@@ -139,7 +141,9 @@ func TestRunContainerReclaimsOnExit(t *testing.T) {
 	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
 		t.Fatalf("record survived the stop: %v", err)
 	}
-	issues, err := os.ReadDir(filepath.Join(filepath.Dir(dir), "issues"))
+	// The issue dir lives under the runtime dir's sb tree (the state
+	// dir holds the records and locks).
+	issues, err := os.ReadDir(filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "sb", "issues"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,8 +492,12 @@ func TestRunContainerRefusesUnreclaimedRecord(t *testing.T) {
 	}
 	// The refusal carries what a hand-recovery needs: the recovery
 	// steps with the session's own label, whatever runtime it names.
+	// The creation's result is unsettled, so the advice is the
+	// unsettle form: the record is what the next sweep retries with,
+	// not the by-hand reclaim named outright.
 	for _, want := range []string{
-		"reclaim them by hand",
+		"next sweep retries with this record",
+		"creation request has ended",
 		"runtime banana",
 		"session id sidOrphan",
 		"--filter label=sb.session.id=sidOrphan",
@@ -799,7 +807,10 @@ func TestRunProxyStartFailureDropsTheSession(t *testing.T) {
 	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
 		t.Fatal("record survived a start failure before the creation")
 	}
-	issues := filepath.Join(filepath.Dir(dir), "issues")
+	// The issue dir lives under the runtime dir's sb tree (the state
+	// dir holds the records and locks); its base is what the run
+	// created there.
+	issues := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "sb", "issues")
 	entries, err := os.ReadDir(issues)
 	if err != nil {
 		t.Fatal(err)

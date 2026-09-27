@@ -1,6 +1,7 @@
 package v3
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -200,48 +201,146 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
-// TestLoadScopeDecidedInEveryGroup covers the shape check past the core
-// group: rules in apps, rbac, batch, and storage load with the shape the
-// scope decision gives the resource — the same check core's rules get, in
-// every group sb decides.
+// stableResources lists every resource of every group the Kubernetes
+// stable API at v1.36 has, with the scope the API reference gives it —
+// an independent list, written from the reference docs, that the scope
+// table has to answer for: a resource the table misses answers here
+// instead, and one it maps to the wrong scope answers here too.
+var stableResources = []struct {
+	group    string
+	resource string
+	cluster  bool // cluster-scoped as the API reference gives it
+}{
+	{"", "bindings", false},
+	{"", "componentstatuses", true},
+	{"", "configmaps", false},
+	{"", "endpoints", false},
+	{"", "events", false},
+	{"", "limitranges", false},
+	{"", "namespaces", true},
+	{"", "nodes", true},
+	{"", "persistentvolumeclaims", false},
+	{"", "persistentvolumes", true},
+	{"", "pods", false},
+	{"", "podtemplates", false},
+	{"", "replicationcontrollers", false},
+	{"", "resourcequotas", false},
+	{"", "secrets", false},
+	{"", "serviceaccounts", false},
+	{"", "services", false},
+	{"apps", "controllerrevisions", false},
+	{"apps", "daemonsets", false},
+	{"apps", "deployments", false},
+	{"apps", "replicasets", false},
+	{"apps", "statefulsets", false},
+	{"admissionregistration.k8s.io", "mutatingwebhookconfigurations", true},
+	{"admissionregistration.k8s.io", "mutatingadmissionpolicies", true},
+	{"admissionregistration.k8s.io", "mutatingadmissionpolicybindings", true},
+	{"admissionregistration.k8s.io", "validatingwebhookconfigurations", true},
+	{"admissionregistration.k8s.io", "validatingadmissionpolicies", true},
+	{"admissionregistration.k8s.io", "validatingadmissionpolicybindings", true},
+	{"apiextensions.k8s.io", "customresourcedefinitions", true},
+	{"apiregistration.k8s.io", "apiservices", true},
+	{"authentication.k8s.io", "tokenreviews", true},
+	{"authorization.k8s.io", "localsubjectaccessreviews", false},
+	{"authorization.k8s.io", "selfsubjectaccessreviews", true},
+	{"authorization.k8s.io", "selfsubjectrulesreviews", true},
+	{"authorization.k8s.io", "subjectaccessreviews", true},
+	{"autoscaling", "horizontalpodautoscalers", false},
+	{"batch", "cronjobs", false},
+	{"batch", "jobs", false},
+	{"certificates.k8s.io", "certificatesigningrequests", true},
+	{"coordination.k8s.io", "leases", false},
+	{"discovery.k8s.io", "endpointslices", false},
+	{"events.k8s.io", "events", false},
+	{"flowcontrol.apiserver.k8s.io", "flowschemas", true},
+	{"flowcontrol.apiserver.k8s.io", "prioritylevelconfigurations", true},
+	{"networking.k8s.io", "ingressclasses", true},
+	{"networking.k8s.io", "ingresses", false},
+	{"networking.k8s.io", "ipaddresses", true},
+	{"networking.k8s.io", "networkpolicies", false},
+	{"networking.k8s.io", "servicecidrs", true},
+	{"node.k8s.io", "runtimeclasses", true},
+	{"policy", "poddisruptionbudgets", false},
+	{"rbac.authorization.k8s.io", "clusterrolebindings", true},
+	{"rbac.authorization.k8s.io", "clusterroles", true},
+	{"rbac.authorization.k8s.io", "rolebindings", false},
+	{"rbac.authorization.k8s.io", "roles", false},
+	{"resource.k8s.io", "deviceclasses", true},
+	{"resource.k8s.io", "resourceclaims", false},
+	{"resource.k8s.io", "resourceclaimtemplates", false},
+	{"resource.k8s.io", "resourceslices", true},
+	{"scheduling.k8s.io", "priorityclasses", true},
+	{"storage.k8s.io", "csidrivers", true},
+	{"storage.k8s.io", "csinodes", true},
+	{"storage.k8s.io", "csistoragecapacities", false},
+	{"storage.k8s.io", "storageclasses", true},
+	{"storage.k8s.io", "volumeattachments", true},
+	{"storage.k8s.io", "volumeattributesclasses", true},
+}
+
+// TestLoadScopeDecidedInEveryGroup covers the shape check against the
+// stable API itself: every resource of every group sb decides loads
+// with the shape the Kubernetes API gives it, and the reversed shape
+// is rejected. The list the test runs on is independent of the scope
+// table — a resource the table misses, or maps to the wrong scope,
+// fails here.
 func TestLoadScopeDecidedInEveryGroup(t *testing.T) {
-	config := `version: 3
-k8s:
-  - context: dev
-    resources:
-      - group: apps
-        resource: deployments
-        namespace: default
-        verbs: [get, list]
-      - group: rbac.authorization.k8s.io
-        resource: clusterroles
-        scope: cluster
-        verbs: [get]
-      - group: batch
-        resource: jobs
-        namespace: other
-        verbs: [get]
-      - group: storage.k8s.io
-        resource: csistoragecapacities
-        namespace: kube-system
-        verbs: [get]
-`
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	writeFile(t, path, config)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+	for _, r := range stableResources {
+		t.Run(r.group+"/"+r.resource, func(t *testing.T) {
+			head := fmt.Sprintf("version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: %q\n        resource: %s\n", r.group, r.resource)
+			clusterShape := "        scope: cluster\n"
+			namespaceShape := "        namespace: default\n"
+			verbs := "        verbs: [get]\n"
+			correct := head + clusterShape
+			namespaced := head + namespaceShape
+			if !r.cluster {
+				correct, namespaced = namespaced, correct
+			}
+			// The shape the API gives the resource loads, and the
+			// rule comes out with that shape.
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			writeFile(t, path, correct+verbs)
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load() with the %s shape: %v", shapeWord(r.cluster), err)
+			}
+			rule := cfg.K8s[0].Resources[0]
+			if r.cluster {
+				if rule.Scope != "cluster" || rule.Namespace != "" {
+					t.Fatalf("rule = %+v, want scope: cluster", rule)
+				}
+			} else if rule.Namespace != "default" || rule.Scope != "" {
+				t.Fatalf("rule = %+v, want namespace: default", rule)
+			}
+			// The reversed shape is rejected: the rule's shape must
+			// match the scope the Kubernetes API gives the resource.
+			dir2 := t.TempDir()
+			path2 := filepath.Join(dir2, "config.yaml")
+			writeFile(t, path2, namespaced+verbs)
+			_, err = Load(path2)
+			if err == nil {
+				t.Fatalf("Load() with the reversed shape: %v; want a refusal", err)
+			}
+			if r.cluster {
+				if !strings.Contains(err.Error(), r.resource+" is cluster-scoped: give scope: cluster, not a namespace") {
+					t.Fatalf("Load() with the reversed shape: %v", err)
+				}
+			} else if !strings.Contains(err.Error(), r.resource+" is namespaced: give a namespace, not scope: cluster") {
+				t.Fatalf("Load() with the reversed shape: %v", err)
+			}
+		})
 	}
-	want := []ResourceRule{
-		{Group: "apps", Resource: "deployments", Namespace: "default", Verbs: []string{"get", "list"}},
-		{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Scope: "cluster", Verbs: []string{"get"}},
-		{Group: "batch", Resource: "jobs", Namespace: "other", Verbs: []string{"get"}},
-		{Group: "storage.k8s.io", Resource: "csistoragecapacities", Namespace: "kube-system", Verbs: []string{"get"}},
+}
+
+// shapeWord names the shape the correct rule takes: cluster-scoped or
+// namespaced.
+func shapeWord(cluster bool) string {
+	if cluster {
+		return "cluster-scoped"
 	}
-	if !reflect.DeepEqual(cfg.K8s[0].Resources, want) {
-		t.Fatalf("K8s[0].Resources = %+v, want %+v", cfg.K8s[0].Resources, want)
-	}
+	return "namespaced"
 }
 
 func TestLoadInvalid(t *testing.T) {

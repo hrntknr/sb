@@ -582,11 +582,11 @@ func (c *channelDataConn) Close() error {
 	return err
 }
 
-func (*channelDataConn) LocalAddr() net.Addr                { return channelAddr("local") }
+func (*channelDataConn) LocalAddr() net.Addr              { return channelAddr("local") }
 func (*channelDataConn) RemoteAddr() net.Addr             { return channelAddr("remote") }
-func (*channelDataConn) SetDeadline(time.Time) error       { return nil }
-func (*channelDataConn) SetReadDeadline(time.Time) error   { return nil }
-func (*channelDataConn) SetWriteDeadline(time.Time) error  { return nil }
+func (*channelDataConn) SetDeadline(time.Time) error      { return nil }
+func (*channelDataConn) SetReadDeadline(time.Time) error  { return nil }
+func (*channelDataConn) SetWriteDeadline(time.Time) error { return nil }
 
 // TestBeginStopCutsTheAuthenticatedSessions covers the stop's reach with
 // the real ssh structures: a downstream client authenticated against the
@@ -702,19 +702,27 @@ func TestBeginStopCutsTheAuthenticatedSessions(t *testing.T) {
 	go cryptossh.DiscardRequests(global)
 
 	// What the session relays reaches the upstream: a global request is
-	// recorded and answered, and a channel open is recorded and accepted.
-	// The replies coming back mean the recording happened before them.
+	// recorded and answered, a channel open is recorded and accepted, and
+	// an exec on the inner channel rides it. The replies coming back
+	// mean the recording happened before them.
 	if ok, _, err := inner.SendRequest("ping", true, nil); err != nil || !ok {
 		t.Fatalf("inner global request: %v, %v; want it relayed and answered", ok, err)
 	}
 	if got := record.globalRequests.Load(); got != 1 {
 		t.Fatalf("upstream global requests = %d, want 1", got)
 	}
-	if _, _, err := inner.OpenChannel("session", nil); err != nil {
+	channel, _, err := inner.OpenChannel("session", nil)
+	if err != nil {
 		t.Fatalf("inner channel open: %v; want it relayed", err)
 	}
 	if got := record.channelOpens.Load(); got != 1 {
 		t.Fatalf("upstream channel opens = %d, want 1", got)
+	}
+	if ok, err := channel.SendRequest("exec", true, cryptossh.Marshal(struct{ Command string }{"true"})); err != nil || !ok {
+		t.Fatalf("inner channel exec: %v, %v; want it relayed and answered", ok, err)
+	}
+	if got := record.execRequests.Load(); got != 1 {
+		t.Fatalf("upstream exec requests = %d, want 1", got)
 	}
 
 	// The stop begins. Everything the session started upstream is
@@ -733,18 +741,46 @@ func TestBeginStopCutsTheAuthenticatedSessions(t *testing.T) {
 	}
 
 	// New operations on the authenticated connection: a new global
-	// request, a new channel, a new exec on a new session. Fired on the
-	// transport after its death, they go nowhere — whatever still waits
-	// on the transport dies with it — and nothing of them is processed
-	// after the stop. What still waits for a reply never comes.
-	go func() {
-		inner.SendRequest("ping2", true, nil)
-		inner.OpenChannel("session2", nil)
-		if s, err := client.NewSession(); err == nil {
-			s.SendRequest("exec", true, cryptossh.Marshal(struct{ Command string }{"proxy-ssh test 127.0.0.1 " + upstreamPort}))
+	// request, a new channel, an exec on the existing inner channel,
+	// and a new exec on a new session. Fired on the transport after its
+	// death, they go nowhere — whatever still waits on the transport
+	// dies with it — and nothing of them is processed after the stop.
+	// What still waits for a reply never comes. Each is waited for its
+	// end: what returns is the failure the dead transport gives, not a
+	// hang.
+	after := func(name string, op func() error) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- op() }()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("%s after the stop: succeeded; want the transport's failure", name)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s after the stop: did not end", name)
 		}
-	}()
-	time.Sleep(100 * time.Millisecond)
+	}
+	after("global request", func() error {
+		_, _, err := inner.SendRequest("ping2", true, nil)
+		return err
+	})
+	after("channel open", func() error {
+		_, _, err := inner.OpenChannel("session2", nil)
+		return err
+	})
+	after("exec on the existing inner channel", func() error {
+		_, err := channel.SendRequest("exec", true, cryptossh.Marshal(struct{ Command string }{"true"}))
+		return err
+	})
+	after("exec on a new session", func() error {
+		s, err := client.NewSession()
+		if err != nil {
+			return err
+		}
+		_, err = s.SendRequest("exec", true, cryptossh.Marshal(struct{ Command string }{"proxy-ssh test 127.0.0.1 " + upstreamPort}))
+		return err
+	})
 
 	// A new connection after the stop: rejected outright — it cannot
 	// authenticate, so nothing of it reaches the upstream either.
@@ -759,11 +795,15 @@ func TestBeginStopCutsTheAuthenticatedSessions(t *testing.T) {
 	}
 
 	// Nothing of what the session and the new connection tried after
-	// the stop reached the upstream: the counters say what did.
+	// the stop reached the upstream: the counters say what did — the
+	// one exec that did arrive did so before it.
 	if got := record.globalRequests.Load(); got != 1 {
 		t.Fatalf("upstream global requests after the stop = %d, want 1 (nothing new reached it)", got)
 	}
 	if got := record.channelOpens.Load(); got != 1 {
 		t.Fatalf("upstream channel opens after the stop = %d, want 1 (nothing new reached it)", got)
+	}
+	if got := record.execRequests.Load(); got != 1 {
+		t.Fatalf("upstream exec requests after the stop = %d, want 1 (nothing new reached it)", got)
 	}
 }

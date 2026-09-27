@@ -1,9 +1,12 @@
 // Package session owns sb session records: one file per session under a
-// per-boot directory (XDG_RUNTIME_DIR), locked by the session owner for the
-// session's lifetime. The lock is the owner's claim on the session name: as
-// long as it is held, the session is alive and its containers are sb's to
-// stop and remove; a session whose lock can be taken is an orphan and is
-// reclaimed at the next sb startup.
+// persistent per-owner state directory (XDG_STATE_HOME), locked by the
+// session owner for the session's lifetime. The lock is the owner's claim
+// on the session name: as long as it is held, the session is alive and its
+// containers are sb's to stop and remove; a session whose lock can be taken
+// is an orphan and is reclaimed at the next sb startup. The records and
+// locks persist across host restarts: the runtime directory does not, so
+// what survives a restart to find the containers (stopped but not gone) has
+// to live where the restart cannot wipe it.
 package session
 
 import (
@@ -46,12 +49,14 @@ type Record struct {
 	CreationSettled bool `json:"creationSettled"`
 }
 
-// baseDir returns sb's per-boot base directory. With XDG_RUNTIME_DIR it is
-// <XDG_RUNTIME_DIR>/sb; without it a per-uid directory under the temp dir
-// (<tmp>/sb-<uid>/sb) keeps users apart. The temp root is shared — anyone
-// may leave anything under it — so every directory sb puts there is
-// verified: this user's, 0700, and a real directory; a symlink is its
-// owner's, not sb's, and is refused, not adopted.
+// baseDir returns sb's per-boot base directory: the runtime directory.
+// With XDG_RUNTIME_DIR it is <XDG_RUNTIME_DIR>/sb; without it a per-uid
+// directory under the temp dir (<tmp>/sb-<uid>/sb) keeps users apart. The
+// temp root is shared — anyone may leave anything under it — so every
+// directory sb puts there is verified: this user's, 0700, and a real
+// directory; a symlink is its owner's, not sb's, and is refused, not
+// adopted. This directory is wiped by a host restart; what must survive
+// one (the records, the locks) lives in the state directory instead.
 func baseDir() (string, error) {
 	var dir string
 	if runtime, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok && filepath.IsAbs(runtime) {
@@ -67,6 +72,29 @@ func baseDir() (string, error) {
 	}
 	if err := secureMkdir(dir); err != nil {
 		return "", err
+	}
+	return dir, nil
+}
+
+// stateBaseDir returns sb's persistent base directory: the state directory,
+// where the session records and locks live. With XDG_STATE_HOME it is
+// <XDG_STATE_HOME>/sb; without it $HOME/.local/state/sb. Unlike the runtime
+// directory it survives a host restart: a stopped container outlives the
+// sb that created it, and the record is what finds its containers again
+// after the restart.
+func stateBaseDir() (string, error) {
+	var dir string
+	if state, ok := os.LookupEnv("XDG_STATE_HOME"); ok && filepath.IsAbs(state) {
+		dir = filepath.Join(state, "sb")
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("state dir: %w", err)
+		}
+		dir = filepath.Join(home, ".local", "state", "sb")
+	}
+	if err := secureMkdir(dir); err != nil {
+		return "", fmt.Errorf("state dir %s: %w", dir, err)
 	}
 	return dir, nil
 }
@@ -111,9 +139,11 @@ func ownerOf(info os.FileInfo) (uint32, bool) {
 func uid() uint32 { return uint32(os.Getuid()) }
 
 // SessionsDir returns the directory holding the session records and locks,
-// creating it with 0700.
+// creating it with 0700. It lives in the persistent state directory: a host
+// restart wipes the runtime directory, but the records and locks outlive it
+// there, so the next startup still finds what a restart left behind.
 func SessionsDir() (string, error) {
-	dir, err := baseDir()
+	dir, err := stateBaseDir()
 	if err != nil {
 		return "", err
 	}
@@ -125,7 +155,9 @@ func SessionsDir() (string, error) {
 }
 
 // NewIssueDir creates the session's issue directory — where the session's
-// credentials are written — named after the session ID, with 0700.
+// credentials are written — named after the session ID, with 0700. It
+// lives in the runtime directory: the credentials are live-session
+// material, not something a restart or the next startup needs.
 func NewIssueDir(sessionID string) (string, error) {
 	dir, err := baseDir()
 	if err != nil {
@@ -357,7 +389,7 @@ func StopSession(dir, name string, lock *Lock, issuanceExited, creationSettled b
 	if err != nil {
 		return ReclaimError(Record{Name: name}, dir)
 	}
-	found, err := removeContainers(&rec)
+	found, err := settleAndRemove(dir, &rec)
 	if err != nil {
 		return ReclaimError(rec, dir)
 	}
@@ -380,18 +412,36 @@ func StopSession(dir, name string, lock *Lock, issuanceExited, creationSettled b
 	return nil
 }
 
-// removeContainers stops and removes the record's containers by session
-// label. Each runtime call is bounded by RuntimeWait: a runtime that does
-// not answer within it is killed, and the removal is a failed one. found
-// reports whether the listing saw any container of the session.
-func removeContainers(rec *Record) (found bool, err error) {
+// settleAndRemove removes the session's containers by label and settles
+// the creation with what the removal observes. The listing finds the
+// containers the creation committed — that observation is the evidence
+// the creation settled, and it is persisted before the destruction: a
+// failure after it (a removal that could not finish, an issue dir that
+// could not be deleted) keeps the evidence with the record, so the next
+// sweep does not hold it unsettled forever on an empty listing.
+func settleAndRemove(dir string, rec *Record) (found bool, err error) {
 	rt, err := containers.ParseName(rec.Runtime)
 	if err != nil {
 		return false, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), RuntimeWait)
 	defer cancel()
-	return containers.RemoveSession(ctx, rt, rec.ID)
+	ids, err := containers.ListSession(ctx, rt, rec.ID)
+	if err != nil {
+		return false, err
+	}
+	found = len(ids) > 0
+	if found && !rec.CreationSettled {
+		// The creation's committed containers are in hand: the
+		// creation cannot commit anything else (one create commits
+		// exactly one container). The evidence goes out before the
+		// destruction — persist it now.
+		rec.CreationSettled = true
+		if err := SaveRecord(dir, *rec); err != nil {
+			return found, err
+		}
+	}
+	return found, containers.RemoveListed(ctx, rt, rec.ID, ids)
 }
 
 // RuntimeWait bounds each runtime CLI call a session's stop or check
@@ -403,15 +453,53 @@ const RuntimeWait = 5 * time.Second
 // ReclaimError explains a session whose stop did not finish: what is left
 // behind, and what to run by hand before the name may be used again. The
 // record stays so the next sweep retries with it.
+//
+// What the record itself says decides the advice. A settled creation's
+// containers are all it committed: removing them by hand is safe, and the
+// record follows. A creation whose result is still unknown may still be
+// committing this session's container — an empty listing does not settle
+// it, and a record deleted on one would leave a late commit unclaimed — so
+// the next sweep retries with this record, and the by-hand reclaim runs
+// only after the creation request has ended.
 func ReclaimError(rec Record, dir string) error {
 	binary := rec.Runtime
 	var runtime containers.Runtime
 	if rt, err := containers.ParseName(rec.Runtime); err == nil {
 		runtime, binary = rt, rt.Binary()
 	}
-	list := fmt.Sprintf("%s ps -aq --filter label=%s=%s", binary, containers.LabelSession, rec.ID)
-	rm := "<the ids it lists>"
-	pick := ""
+	list, pick, rm := listingCommands(binary, runtime, rec)
+	header := fmt.Sprintf("session %q: creation's result still unknown after a failed stop\n"+
+		"(runtime %s, session id %s);\n"+
+		"the runtime may still be committing this session's container, so the\n"+
+		"next sweep retries with this record. To reclaim by hand, confirm the\n"+
+		"creation request has ended first — nothing is still creating this\n"+
+		"container — then run, with nothing left to commit:\n",
+		rec.Name, binary, rec.ID)
+	if rec.CreationSettled {
+		header = fmt.Sprintf("session %q: containers left behind by a failed removal\n"+
+			"(runtime %s, session id %s, container id %q);\n"+
+			"the creation's result is fixed: nothing is still being committed.\n"+
+			"reclaim them by hand, then start again:\n",
+			rec.Name, binary, rec.ID, rec.ContainerID)
+	}
+	return fmt.Errorf("%s"+
+		"  %s\n%s"+
+		"  %s rm -f %s\n"+
+		"  rm -rf %s\n"+
+		"  rm %s",
+		header,
+		list, pick,
+		binary, rm,
+		rec.IssueDir, RecordPath(dir, rec.Name))
+}
+
+// listingCommands builds the by-label listing the by-hand reclaim starts
+// from, and the id argument its removal takes: each runtime's own way of
+// naming what this session left behind. binary is the runtime's executable
+// (the apple CLI is "container", the rest run under their own names).
+func listingCommands(binary string, runtime containers.Runtime, rec Record) (list, pick, rm string) {
+	list = fmt.Sprintf("%s ps -aq --filter label=%s=%s", binary, containers.LabelSession, rec.ID)
+	rm = "<the ids it lists>"
 	if runtime == containers.Apple {
 		// The apple CLI lists everything as JSON: what this session
 		// left behind is picked out of it by hand — only the
@@ -421,15 +509,5 @@ func ReclaimError(rec Record, dir string) error {
 		pick = fmt.Sprintf("  # pick the ids whose labels carry %s=%s — only those\n", containers.LabelSession, rec.ID)
 		rm = "<the ids picked above>"
 	}
-	return fmt.Errorf("session %q: containers left behind by a failed removal\n"+
-		"(runtime %s, session id %s, container id %q);\n"+
-		"reclaim them by hand, then start again:\n"+
-		"  %s\n%s"+
-		"  %s rm -f %s\n"+
-		"  rm -rf %s\n"+
-		"  rm %s",
-		rec.Name, binary, rec.ID, rec.ContainerID,
-		list, pick,
-		binary, rm,
-		rec.IssueDir, RecordPath(dir, rec.Name))
+	return list, pick, rm
 }

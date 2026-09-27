@@ -232,20 +232,28 @@ func RemoveSession(ctx context.Context, r Runtime, sessionID string) (found bool
 	if err != nil {
 		return false, err
 	}
-	found = len(ids) > 0
+	return len(ids) > 0, RemoveListed(ctx, r, sessionID, ids)
+}
+
+// RemoveListed removes the listed containers and verifies the session's
+// listing comes back empty: what the listing that found them started
+// must be gone when it ends. It is the half of RemoveSession after the
+// listing: whoever observes the listing itself (a removal that settles
+// what it found) runs this with what it saw.
+func RemoveListed(ctx context.Context, r Runtime, sessionID string, ids []string) error {
 	for _, id := range ids {
 		if err := RemoveByID(ctx, r, id); err != nil {
-			return found, err
+			return err
 		}
 	}
 	left, err := ListSession(ctx, r, sessionID)
 	if err != nil {
-		return found, err
+		return err
 	}
 	if len(left) > 0 {
-		return found, fmt.Errorf("%s: remove left containers behind: %s", r, strings.Join(left, " "))
+		return fmt.Errorf("%s: remove left containers behind: %s", r, strings.Join(left, " "))
 	}
-	return found, nil
+	return nil
 }
 
 // RemoveByID stops and removes the container with the given ID. The output

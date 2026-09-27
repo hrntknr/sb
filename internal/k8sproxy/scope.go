@@ -3,11 +3,12 @@ package k8sproxy
 import "strings"
 
 // resourceScopes maps the resources sb decides the scope of — the
-// Kubernetes stable API's groups — to their scope as the Kubernetes
-// API defines it: true — the objects live at the cluster's root,
-// false — inside a namespace. A resource outside it is not decided at
-// all: the config load rejects it, so the policy never meets a rule
-// whose scope it cannot check against the resource's real one.
+// Kubernetes stable API at v1.36 (k8s.io/api v0.36.1 registers the
+// kinds) — to their scope as the Kubernetes API defines it: true —
+// the objects live at the cluster's root, false — inside a
+// namespace. A resource outside it is not decided at all: the config
+// load rejects it, so the policy never meets a rule whose scope it
+// cannot check against the resource's real one.
 var resourceScopes = map[string]map[string]bool{
 	"": { // the core API group
 		"bindings":               false,
@@ -42,8 +43,12 @@ var resourceScopes = map[string]map[string]bool{
 		"roles":               false,
 	},
 	"admissionregistration.k8s.io": {
-		"mutatingwebhookconfigurations":   true,
-		"validatingwebhookconfigurations": true,
+		"mutatingwebhookconfigurations":     true,
+		"mutatingadmissionpolicies":         true,
+		"mutatingadmissionpolicybindings":   true,
+		"validatingwebhookconfigurations":   true,
+		"validatingadmissionpolicies":       true,
+		"validatingadmissionpolicybindings": true,
 	},
 	"apiextensions.k8s.io": {
 		"customresourcedefinitions": true,
@@ -73,6 +78,10 @@ var resourceScopes = map[string]map[string]bool{
 	"coordination.k8s.io": {
 		"leases": false,
 	},
+	"flowcontrol.apiserver.k8s.io": {
+		"flowschemas":                 true,
+		"prioritylevelconfigurations": true,
+	},
 	"discovery.k8s.io": {
 		"endpointslices": false,
 	},
@@ -82,7 +91,9 @@ var resourceScopes = map[string]map[string]bool{
 	"networking.k8s.io": {
 		"ingressclasses":  true,
 		"ingresses":       false,
+		"ipaddresses":     true,
 		"networkpolicies": false,
+		"servicecidrs":    true,
 	},
 	"node.k8s.io": {
 		"runtimeclasses": true,
@@ -90,15 +101,22 @@ var resourceScopes = map[string]map[string]bool{
 	"policy": {
 		"poddisruptionbudgets": false,
 	},
+	"resource.k8s.io": {
+		"deviceclasses":          true,
+		"resourceclaims":         false,
+		"resourceclaimtemplates": false,
+		"resourceslices":         true,
+	},
 	"scheduling.k8s.io": {
 		"priorityclasses": true,
 	},
 	"storage.k8s.io": {
-		"csidrivers":           true,
-		"csinodes":             true,
-		"csistoragecapacities": false,
-		"storageclasses":       true,
-		"volumeattachments":    true,
+		"csidrivers":              true,
+		"csinodes":                true,
+		"csistoragecapacities":    false,
+		"storageclasses":          true,
+		"volumeattachments":       true,
+		"volumeattributesclasses": true,
 	},
 }
 

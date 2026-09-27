@@ -16,6 +16,9 @@ import (
 
 func testSessionsDir(t *testing.T) string {
 	t.Helper()
+	// The records live in the state dir, the issue dirs in the runtime
+	// dir: both isolated per test, away from this user's real ones.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	dir, err := SessionsDir()
 	if err != nil {
@@ -180,7 +183,7 @@ func TestAcquireRefusesUnreclaimedRecord(t *testing.T) {
 
 	// The record a failed removal left: containers under the session
 	// label, an issue dir, a runtime.
-	mustSaveRecord(t, dir, Record{Name: "orphan", ID: "sidOrphan", Runtime: "docker", IssueDir: t.TempDir(), ContainerID: "cidOrphan"})
+	mustSaveRecord(t, dir, Record{Name: "orphan", ID: "sidOrphan", Runtime: "docker", IssueDir: t.TempDir(), ContainerID: "cidOrphan", CreationSettled: true})
 	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
 
 	_, err := Acquire(dir, "orphan")
@@ -226,8 +229,20 @@ func TestStopSessionKeepsTheRecordOnFailedRemoval(t *testing.T) {
 	if err == nil {
 		t.Fatal("StopSession() succeeded without a runtime, want error")
 	}
-	if !strings.Contains(err.Error(), "reclaim them by hand") {
-		t.Fatalf("StopSession() error = %q, want the hand-reclaim steps", err.Error())
+	// The creation's result is not settled, and the removal could not
+	// observe it: the advice is the unsettled one — retry at the next
+	// sweep, not the by-hand reclaim on an empty listing.
+	for _, want := range []string{
+		"creation's result still unknown",
+		"next sweep retries with this record",
+		"creation request has ended",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("StopSession() error = %q, want it to contain %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "reclaim them by hand") {
+		t.Fatalf("StopSession() error = %q, want the unsettled advice, not the by-hand reclaim", err.Error())
 	}
 	// The record stays: the next sweep retries with it.
 	if _, err := LoadRecord(dir, "orphan"); err != nil {
@@ -475,47 +490,6 @@ func waitForExit(t *testing.T, cmd *exec.Cmd) {
 	}
 }
 
-// TestSessionsDirFallsBackPerUser covers the fallback: without a usable
-// XDG_RUNTIME_DIR, the sessions live under this user's own subtree of the
-// temp dir — never a shared path another user could write into. The test
-// runs in its own temp root: the real <tmp>/sb-<uid> (a running sb's
-// records, issuances, and lock paths) is outside it and survives the run
-// untouched.
-func TestSessionsDirFallsBackPerUser(t *testing.T) {
-	// The real temp dir is where a running sb's fallback lives; the test
-	// falls back inside its own root instead.
-	realTemp := os.TempDir()
-	root := t.TempDir()
-	t.Setenv("TMPDIR", root)
-	t.Setenv("XDG_RUNTIME_DIR", "") // set but empty: not a usable runtime dir
-	real := filepath.Join(realTemp, fmt.Sprintf("sb-%d", os.Getuid()))
-	before := dirSnapshot(real)
-	t.Cleanup(func() {
-		if after := dirSnapshot(real); !slices.Equal(after, before) {
-			t.Errorf("the real %s changed: %v -> %v", real, before, after)
-		}
-	})
-
-	dir, err := SessionsDir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := filepath.Join(root, fmt.Sprintf("sb-%d", os.Getuid()), "sb", "sessions"); dir != want {
-		t.Fatalf("SessionsDir() = %q, want %q", dir, want)
-	}
-	// What the run created is this user's and 0700.
-	info, err := os.Stat(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o700 {
-		t.Fatalf("sessions dir mode is %o, want 0700", info.Mode().Perm())
-	}
-	if owner, ok := ownerOf(info); !ok || owner != uid() {
-		t.Fatalf("sessions dir owner is %d (ok=%v), want uid %d", owner, ok, uid())
-	}
-}
-
 // dirSnapshot lists a directory's entry names, sorted; a nil result is a
 // directory that does not exist.
 func dirSnapshot(dir string) []string {
@@ -536,13 +510,42 @@ func dirSnapshot(dir string) []string {
 	return names
 }
 
-// TestSessionsDirRefusesAWiderDir covers the existing-dir condition: a
-// directory left too open (0755 — say another session umask'ed it) is
-// refused; sb does not write session records into it.
-func TestSessionsDirRefusesAWiderDir(t *testing.T) {
-	runtime := t.TempDir()
-	t.Setenv("XDG_RUNTIME_DIR", runtime)
-	sb := filepath.Join(runtime, "sb")
+// TestStateDirFallsBackHome covers the records' own fallback: without a
+// usable XDG_STATE_HOME, they live under this user's $HOME tree — the
+// state directory is what survives a restart, so it never sits in a
+// shared path. The test runs with its own $HOME: the real one (a
+// running sb's records) is outside it and survives untouched.
+func TestStateDirFallsBackHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", "") // set but empty: not a usable state dir
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, ".local", "state", "sb", "sessions"); dir != want {
+		t.Fatalf("SessionsDir() = %q, want %q", dir, want)
+	}
+	// What the run created is this user's and 0700.
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("sessions dir mode is %o, want 0700", info.Mode().Perm())
+	}
+	if owner, ok := ownerOf(info); !ok || owner != uid() {
+		t.Fatalf("sessions dir owner is %d (ok=%v), want uid %d", owner, ok, uid())
+	}
+}
+
+// TestStateDirRefusesAWiderDir covers the existing-dir condition for the
+// records: a state dir left too open (0755 — say another user umask'ed
+// it) is refused; sb does not write session records into it.
+func TestStateDirRefusesAWiderDir(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	sb := filepath.Join(state, "sb")
 	if err := os.MkdirAll(sb, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -554,10 +557,221 @@ func TestSessionsDirRefusesAWiderDir(t *testing.T) {
 	}
 }
 
-// TestSessionsDirRefusesAWrongParentMode covers the fallback's parent: a
+// TestStateDirRefusesAWrongOwner covers the state dir's own directory:
+// an <XDG_STATE_HOME>/sb that exists as another user's (uid 1 here) is
+// refused — what sb writes under it would sit in another user's tree,
+// where a rename could swap sb's own subtree under it.
+func TestStateDirRefusesAWrongOwner(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("changing the dir's owner needs root")
+	}
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	sb := filepath.Join(state, "sb")
+	if err := os.MkdirAll(sb, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(sb, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "not this user's (uid 1)") {
+		t.Fatalf("SessionsDir() with another user's state dir: %v; want a refusal", err)
+	}
+}
+
+// TestSweepReclaimsAfterARestart covers the restart: the runtime
+// directory does not survive it — a host restart wipes it — while the
+// state directory does. What the restart left behind is what the next
+// startup's sweep has to find it with: the record and the lock live in
+// the state dir, so the label is still looked for. Were the records in
+// the runtime dir instead, the restart would take them with it, and the
+// labeled container would sit in the runtime's own state with nothing
+// left to look for it.
+func TestSweepReclaimsAfterARestart(t *testing.T) {
+	fakeruntime.Install(t, t.TempDir())
+	// The state dir survives the restart; the runtime dir is per-boot.
+	stateHome := t.TempDir()
+	rtBoot1 := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("XDG_RUNTIME_DIR", rtBoot1)
+
+	// What boot 1's session left behind: a record and a lock in the
+	// state dir, an issue dir under its runtime dir, and a container
+	// in the runtime's own state.
+	dir, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	issueDir, err := NewIssueDir("sidOrphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(issueDir, "key"), []byte("credential"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustSaveRecord(t, dir, Record{Name: "orphan", ID: "sidOrphan", Runtime: "docker", IssueDir: issueDir})
+	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
+
+	// The restart: the runtime dir is wiped, the next boot gets a fresh
+	// one, and the sb that ran is gone — nothing holds the lock.
+	if err := os.RemoveAll(rtBoot1); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+	// The next startup: the same state dir (the records survived the
+	// restart there), a fresh runtime dir, and a sweep that reclaims
+	// what the restart left behind.
+	next, err := SessionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != dir {
+		t.Fatalf("sessions dir moved across the restart: %q -> %q", dir, next)
+	}
+	if err := Sweep(next); err != nil {
+		t.Fatalf("Sweep() after the restart: %v", err)
+	}
+	if _, err := LoadRecord(next, "orphan"); err == nil {
+		t.Fatal("record survived the restart's sweep")
+	}
+	if strings.Contains(stateText(t), "sidOrphan") {
+		t.Fatalf("container survived the restart's sweep: %q", stateText(t))
+	}
+	if _, err := os.Stat(issueDir); !os.IsNotExist(err) {
+		t.Fatalf("issue dir survived the restart's sweep: %v", err)
+	}
+}
+
+// TestSweepRetriesWithThePersistedSettlement covers what a failed removal
+// keeps past the record itself: the settlement its own listing observed.
+// The first sweep settles the creation with the container it found,
+// persists the settlement before the destruction, then fails past the
+// removal (the runtime answers without removing). The obstacle resolved
+// — the leftover removed by hand, the runtime answering again — the next
+// sweep finishes on an empty listing. Without the persisted settlement,
+// the record would be held as unsettled forever: the issue dir and the
+// name with it.
+func TestSweepRetriesWithThePersistedSettlement(t *testing.T) {
+	fakeruntime.Install(t, t.TempDir())
+	dir := testSessionsDir(t)
+
+	// An unsettled record: the creation may still be committing. A
+	// container in the runtime's state, an issue dir of its own.
+	issueDir, err := NewIssueDir("sidOrphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSaveRecord(t, dir, Record{Name: "orphan", ID: "sidOrphan", Runtime: "docker", IssueDir: issueDir})
+	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
+
+	// The first sweep: the runtime answers without removing. The
+	// listing before the removal finds the container — the creation's
+	// only committed one — so the settlement goes out first; the
+	// removal's own listing then fails: the containers stay behind.
+	t.Setenv("SB_FAKE_RM_LINGER", t.TempDir())
+	err = Sweep(dir)
+	if err == nil || !strings.Contains(err.Error(), "reclaim them by hand") {
+		t.Fatalf("Sweep() with a lingering runtime: %v; want the by-hand reclaim steps", err)
+	}
+	t.Setenv("SB_FAKE_RM_LINGER", "")
+	// The settlement is on disk with the record: the next sweep will not
+	// hold it as unsettled on an empty listing.
+	settled, err := LoadRecord(dir, "orphan")
+	if err != nil {
+		t.Fatalf("record dropped on a failed removal: %v", err)
+	}
+	if !settled.CreationSettled {
+		t.Fatal("settlement not persisted with the record")
+	}
+	if !strings.Contains(stateText(t), "cidOrphan sb.session.id=sidOrphan\n") {
+		t.Fatalf("container not left behind: %q", stateText(t))
+	}
+
+	// The obstacle resolved: the leftover removed by hand (the
+	// advice's own steps), the runtime answering again.
+	if err := os.WriteFile(os.Getenv("SB_FAKE_STATE"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The next sweep finishes on the empty listing: the record, the
+	// issue dir, and the name all go.
+	if err := Sweep(dir); err != nil {
+		t.Fatalf("Sweep() after the obstacle resolved: %v", err)
+	}
+	if _, err := LoadRecord(dir, "orphan"); err == nil {
+		t.Fatal("record survived the second sweep")
+	}
+	if strings.Contains(stateText(t), "sidOrphan") {
+		t.Fatalf("container survived the second sweep: %q", stateText(t))
+	}
+	if _, err := os.Stat(issueDir); !os.IsNotExist(err) {
+		t.Fatalf("issue dir survived the second sweep: %v", err)
+	}
+}
+
+// TestNewIssueDirFallsBackPerUser covers the issue dir's fallback: without
+// a usable XDG_RUNTIME_DIR, the issue dir lives under this user's own
+// subtree of the temp dir — never a shared path another user could write
+// into. The test runs in its own temp root: the real <tmp>/sb-<uid> (a
+// running sb's issuances) is outside it and survives the run untouched.
+func TestNewIssueDirFallsBackPerUser(t *testing.T) {
+	// The real temp dir is where a running sb's fallback lives; the test
+	// falls back inside its own root instead.
+	realTemp := os.TempDir()
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	t.Setenv("XDG_RUNTIME_DIR", "") // set but empty: not a usable runtime dir
+	real := filepath.Join(realTemp, fmt.Sprintf("sb-%d", os.Getuid()))
+	before := dirSnapshot(real)
+	t.Cleanup(func() {
+		if after := dirSnapshot(real); !slices.Equal(after, before) {
+			t.Errorf("the real %s changed: %v -> %v", real, before, after)
+		}
+	})
+
+	dir, err := NewIssueDir("sid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(root, fmt.Sprintf("sb-%d", os.Getuid()), "sb", "issues", "sid"); dir != want {
+		t.Fatalf("NewIssueDir() = %q, want %q", dir, want)
+	}
+	// What the run created is this user's and 0700.
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("issue dir mode is %o, want 0700", info.Mode().Perm())
+	}
+	if owner, ok := ownerOf(info); !ok || owner != uid() {
+		t.Fatalf("issue dir owner is %d (ok=%v), want uid %d", owner, ok, uid())
+	}
+}
+
+// TestNewIssueDirRefusesAWiderDir covers the existing-dir condition for
+// the issue dir: a runtime dir left too open (0755 — say another session
+// umask'ed it) is refused; sb does not write the credentials into it.
+func TestNewIssueDirRefusesAWiderDir(t *testing.T) {
+	runtime := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtime)
+	sb := filepath.Join(runtime, "sb")
+	if err := os.MkdirAll(sb, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sb, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewIssueDir("sid"); err == nil || !strings.Contains(err.Error(), "mode is 755, want 0700") {
+		t.Fatalf("NewIssueDir() with a 0755 dir: %v; want a refusal", err)
+	}
+}
+
+// TestNewIssueDirRefusesAWrongParentMode covers the fallback's parent: a
 // <tmp>/sb-<uid> left too open (0755 — say another user umask'ed it) is
 // refused — what sb writes under it would sit in a too-open tree.
-func TestSessionsDirRefusesAWrongParentMode(t *testing.T) {
+func TestNewIssueDirRefusesAWrongParentMode(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("TMPDIR", root)
 	t.Setenv("XDG_RUNTIME_DIR", "")
@@ -568,16 +782,16 @@ func TestSessionsDirRefusesAWrongParentMode(t *testing.T) {
 	if err := os.Chmod(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "mode is 755, want 0700") {
-		t.Fatalf("SessionsDir() with a 0755 parent: %v; want a refusal", err)
+	if _, err := NewIssueDir("sid"); err == nil || !strings.Contains(err.Error(), "mode is 755, want 0700") {
+		t.Fatalf("NewIssueDir() with a 0755 parent: %v; want a refusal", err)
 	}
 }
 
-// TestSessionsDirRefusesAWrongParentOwner covers the fallback's parent: a
+// TestNewIssueDirRefusesAWrongParentOwner covers the fallback's parent: a
 // <tmp>/sb-<uid> that exists as another user's (uid 1 here) is refused —
 // what sb writes under it would sit in another user's tree, where a rename
 // could swap sb's own subtree under it.
-func TestSessionsDirRefusesAWrongParentOwner(t *testing.T) {
+func TestNewIssueDirRefusesAWrongParentOwner(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("changing the parent's owner needs root")
 	}
@@ -591,17 +805,17 @@ func TestSessionsDirRefusesAWrongParentOwner(t *testing.T) {
 	if err := os.Chown(parent, 1, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "not this user's (uid 1)") {
-		t.Fatalf("SessionsDir() with another user's parent: %v; want a refusal", err)
+	if _, err := NewIssueDir("sid"); err == nil || !strings.Contains(err.Error(), "not this user's (uid 1)") {
+		t.Fatalf("NewIssueDir() with another user's parent: %v; want a refusal", err)
 	}
 }
 
-// TestSessionsDirRefusesASymlinkParent covers the fallback's parent: a
+// TestNewIssueDirRefusesASymlinkParent covers the fallback's parent: a
 // <tmp>/sb-<uid> symlink pointing at this user's own 0700 directory —
 // everything the verification asks for — is refused anyway: the path
 // itself must be the directory, not a link to one, whoever owns the
 // link can replace it afterwards.
-func TestSessionsDirRefusesASymlinkParent(t *testing.T) {
+func TestNewIssueDirRefusesASymlinkParent(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("TMPDIR", root)
 	t.Setenv("XDG_RUNTIME_DIR", "")
@@ -616,8 +830,8 @@ func TestSessionsDirRefusesASymlinkParent(t *testing.T) {
 	if err := os.Symlink(target, parent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SessionsDir(); err == nil || !strings.Contains(err.Error(), "not a directory") {
-		t.Fatalf("SessionsDir() with a symlinked parent: %v; want a refusal", err)
+	if _, err := NewIssueDir("sid"); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("NewIssueDir() with a symlinked parent: %v; want a refusal", err)
 	}
 }
 
@@ -654,9 +868,14 @@ func TestAcquireRefusesAnUnreadableRecord(t *testing.T) {
 // as JSON, docker and podman by label — and the advice names the
 // runtime's own binary without looking for it on PATH: whatever picks
 // the ids out of the listing by hand works without the CLI too.
+//
+// A settled creation's advice names the by-hand reclaim outright; an
+// unsettled one does not: the record is what the next sweep retries
+// with, and the by-hand reclaim runs only once the creation request
+// has ended — an empty listing does not settle it.
 func TestReclaimErrorAdvisesPerRuntime(t *testing.T) {
 	issue := "/issue"
-	appleErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "apple", IssueDir: issue}, "records")
+	appleErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "apple", IssueDir: issue, CreationSettled: true}, "records")
 	if !strings.Contains(appleErr.Error(), "container ls --all --format json") {
 		t.Fatalf("ReclaimError(apple) = %v; want the apple listing", appleErr)
 	}
@@ -676,8 +895,11 @@ func TestReclaimErrorAdvisesPerRuntime(t *testing.T) {
 	if strings.Contains(appleErr.Error(), "apple ps") {
 		t.Fatalf("ReclaimError(apple) = %v; advises the missing apple binary", appleErr)
 	}
+	if !strings.Contains(appleErr.Error(), "reclaim them by hand, then start again") {
+		t.Fatalf("ReclaimError(apple) = %v; want the by-hand reclaim named outright", appleErr)
+	}
 	// Docker and podman list by label: nothing to pick out of them.
-	dockerErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "docker", IssueDir: issue}, "records")
+	dockerErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "docker", IssueDir: issue, CreationSettled: true}, "records")
 	if !strings.Contains(dockerErr.Error(), "docker ps -aq --filter label=sb.session.id=sid") {
 		t.Fatalf("ReclaimError(docker) = %v; want the ps --filter listing", dockerErr)
 	}
@@ -686,5 +908,23 @@ func TestReclaimErrorAdvisesPerRuntime(t *testing.T) {
 	}
 	if !strings.Contains(dockerErr.Error(), "docker rm -f <the ids it lists>") {
 		t.Fatalf("ReclaimError(docker) = %v; want the listed ids' removal", dockerErr)
+	}
+
+	// An unsettled creation: the same steps appear, but only after the
+	// creation request has ended — an empty listing is not the
+	// creation's end, so the record is not deleted on one. The next
+	// sweep retries with it.
+	unsettledErr := ReclaimError(Record{Name: "dev", ID: "sid", Runtime: "docker", IssueDir: issue}, "records")
+	if !strings.Contains(unsettledErr.Error(), "creation's result still unknown") {
+		t.Fatalf("ReclaimError(unsettled) = %v; want the unsettled header", unsettledErr)
+	}
+	if !strings.Contains(unsettledErr.Error(), "next sweep retries with this record") {
+		t.Fatalf("ReclaimError(unsettled) = %v; want the next-sweep retry", unsettledErr)
+	}
+	if !strings.Contains(unsettledErr.Error(), "creation request has ended") {
+		t.Fatalf("ReclaimError(unsettled) = %v; want the creation-request confirmation", unsettledErr)
+	}
+	if strings.Contains(unsettledErr.Error(), "reclaim them by hand") {
+		t.Fatalf("ReclaimError(unsettled) = %v; wants the by-hand reclaim named outright", unsettledErr)
 	}
 }
