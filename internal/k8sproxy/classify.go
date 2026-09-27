@@ -44,7 +44,13 @@ func validAPIPath(decoded, raw string) bool {
 	if strings.Count(decoded, "/") != strings.Count(raw, "/") {
 		return false
 	}
-	seg := strings.Split(strings.Trim(decoded, "/"), "/")
+	// Only the one leading separator of the API path is stripped.
+	// Every segment after it is checked, so a doubled separator
+	// anywhere — an empty segment between them or at either end
+	// (/api//v1/.../pods//, the API server trims it away and classifies
+	// the trimmed form) — is not a variant of the path, and a trailing
+	// separator is one too.
+	seg := strings.Split(strings.TrimPrefix(decoded, "/"), "/")
 	for _, s := range seg {
 		if s == "" || s == "." || s == ".." {
 			return false

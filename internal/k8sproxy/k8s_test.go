@@ -637,8 +637,9 @@ func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
 // Regression: a path the API server's classification reads past the end
 // of the resource it names — a further segment after the subresource, an
 // escape that decodes to a separator, a version the core group does not
-// have — must not reach the upstream. With pods/log granted, all three
-// pass as pods/log get or pods list and are forwarded.
+// have, a doubled separator at the context or at the end — must not
+// reach the upstream. With pods/log granted, all of them pass as
+// pods/log get or pods list and are forwarded.
 func TestServeRejectsMalformedAPIPath(t *testing.T) {
 	hits := int32(0)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -679,6 +680,14 @@ func TestServeRejectsMalformedAPIPath(t *testing.T) {
 		// a version the core group does not have: it classifies as a
 		// pods list
 		"/dev/api/unknown/namespaces/default/pods",
+		// a doubled separator before the API path: an empty segment the
+		// classification would read as none
+		"/dev//api/v1/namespaces/default/pods",
+		// a doubled separator past the resource: an empty segment at
+		// the end
+		"/dev/api/v1/namespaces/default/pods//",
+		// a trailing separator: an empty final segment
+		"/dev/api/v1/namespaces/default/pods/",
 	} {
 		req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+path, nil)
 		if err != nil {
@@ -763,62 +772,87 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 // Regression: the resolved API server URL's base path is kept when
 // forwarding. A server under https://gateway.example/k8s receives
 // /k8s/api/..., not /api/...: without the base path the request would
-// go to another route on the gateway host, credentials included.
+// go to another route on the gateway host, credentials included. The
+// raw form the upstream sees is the joined escape — the base's escapes
+// included — so a base behind an escaped separator stays itself.
 func TestServeProxiesToUpstreamBasePath(t *testing.T) {
-	hits := make(chan string, 2)
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits <- r.URL.Path
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer upstream.Close()
+	// wantURI/wantLog: the raw forms the upstream server must see on
+	// the discovery path and the log path.
+	tests := []struct {
+		name    string
+		base    string // the base path of the server URL in the source kubeconfig
+		wantURI string
+		wantLog string
+	}{
+		{"no base", "", "/api", "/api/v1/namespaces/default/pods/nginx/log"},
+		{"plain base", "/k8s", "/k8s/api", "/k8s/api/v1/namespaces/default/pods/nginx/log"},
+		{"trailing slash", "/k8s/", "/k8s/api", "/k8s/api/v1/namespaces/default/pods/nginx/log"},
+		{"escaped separator", "/k8s%2F", "/k8s%2F/api", "/k8s%2F/api/v1/namespaces/default/pods/nginx/log"},
+		{"escaped separator and suffix", "/k8s%2Ftenant", "/k8s%2Ftenant/api", "/k8s%2Ftenant/api/v1/namespaces/default/pods/nginx/log"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The raw forms the upstream saw: the request URI as it went
+			// over the wire, and the server's own escape of it. The
+			// pair must be the joined escape, not a re-escape of a
+			// differently joined path.
+			type saw struct{ requestURI, escapedPath string }
+			seen := make(chan saw, 2)
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seen <- saw{r.RequestURI, r.URL.EscapedPath()}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
 
-	sourcePath := filepath.Join(t.TempDir(), "config")
-	t.Setenv("KUBECONFIG", sourcePath)
-	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL+"/k8s")
+			sourcePath := filepath.Join(t.TempDir(), "config")
+			t.Setenv("KUBECONFIG", sourcePath)
+			writeUsableSourceKubeconfig(t, sourcePath, upstream.URL+tt.base)
 
-	proxy := New(Targets{testTarget("dev",
-		testResource("pods", "default", "get", "list", "watch"),
-		testResource("pods/log", "default", "get"),
-	)}, "localhost")
-	if err := proxy.resolveConnections(); err != nil {
-		t.Fatal(err)
-	}
-	proxy.tokens = map[string]string{"downstream-token": "dev"}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() error = %v", err)
-	}
-	defer listener.Close()
-	go func() {
-		_ = proxy.Serve(listener)
-	}()
+			proxy := New(Targets{testTarget("dev",
+				testResource("pods", "default", "get", "list", "watch"),
+				testResource("pods/log", "default", "get"),
+			)}, "localhost")
+			if err := proxy.resolveConnections(); err != nil {
+				t.Fatal(err)
+			}
+			proxy.tokens = map[string]string{"downstream-token": "dev"}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("Listen() error = %v", err)
+			}
+			defer listener.Close()
+			go func() {
+				_ = proxy.Serve(listener)
+			}()
 
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	for _, path := range []string{
-		// discovery under the base path
-		"/dev/api",
-		// a resource path under it
-		"/dev/api/v1/namespaces/default/pods/nginx/log",
-	} {
-		req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+path, nil)
-		if err != nil {
-			t.Fatalf("NewRequest() error = %v", err)
-		}
-		req.Header.Set("Authorization", "Bearer downstream-token")
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("Do() error = %v", err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("%s: status = %d, want %d", path, resp.StatusCode, http.StatusNoContent)
-		}
-	}
-	if got := <-hits; got != "/k8s/api" {
-		t.Fatalf("discovery path = %q, want /k8s/api", got)
-	}
-	if got := <-hits; got != "/k8s/api/v1/namespaces/default/pods/nginx/log" {
-		t.Fatalf("resource path = %q, want /k8s/api/v1/namespaces/default/pods/nginx/log", got)
+			client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+			for _, path := range []string{
+				// discovery under the base path
+				"/dev/api",
+				// a resource path under it
+				"/dev/api/v1/namespaces/default/pods/nginx/log",
+			} {
+				req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+path, nil)
+				if err != nil {
+					t.Fatalf("NewRequest() error = %v", err)
+				}
+				req.Header.Set("Authorization", "Bearer downstream-token")
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("Do() error = %v", err)
+				}
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusNoContent {
+					t.Fatalf("%s: status = %d, want %d", path, resp.StatusCode, http.StatusNoContent)
+				}
+			}
+			if got := <-seen; got.requestURI != tt.wantURI || got.escapedPath != tt.wantURI {
+				t.Fatalf("discovery path: requestURI = %q, escapedPath = %q, want %q", got.requestURI, got.escapedPath, tt.wantURI)
+			}
+			if got := <-seen; got.requestURI != tt.wantLog || got.escapedPath != tt.wantLog {
+				t.Fatalf("log path: requestURI = %q, escapedPath = %q, want %q", got.requestURI, got.escapedPath, tt.wantLog)
+			}
+		})
 	}
 }
 
@@ -1257,13 +1291,16 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	}
 
 	// The next session resolves the auth settings anew: a fresh proxy
-	// resolves the rewritten source through its initial issuance.
+	// whose initial issuance resolves the rewritten source, and a
+	// request made with what it issued — the generated kubeconfig's URL
+	// and token — no internal state set by hand.
+	issueDir := t.TempDir()
 	proxy2 := New(testPolicy("dev"), "localhost")
-	if err := proxy2.resolveConnections(); err != nil {
-		t.Fatal(err)
-	}
-	proxy2.tokens = map[string]string{"downstream-token": "dev"}
-	listener2, err := net.Listen("tcp", "127.0.0.1:0")
+	cancel2 := runSyncConfig(t, proxy2, issueDir)
+	defer cancel2()
+	// The issued kubeconfig's server URL names this port; the proxy
+	// serves there for the request to reach.
+	listener2, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", testProxyPort))
 	if err != nil {
 		t.Fatalf("Listen() error = %v", err)
 	}
@@ -1271,7 +1308,24 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	go func() {
 		_ = proxy2.Serve(listener2)
 	}()
-	requestKubeAPI(t, client, listener2.Addr().String(), "dev", "downstream-token")
+
+	// The request made with what the session issued.
+	kubeconfig2 := filepath.Join(issueDir, ".kube", "config")
+	server := issuedServerURL(t, kubeconfig2)
+	token2 := contextToken(t, kubeconfig2, "dev")
+	req, err := http.NewRequest(http.MethodGet, server+"/api", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token2)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
 	if got := <-seen; got != "Bearer "+newToken {
 		t.Fatalf("third upstream Authorization = %q, want new token", got)
 	}
@@ -1478,6 +1532,32 @@ func contextToken(t *testing.T, path, context string) string {
 			return user.User.Token
 		}
 	}
+	return ""
+}
+
+// issuedServerURL reads the server URL the generated kubeconfig at
+// path gives its current context.
+func issuedServerURL(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	var rendered kubeconfigFile
+	if err := yaml.Unmarshal(content, &rendered); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	for _, context := range rendered.Contexts {
+		if context.Name != rendered.CurrentContext {
+			continue
+		}
+		for _, cluster := range rendered.Clusters {
+			if cluster.Name == context.Context.Cluster {
+				return cluster.Cluster.Server
+			}
+		}
+	}
+	t.Fatalf("no server URL for the current context %q", rendered.CurrentContext)
 	return ""
 }
 

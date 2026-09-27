@@ -143,7 +143,9 @@ Rules:
 
 ## k8s: the issued kubeconfig is read-only
 
-The kubeconfig sb issues is read-only by design: `kubectl config use-context` cannot write to it (and a written context would change what the grants were issued for). Pass `--context` or `-n` per command instead, or copy the kubeconfig somewhere writable and edit the copy — the `context` key stays the switch. Changes to the source kubeconfig or the copy apply at the next session, not while sb runs.
+The kubeconfig sb issues is read-only by design: `kubectl config use-context` cannot write to it (and a written context would change what the grants were issued for). Pass `--context` or `-n` per command instead, or copy the kubeconfig somewhere writable and edit the copy — the `context` key stays the switch.
+
+What changes when differs per side: the host-side source's connection and auth settings are fixed for the session, so a change there lands at the next session, while the working copy's own client-side selections — the context it points at, the default namespace — apply with the next request that uses the copy, within the issued contexts and the fixed policy.
 
 ## AWS: rename `mode: r` to `mode: ro`
 

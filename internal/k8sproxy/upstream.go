@@ -65,15 +65,22 @@ func resolveUpstream(raw *api.Config, loadingRules *clientcmd.ClientConfigLoadin
 	return &upstream{transport: transport, target: target}, nil
 }
 
-// joinBasePath joins the server URL's base path onto the API path: the
-// upstream request goes to the fixed server, its path prefix included
-// (a server under https://gateway.example/k8s gets /k8s/api/v1/...),
-// and an empty base leaves the API path alone.
-func joinBasePath(base, api string) string {
-	if base == "" {
-		return api
+// joinBasePath joins the fixed server's base path onto the API path as
+// one consistent pair: the boundary is decided on the escaped side —
+// the base keeps the escapes of the server URL the source kubeconfig
+// names, the API path the ones the downstream client used — and the
+// decoded form is what the joined escape decodes to. What goes
+// upstream is that joined escape, never a re-escape of a differently
+// joined path (a base behind an escaped separator, /k8s%2F, stays
+// /k8s%2F/api/..., not /api/...). A base without a path leaves the
+// API path alone.
+func joinBasePath(base *url.URL, apiRaw string) (decoded, raw string, err error) {
+	raw = strings.TrimSuffix(base.EscapedPath(), "/") + apiRaw
+	decoded, err = url.PathUnescape(raw)
+	if err != nil {
+		return "", "", err
 	}
-	return strings.TrimSuffix(base, "/") + api
+	return decoded, raw, nil
 }
 
 // upstreamRequestPath splits the context prefix off the downstream URL
