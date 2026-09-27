@@ -180,6 +180,52 @@ func TestTargetsAllNamespacesAndClusterScope(t *testing.T) {
 	}
 }
 
+// TestTargetsScopeBeyondTheCoreGroup covers the scope decision past the
+// core group: apps and rbac rules are decided the same way — the rule's
+// shape must match the scope the Kubernetes API gives the resource — and
+// a resource sb does not decide is not granted at all.
+func TestTargetsScopeBeyondTheCoreGroup(t *testing.T) {
+	targets := Targets{
+		testTarget("dev",
+			Resource{Group: "apps", Resource: "deployments", Namespace: "default", Verbs: []string{"get", "list"}},
+			Resource{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Scope: "cluster", Verbs: []string{"get", "list"}},
+		),
+		testTarget("star",
+			Resource{Group: "apps", Resource: "deployments", Namespace: "*", Verbs: []string{"list"}},
+		),
+		testTarget("undecided",
+			Resource{Group: "example.com", Resource: "widgets", Namespace: "default", Verbs: []string{"get"}},
+		),
+	}
+
+	tests := []struct {
+		name, context, method, path string
+		want                        bool
+	}{
+		// apps deployments (namespaced): a single namespace does not
+		// cover the all-namespaces listing — an explicit "*" does.
+		{"dev all-namespaces listing", "dev", http.MethodGet, "/apis/apps/v1/deployments", false},
+		{"star all-namespaces listing", "star", http.MethodGet, "/apis/apps/v1/deployments", true},
+		{"dev named in the rule's namespace", "dev", http.MethodGet, "/apis/apps/v1/namespaces/default/deployments/web", true},
+		{"dev named in another namespace", "dev", http.MethodGet, "/apis/apps/v1/namespaces/other/deployments/web", false},
+		// rbac clusterroles (cluster-scoped): a cluster rule covers the
+		// collection and the named get alike.
+		{"dev clusterroles collection", "dev", http.MethodGet, "/apis/rbac.authorization.k8s.io/v1/clusterroles", true},
+		{"dev one named clusterrole", "dev", http.MethodGet, "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin", true},
+		// What sb does not decide the scope of is not granted at all:
+		// the rule could not be checked against the resource's real scope.
+		{"undecided resource", "undecided", http.MethodGet, "/apis/example.com/v1/widgets", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowsClassified(t, targets, tt.context, tt.method, tt.path, ""); got != tt.want {
+				t.Fatalf("Allows(%s %s) = %v, want %v", tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestTargetsIsolateSameClusterDifferentContexts covers the context
 // partition: two contexts pointing at the same cluster stay isolated, the
 // rules of one context never apply to another, and matching a context name

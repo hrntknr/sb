@@ -125,7 +125,16 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 		lock.Release()
 		return err
 	}
-	rec := session.Record{Name: name, ID: sessionID, Runtime: rt.String(), IssueDir: issueDir}
+	// The session's record persists what the next sweep needs: the
+	// runtime and session ID to find the containers by label, the issue
+	// dir to reissue, and the creation's state — the creation not
+	// settled, the runtime may still commit the container — so a
+	// sweep that finds it orphaned may not settle it on an empty
+	// listing.
+	rec := session.Record{
+		Name: name, ID: sessionID, Runtime: rt.String(), IssueDir: issueDir,
+		CreationSettled: false,
+	}
 	if err := session.SaveRecord(sessionsDir, rec); err != nil {
 		os.RemoveAll(issueDir)
 		lock.Release()
@@ -139,18 +148,29 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	//       the CLIs are doing meanwhile;
 	//   (2) the session stops: its containers are removed by label, its
 	//       issue dir and record dropped — what could not be removed,
-	//       and what is still being created (its result unknown), keeps
+	//       or what is still being created (its result unknown), keeps
 	//       the record for the next sweep;
 	//   (3) the CLIs are killed and reaped within WaitDelay.
 	//
 	// Nothing in the flow waits for a CLI's own exit.
 	var (
-		proxy           *proxyServer
-		create          *exec.Cmd
-		start           *exec.Cmd
-		createDone      <-chan struct{}
-		startDone       <-chan struct{}
-		creationSettled bool
+		proxy      *proxyServer
+		create     *exec.Cmd
+		start      *exec.Cmd
+		createDone <-chan struct{}
+		startDone  <-chan struct{}
+		// creationUnknown tracks whether the container creation's
+		// result is still unknown — the runtime may still commit the
+		// container. It is set when the create CLI starts: the runtime
+		// daemon may commit even after a non-zero exit (a connection
+		// dropped after the daemon committed leaves the CLI's own
+		// result unknown), and it is not cleared before the CLI
+		// settles: the container exists as the session's ContainerID,
+		// or nothing more will be committed for it. A stop before the
+		// CLI starts keeps the result known — nothing was asked of
+		// the runtime, nothing will be created — and may drop the
+		// session's record and issue dir outright.
+		creationUnknown bool
 	)
 	defer func() {
 		var errs []error
@@ -168,10 +188,10 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 			issuanceExited = proxy.Stop(shutdownCtx())
 		}
 		// (2) Container reclaim: the session's containers are removed
-		// by label, its issue dir and record dropped. What could not be
-		// removed — or what is still being created, its result unknown —
-		// keeps the record for the next sweep.
-		if err := session.StopSession(sessionsDir, name, lock, issuanceExited, creationSettled); err != nil {
+		// by label, its issue dir and record dropped. What could not
+		// be removed — or what is still being created, its result
+		// unknown — keeps the record for the next sweep.
+		if err := session.StopSession(sessionsDir, name, lock, issuanceExited, !creationUnknown); err != nil {
 			errs = append(errs, err)
 		}
 		// (3) CLI collection: what is left of them is killed, and the
@@ -195,7 +215,10 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	runCtx := cmd.Context()
 	runCtx, stop := signal.NotifyContext(runCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	proxy, err = startProxy(runCtx, cfg, opts, host, issueDir)
+	// The run's own proxies listen on every interface: the container
+	// reaches the host across a network boundary, so a loopback-only
+	// listen would keep them out of the container's reach.
+	proxy, err = startProxy(runCtx, cfg, runListenAddr, runListenAddr, runListenAddr, host, issueDir)
 	if err != nil {
 		return err
 	}
@@ -223,6 +246,10 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	if err := create.Start(); err != nil {
 		return err
 	}
+	// The creation is in flight: the CLI is running, the runtime
+	// daemon may commit the container. From here the stop flow may
+	// not drop the session's record on what it cannot confirm.
+	creationUnknown = true
 	createDone2 := make(chan struct{})
 	createDone = createDone2
 	createErr := make(chan error, 1)
@@ -249,10 +276,12 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 		return retErr
 	case err := <-createErr:
 		if err != nil && runCtx.Err() == nil {
-			// The creation failed on its own: the container never
-			// existed. Its result is settled — the reclaim has
-			// nothing to wait for.
-			creationSettled = true
+			// The creation failed on its own: the CLI's own
+			// complaint. What the runtime daemon did with it is
+			// unknown — a connection dropped after the daemon
+			// committed leaves the CLI's exit non-zero and the
+			// container created — so its result stays unknown,
+			// and the stop flow keeps the record.
 			retErr = fmt.Errorf("create: %w", err)
 			return retErr
 		}
@@ -272,7 +301,10 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 			retErr = errors.New("runtime exited without recording the container ID")
 			return retErr
 		}
-		creationSettled = true
+		creationUnknown = false
+		// The settled result persists with the ID: a sweep that finds
+		// this record may reclaim it, but not before.
+		rec.CreationSettled = true
 		if err := session.SaveRecord(sessionsDir, rec); err != nil {
 			retErr = fmt.Errorf("session record: %w", err)
 			return retErr

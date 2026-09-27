@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,10 +45,12 @@ func writeRunConfig(t *testing.T) string {
 	return path
 }
 
-// testOptions builds the run options against the test config.
+// testOptions builds the run options against the test config. The run
+// flow derives its own listen addresses — none of sb proxy's flag
+// defaults flow into it — so the options carry nothing of the proxies.
 func testOptions(t *testing.T) options {
 	t.Helper()
-	return options{configPath: writeRunConfig(t), sshListen: ":0", k8sListen: ":0", awsListen: ":0"}
+	return options{configPath: writeRunConfig(t)}
 }
 
 // sessionsDir is this test's session directory.
@@ -258,6 +262,82 @@ func waitForContainerID(t *testing.T, name string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("session %q: container ID never recorded", name)
+}
+
+// waitForCreateCall polls until the runtime CLI was called to create the
+// container: the creation started, its result not yet settled. That is the
+// sync point between the run and what observes it — a stop or a sweep
+// that lands here may not settle what the runtime has not committed.
+func waitForCreateCall(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(os.Getenv("SB_TEST_CALLS_LOG")); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "create ") {
+					return
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the create CLI was never called")
+}
+
+// runRootCommand runs sb through the real root command: the production
+// wiring — flag parsing, the defaults, the run flow — not a test-local
+// substitute. What it returns is the run's own result.
+func runRootCommand(args ...string) error {
+	cmd := newRootCommand()
+	cmd.SetArgs(args)
+	return cmd.Execute()
+}
+
+// primaryIP returns the host's source address for outbound traffic: the
+// address a connection from beyond the host's loopback arrives at — the
+// same route a bridge container's connection takes to the host. It sends
+// no packets (a UDP connect consults the routing table only), and reports
+// an error when there is no route to take.
+func primaryIP() (string, error) {
+	conn, err := net.Dial("udp", "1.1.1.1:80")
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	ip := conn.LocalAddr().(*net.UDPAddr).IP
+	if ip == nil || ip.IsLoopback() {
+		return "", fmt.Errorf("the outbound address %v is not beyond loopback", ip)
+	}
+	return ip.String(), nil
+}
+
+// sshConfigTarget parses the generated ssh config: the host the
+// credentials point the container at, and the port the proxy listens on.
+// Each is the first of its key in the file (the proxy's own block).
+func sshConfigTarget(t *testing.T, path string) (host, port string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[0] {
+		case "HostName":
+			host = fields[1]
+		case "Port":
+			if port == "" {
+				port = fields[1]
+			}
+		}
+	}
+	if host == "" || port == "" {
+		t.Fatalf("generated ssh config: no target under %s", path)
+	}
+	return host, port
 }
 
 // TestRunContainerStopsWhenOnlySbGetsTheSignal covers the blocker: SIGTERM
@@ -601,5 +681,208 @@ func TestRunSweepFailureShowsOnStderr(t *testing.T) {
 	// The orphan's record stays: the next sweep retries with it.
 	if _, err := session.LoadRecord(sessions, "orphan"); err != nil {
 		t.Fatalf("orphan's record did not stay: %v", err)
+	}
+}
+
+// TestSweepKeepsAnUnsettledCreationUntilItsEnd covers the ordering that
+// loses containers: a sweep that lands between the creation's start and
+// the runtime's commit. The record's persisted state — the creation not
+// settled — is what the sweep reads: an empty listing is not the
+// creation's end, so the record stays, and the container the runtime
+// commits after it is the next sweep's to reclaim.
+func TestSweepKeepsAnUnsettledCreationUntilItsEnd(t *testing.T) {
+	setupRunTest(t)
+	dir := sessionsDir(t)
+
+	// The creation is in flight: the CLI does not answer while this
+	// exists, and the runtime commits nothing for the session until it.
+	slow := filepath.Join(t.TempDir(), "slow")
+	if err := os.WriteFile(slow, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_CREATE_SLOW", slow)
+
+	done := make(chan error, 1)
+	go func() {
+		cmd := &cobra.Command{}
+		cmd.SetContext(context.Background())
+		done <- runContainer(cmd, testOptions(t), "default", "", false, nil)
+	}()
+	// The sync point: the creation started — its result is in flight.
+	// The stop that follows lands on a creation the runtime may still
+	// commit, so the record stays for the next sweep.
+	waitForCreateCall(t)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("run: want the record kept for the next sweep")
+	}
+
+	// A sweep before the creation completes: the listing is empty (the
+	// runtime has not committed), and the record's own state — not the
+	// listing — decides. The record stays, and with it the issue dir:
+	// what the creation commits after the sweep is the next sweep's to
+	// reclaim, and the issue dir is what a retry needs.
+	if err := session.Sweep(dir); err == nil {
+		t.Fatal("sweep: want the record kept for the next sweep")
+	}
+	if _, err := os.Stat(session.RecordPath(dir, "default")); os.IsNotExist(err) {
+		t.Fatal("record dropped on an empty listing while the creation was in flight")
+	}
+	rec, err := session.LoadRecord(dir, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(rec.IssueDir); os.IsNotExist(err) {
+		t.Fatal("issue dir dropped while the creation was in flight")
+	}
+
+	// The creation completes after the sweep: the runtime commits the
+	// container. Nothing of sb's is left to settle it — the record is
+	// what the next sweep needs.
+	addStateLine(t, "cidLate sb.session.id="+rec.ID+"\n")
+
+	// The next sweep reclaims it: the listing finds the container, the
+	// removal confirms the creation's end, and the record goes.
+	if err := session.Sweep(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
+		t.Fatal("record survived the sweep")
+	}
+	if state := stateText(t); strings.Contains(state, "cidLate") {
+		t.Fatalf("container survived the sweep: %q", state)
+	}
+}
+
+// TestRunProxyStartFailureDropsTheSession covers the start failure before
+// the creation: a proxy component that cannot start returns before the
+// create CLI is ever asked of the runtime. Nothing was asked of the
+// runtime, nothing will be created — the stop flow may drop the session's
+// record and issue dir on the empty listing, and the run's error carries
+// only what failed: no unstarted creation's recovery advice.
+func TestRunProxyStartFailureDropsTheSession(t *testing.T) {
+	setupRunTest(t)
+	dir := sessionsDir(t)
+
+	// The run's config: a k8s rule (a proxy is started for it) whose
+	// upstream source is corrupt — the issuance fails at startup.
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, list]\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(kubeconfig, []byte("not: a: kubeconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", kubeconfig)
+
+	done := make(chan error, 1)
+	go func() {
+		cmd := &cobra.Command{}
+		cmd.SetContext(context.Background())
+		done <- runContainer(cmd, options{configPath: cfgPath}, "default", "", false, nil)
+	}()
+	err := <-done
+	if err == nil {
+		t.Fatal("run: want the proxy start failure")
+	}
+	// The run's error carries what failed — only that: no creation was
+	// started, so no creation's recovery advice may be in it.
+	if strings.Contains(err.Error(), "reclaim them by hand") {
+		t.Fatalf("run %v: the container was never asked of the runtime; want no recovery advice", err)
+	}
+	// The session's record and issue dir are gone: nothing was asked
+	// of the runtime, nothing will be created for the session.
+	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
+		t.Fatal("record survived a start failure before the creation")
+	}
+	issues := filepath.Join(filepath.Dir(dir), "issues")
+	entries, err := os.ReadDir(issues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("issue dirs survived a start failure: %v", entries)
+	}
+}
+
+// TestRunProxiesReachBeyondLoopbackThroughTheRootCommand covers the run's
+// own wiring, through the root command: the run's defaults — not sb
+// proxy's — select the listen addresses, and the generated credentials
+// point the container at what reaches them. The listener binds every
+// interface, and the connection from beyond the host's loopback — the
+// same route a bridge container's connection takes onto the host —
+// reaches the proxy. A loopback-only listener (sb proxy's safe default
+// flowing into the run) would not: the connection would be refused.
+func TestRunProxiesReachBeyondLoopbackThroughTheRootCommand(t *testing.T) {
+	setupRunTest(t)
+	dir := sessionsDir(t)
+
+	// The run's config: an ssh rule (the ssh proxy is started, the
+	// generated ssh config points the container at it) and the container
+	// section the run needs.
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := "version: 3\nssh:\n  - host: github.com\n    access: full\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The run through the root command: the real wiring — flag parsing,
+	// the run's own defaults — not a test-local substitute.
+	lifetime := os.Getenv("SB_FAKE_START_LIFETIME")
+	done := make(chan error, 1)
+	go func() {
+		done <- runRootCommand("run", "--config", cfgPath, "--name", "default", "--", "zsh", "-l")
+	}()
+	// The creation started: the proxies are up, the credentials issued.
+	waitForCreateCall(t)
+
+	rec, err := session.LoadRecord(dir, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := sshConfigTarget(t, filepath.Join(rec.IssueDir, ".ssh", "config"))
+
+	// The generated ssh config points the container at the host the
+	// runtime's network mode reaches: the fake docker on a bridge —
+	// rootful, as the fake's info answers — advertises host.docker.internal.
+	if host != "host.docker.internal" {
+		t.Fatalf("generated ssh config: HostName %q, want host.docker.internal", host)
+	}
+
+	// The listener binds every interface: the connection from beyond the
+	// host's loopback — the host's own outbound address, the same route
+	// a bridge container's connection takes onto the host — reaches the
+	// proxy. A loopback-only listener would refuse it.
+	ip, err := primaryIP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", net.JoinHostPort(ip, port), time.Second)
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial %s:%s via %q: %v (a loopback-only listener refuses it)", ip, port, ip, dialErr)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// End the run: the container's start ends, and the run's own stop
+	// flow reclaims its session.
+	if err := os.Remove(lifetime); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
+		t.Fatalf("record survived the stop: %v", err)
 	}
 }

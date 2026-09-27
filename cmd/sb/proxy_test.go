@@ -65,7 +65,7 @@ func proxyTestConfig() v3.Config {
 // startProxyBounded runs startProxy with a return bound: a start that does
 // not return — a ready that never comes, an issuance that never begins —
 // is a hung start, and the bound reports it instead of waiting forever.
-func startProxyBounded(t *testing.T, ctx context.Context, cfg v3.Config, opts options, host, dir string) (*proxyServer, error) {
+func startProxyBounded(t *testing.T, ctx context.Context, cfg v3.Config, sshAddr, k8sAddr, awsAddr, host, dir string) (*proxyServer, error) {
 	t.Helper()
 	type startResult struct {
 		server *proxyServer
@@ -73,7 +73,7 @@ func startProxyBounded(t *testing.T, ctx context.Context, cfg v3.Config, opts op
 	}
 	done := make(chan startResult, 1)
 	go func() {
-		server, err := startProxy(ctx, cfg, opts, host, dir)
+		server, err := startProxy(ctx, cfg, sshAddr, k8sAddr, awsAddr, host, dir)
 		done <- startResult{server, err}
 	}()
 	select {
@@ -108,7 +108,7 @@ func TestStartProxyFailureStopsTheOtherSide(t *testing.T) {
 		RoleARN:  "arn:aws:iam::123456789012:role/dev",
 		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
 	}}
-	_, err := startProxy(ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxy(ctx, cfg, ":0", ":0", ":0", "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a corrupt upstream kubeconfig; want a failure")
 	}
@@ -147,7 +147,7 @@ func TestStartProxyCancelledDuringStartup(t *testing.T) {
 		RoleARN:  "arn:aws:iam::123456789012:role/dev",
 		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
 	}}
-	_, err := startProxy(ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxy(ctx, cfg, ":0", ":0", ":0", "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a cancelled run; want a failure")
 	}
@@ -182,7 +182,7 @@ func TestStartProxyStartsOnlyConfiguredProtocols(t *testing.T) {
 	issueDir := t.TempDir()
 	// Only the ssh protocol is in use: one ssh rule.
 	cfg := v3.Config{SSH: []v3.SSHRule{{Host: "github.com"}}}
-	server, err := startProxy(ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxy(ctx, cfg, ":0", ":0", ":0", "localhost", issueDir)
 	if err != nil {
 		t.Fatalf("startProxy() = %v; want a start that skips the k8s read", err)
 	}
@@ -223,7 +223,7 @@ func TestStartProxyWithoutProtocols(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	server, err := startProxy(ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxy(ctx, v3.Config{}, ":0", ":0", ":0", "localhost", issueDir)
 	if err != nil {
 		t.Fatalf("startProxy() = %v; want a start that starts nothing", err)
 	}
@@ -273,7 +273,7 @@ func TestStartProxyK8sSourceReadFailureIsReported(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	_, err := startProxyBounded(t, ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxyBounded(t, ctx, proxyTestConfig(), ":0", ":0", ":0", "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a failing source read; want a failure")
 	}
@@ -314,7 +314,7 @@ func TestStartProxyAWSSourceReadFailureIsReported(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	_, err := startProxyBounded(t, ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxyBounded(t, ctx, cfg, ":0", ":0", ":0", "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a failing source read; want a failure")
 	}
@@ -350,7 +350,7 @@ func TestStartProxyCancelledDuringReadyWait(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
 		cancel()
 	}()
-	server, err := startProxyBounded(t, ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxyBounded(t, ctx, proxyTestConfig(), ":0", ":0", ":0", "localhost", issueDir)
 	_ = server
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("startProxy() = %v; want context.Canceled", err)
@@ -417,7 +417,7 @@ func TestStartProxyAWSCancelledDuringReadyWait(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // the startup resolution is in the STS call
 		cancel()
 	}()
-	server, err := startProxyBounded(t, ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxyBounded(t, ctx, cfg, ":0", ":0", ":0", "localhost", issueDir)
 	_ = server
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("startProxy() = %v; want context.Canceled", err)
@@ -452,7 +452,7 @@ func TestStartProxyReportsTheUnfinishedReclamation(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
 		cancel()
 	}()
-	_, err := startProxyBounded(t, ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxyBounded(t, ctx, proxyTestConfig(), ":0", ":0", ":0", "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a cancelled run; want a failure")
 	}
@@ -492,7 +492,7 @@ func TestStopJoinsTheIssuanceTasks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	server, err := startProxy(ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxy(ctx, proxyTestConfig(), ":0", ":0", ":0", "localhost", issueDir)
 	if err != nil {
 		t.Fatal(err)
 	}

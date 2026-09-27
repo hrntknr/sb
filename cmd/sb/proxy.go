@@ -50,7 +50,7 @@ func newProxyCommand(opts *options) *cobra.Command {
 			slog.Info("starting sb proxy", "config", opts.configPath, "host", opts.host, "ssh_listen", opts.sshListen, "k8s_listen", opts.k8sListen, "aws_listen", opts.awsListen, "dir", dir)
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			proxy, err := startProxy(ctx, cfg, *opts, opts.host, dir)
+			proxy, err := startProxy(ctx, cfg, opts.sshListen, opts.k8sListen, opts.awsListen, opts.host, dir)
 			if err != nil {
 				// startProxy stops the issuances, waits for their
 				// exit, and removes what they issued — or joins the
@@ -184,15 +184,16 @@ func enabledProtocols(cfg v3.Config) containers.Protocol {
 // success). A protocol without rules is not started at all: it is not
 // served, nothing is issued under its name, and its sources are not
 // read. Every failure path closes the listeners. host is the address
-// downstreams use to reach the proxy. Cancel ctx to stop them.
-func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir string) (*proxyServer, error) {
+// downstreams use to reach the proxy; sshAddr, k8sAddr, and awsAddr are
+// the addresses its three listeners bind. Cancel ctx to stop them.
+func startProxy(ctx context.Context, cfg v3.Config, sshAddr, k8sAddr, awsAddr, host, dir string) (*proxyServer, error) {
 	sshProxy := sshproxy.New(cfg.SSHTargets(), nil)
 	k8sProxy := k8sproxy.New(cfg.K8sTargets(), host)
 	awsProxy := awsproxy.New(cfg.AWSTargets(), host)
 
 	// The listeners of the protocols in use: a protocol without rules
 	// gets no listener — what is not started gets no port either.
-	sshListener, k8sListener, awsListener, err := listenAll(opts.sshListen, opts.k8sListen, opts.awsListen, enabledProtocols(cfg))
+	sshListener, k8sListener, awsListener, err := listenAll(sshAddr, k8sAddr, awsAddr, enabledProtocols(cfg))
 	if err != nil {
 		return nil, err
 	}

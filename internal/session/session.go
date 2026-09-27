@@ -34,6 +34,16 @@ type Record struct {
 	Runtime     string `json:"runtime"`
 	IssueDir    string `json:"issueDir"`
 	ContainerID string `json:"containerId,omitempty"`
+	// CreationSettled persists whether the container creation's result
+	// is fixed. False — what a sweep reads — means the runtime may
+	// still commit the container: the CLI is still running, or was
+	// killed mid-flight, or exited with the daemon's own result
+	// unknown. A sweep may not settle the creation on an empty
+	// listing: it could not tell a creation still in flight from one
+	// that will never commit, so the record stays until a removal
+	// could confirm its end (a listing that found the session's
+	// containers) — or until it is reclaimed by hand.
+	CreationSettled bool `json:"creationSettled"`
 }
 
 // baseDir returns sb's per-boot base directory. With XDG_RUNTIME_DIR it is
@@ -285,6 +295,12 @@ func (l *Lock) Release() {
 // deleted, and its record and lock file are removed. A live session (lock
 // held) is left alone. A session whose containers could not be removed keeps
 // its record so the next sweep retries.
+//
+// What the record itself says decides how far the sweep may go: a record
+// whose creation is not settled may not be dropped on an empty listing —
+// the runtime could still commit the container, and nothing else could find
+// it — so the sweep keeps it, and the removal's own listing confirms the
+// creation's end when it can.
 func Sweep(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -304,7 +320,16 @@ func Sweep(dir string) error {
 		if lock == nil {
 			continue // a live session holds it
 		}
-		if err := StopSession(dir, name, lock, true, true); err != nil {
+		rec, err := LoadRecord(dir, name)
+		if err != nil {
+			// A record that cannot be read cannot be settled
+			// either: it stays, and the next sweep retries
+			// with it. Nothing of sb holds the name.
+			lock.Release()
+			errs = append(errs, fmt.Errorf("sweep %q: read record: %w", name, err))
+			continue
+		}
+		if err := StopSession(dir, name, lock, true, rec.CreationSettled); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -315,26 +340,33 @@ func Sweep(dir string) error {
 // an orphan (the sweep found it). Its containers are removed by the session
 // label, the issue dir is deleted, then the record; whatever it is that
 // fails keeps what the retry needs — the record stays — and releases the
-// lock either way: after this, nothing of sb holds the name. With the
-// issuing tasks still writing (issuanceExited false) or the container
-// creation still in flight (creationSettled false, its result unknown),
-// the issue dir is not deleted: the removal would race what they are
-// still writing or creating; the record stays, and the next sweep
-// retries with it.
+// lock either way: after this, nothing of sb holds the name.
+//
+// What may still be committed decides whether the record may be dropped:
+// the issuing tasks still writing (issuanceExited false), or the creation's
+// result still unknown AND this removal's own listing found nothing of it
+// (creationSettled false, found false) — the container could still be
+// committed after the removal, so nothing may be settled on the empty
+// listing. What this listing found — the session's containers, the only
+// things the creation could have committed — confirms the creation's end:
+// one create commits exactly one container, so nothing of it appears after
+// the removal of what it committed.
 func StopSession(dir, name string, lock *Lock, issuanceExited, creationSettled bool) error {
 	defer lock.Release()
 	rec, err := LoadRecord(dir, name)
 	if err != nil {
 		return ReclaimError(Record{Name: name}, dir)
 	}
-	if err := removeContainers(&rec); err != nil {
+	found, err := removeContainers(&rec)
+	if err != nil {
 		return ReclaimError(rec, dir)
 	}
-	if !issuanceExited || !creationSettled {
+	if !issuanceExited || !(creationSettled || found) {
 		// The issuing tasks are still writing the issue dir, or the
-		// creation's result is still unknown: what the removal lists
-		// is not the whole truth yet. The record stays; the next
-		// sweep retries with it.
+		// creation's result is still unknown and this removal could
+		// not confirm its end. What the removal lists is not the
+		// whole truth yet. The record stays; the next sweep retries
+		// with it.
 		return ReclaimError(rec, dir)
 	}
 	if rec.IssueDir != "" {
@@ -350,11 +382,12 @@ func StopSession(dir, name string, lock *Lock, issuanceExited, creationSettled b
 
 // removeContainers stops and removes the record's containers by session
 // label. Each runtime call is bounded by RuntimeWait: a runtime that does
-// not answer within it is killed, and the removal is a failed one.
-func removeContainers(rec *Record) error {
+// not answer within it is killed, and the removal is a failed one. found
+// reports whether the listing saw any container of the session.
+func removeContainers(rec *Record) (found bool, err error) {
 	rt, err := containers.ParseName(rec.Runtime)
 	if err != nil {
-		return err
+		return false, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), RuntimeWait)
 	defer cancel()

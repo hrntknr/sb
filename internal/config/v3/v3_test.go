@@ -200,6 +200,50 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+// TestLoadScopeDecidedInEveryGroup covers the shape check past the core
+// group: rules in apps, rbac, batch, and storage load with the shape the
+// scope decision gives the resource — the same check core's rules get, in
+// every group sb decides.
+func TestLoadScopeDecidedInEveryGroup(t *testing.T) {
+	config := `version: 3
+k8s:
+  - context: dev
+    resources:
+      - group: apps
+        resource: deployments
+        namespace: default
+        verbs: [get, list]
+      - group: rbac.authorization.k8s.io
+        resource: clusterroles
+        scope: cluster
+        verbs: [get]
+      - group: batch
+        resource: jobs
+        namespace: other
+        verbs: [get]
+      - group: storage.k8s.io
+        resource: csistoragecapacities
+        namespace: kube-system
+        verbs: [get]
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, config)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []ResourceRule{
+		{Group: "apps", Resource: "deployments", Namespace: "default", Verbs: []string{"get", "list"}},
+		{Group: "rbac.authorization.k8s.io", Resource: "clusterroles", Scope: "cluster", Verbs: []string{"get"}},
+		{Group: "batch", Resource: "jobs", Namespace: "other", Verbs: []string{"get"}},
+		{Group: "storage.k8s.io", Resource: "csistoragecapacities", Namespace: "kube-system", Verbs: []string{"get"}},
+	}
+	if !reflect.DeepEqual(cfg.K8s[0].Resources, want) {
+		t.Fatalf("K8s[0].Resources = %+v, want %+v", cfg.K8s[0].Resources, want)
+	}
+}
+
 func TestLoadInvalid(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -237,6 +281,16 @@ func TestLoadInvalid(t *testing.T) {
 		{"k8s namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        scope: cluster\n        verbs: [get]\n", "give a namespace, not scope: cluster"},
 		{"k8s cluster-scoped with a namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: nodes\n        namespace: default\n        verbs: [get]\n", "nodes is cluster-scoped: give scope: cluster, not a namespace"},
 		{"k8s cluster-scoped without scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: namespaces\n        verbs: [get]\n", "namespaces is cluster-scoped: give scope: cluster"},
+		// The shape must match beyond the core group too: what sb
+		// decides in apps and rbac it decides the same way.
+		{"k8s apps namespaced with scope cluster", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: apps\n        resource: deployments\n        scope: cluster\n        verbs: [list]\n", "deployments is namespaced: give a namespace, not scope: cluster"},
+		{"k8s rbac cluster-scoped with a namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: rbac.authorization.k8s.io\n        resource: clusterroles\n        namespace: \"*\"\n        verbs: [list]\n", "clusterroles is cluster-scoped: give scope: cluster, not a namespace"},
+		// What sb does not decide the scope of is not loadable:
+		// the rule could not be checked against the resource's real
+		// scope, so the config would promise more than the
+		// authorization grants.
+		{"k8s undecided resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: example.com\n        resource: widgets\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
+		{"k8s undecided core resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: inventions\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
 		{"k8s invalid scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        scope: node\n        verbs: [get]\n", `invalid scope "node" (want cluster)`},
 		{"k8s missing verbs", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n", "verbs is required"},
 		{"k8s unsupported verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, create]\n", `unsupported verb "create"`},

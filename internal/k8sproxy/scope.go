@@ -2,41 +2,118 @@ package k8sproxy
 
 import "strings"
 
-// coreResourceScopes maps the core group's ("") fixed resources to
-// their scope as the Kubernetes API defines it: true — the objects
-// live at the cluster's root, false — inside a namespace. Only these
-// resources are decided by it; anything else (another group, or a
-// name the core group does not define) keeps the shape it was given.
-var coreResourceScopes = map[string]bool{
-	"bindings":               false,
-	"componentstatuses":      true,
-	"configmaps":             false,
-	"endpoints":              false,
-	"events":                 false,
-	"limitranges":            false,
-	"namespaces":             true,
-	"nodes":                  true,
-	"persistentvolumeclaims": false,
-	"persistentvolumes":      true,
-	"pods":                   false,
-	"podtemplates":           false,
-	"replicationcontrollers": false,
-	"resourcequotas":         false,
-	"secrets":                false,
-	"serviceaccounts":        false,
-	"services":               false,
+// resourceScopes maps the resources sb decides the scope of — the
+// Kubernetes stable API's groups — to their scope as the Kubernetes
+// API defines it: true — the objects live at the cluster's root,
+// false — inside a namespace. A resource outside it is not decided at
+// all: the config load rejects it, so the policy never meets a rule
+// whose scope it cannot check against the resource's real one.
+var resourceScopes = map[string]map[string]bool{
+	"": { // the core API group
+		"bindings":               false,
+		"componentstatuses":      true,
+		"configmaps":             false,
+		"endpoints":              false,
+		"events":                 false,
+		"limitranges":            false,
+		"namespaces":             true,
+		"nodes":                  true,
+		"persistentvolumeclaims": false,
+		"persistentvolumes":      true,
+		"pods":                   false,
+		"podtemplates":           false,
+		"replicationcontrollers": false,
+		"resourcequotas":         false,
+		"secrets":                false,
+		"serviceaccounts":        false,
+		"services":               false,
+	},
+	"apps": {
+		"controllerrevisions": false,
+		"daemonsets":          false,
+		"deployments":         false,
+		"replicasets":         false,
+		"statefulsets":        false,
+	},
+	"rbac.authorization.k8s.io": {
+		"clusterrolebindings": true,
+		"clusterroles":        true,
+		"rolebindings":        false,
+		"roles":               false,
+	},
+	"admissionregistration.k8s.io": {
+		"mutatingwebhookconfigurations":   true,
+		"validatingwebhookconfigurations": true,
+	},
+	"apiextensions.k8s.io": {
+		"customresourcedefinitions": true,
+	},
+	"apiregistration.k8s.io": {
+		"apiservices": true,
+	},
+	"authentication.k8s.io": {
+		"tokenreviews": true,
+	},
+	"authorization.k8s.io": {
+		"localsubjectaccessreviews": false,
+		"selfsubjectaccessreviews":  true,
+		"selfsubjectrulesreviews":   true,
+		"subjectaccessreviews":      true,
+	},
+	"autoscaling": {
+		"horizontalpodautoscalers": false,
+	},
+	"batch": {
+		"cronjobs": false,
+		"jobs":     false,
+	},
+	"certificates.k8s.io": {
+		"certificatesigningrequests": true,
+	},
+	"coordination.k8s.io": {
+		"leases": false,
+	},
+	"discovery.k8s.io": {
+		"endpointslices": false,
+	},
+	"events.k8s.io": {
+		"events": false,
+	},
+	"networking.k8s.io": {
+		"ingressclasses":  true,
+		"ingresses":       false,
+		"networkpolicies": false,
+	},
+	"node.k8s.io": {
+		"runtimeclasses": true,
+	},
+	"policy": {
+		"poddisruptionbudgets": false,
+	},
+	"scheduling.k8s.io": {
+		"priorityclasses": true,
+	},
+	"storage.k8s.io": {
+		"csidrivers":           true,
+		"csinodes":             true,
+		"csistoragecapacities": false,
+		"storageclasses":       true,
+		"volumeattachments":    true,
+	},
 }
 
-// CoreResourceScope returns the scope the Kubernetes API gives the
-// resource: cluster-scoped (true) — the objects live at the cluster's
-// root — or namespaced (false). Only the core group's ("") fixed
-// resources are decided by it, with any subresource stripped; another
-// group, or a name the core group does not define, is not: (, false).
-func CoreResourceScope(group, resource string) (clusterScoped, known bool) {
-	if group != "" {
+// ResourceScope returns the scope the Kubernetes API gives the resource:
+// cluster-scoped (true) — the objects live at the cluster's root — or
+// namespaced (false), with any subresource stripped. Only the resources
+// above are decided by it; anything else (another group, or a name no
+// group defines) is not, and the config load rejects it: what the policy
+// sees is always decided.
+func ResourceScope(group, resource string) (clusterScoped, decided bool) {
+	base, _, _ := strings.Cut(resource, "/")
+	resources := resourceScopes[group]
+	if resources == nil {
 		return false, false
 	}
-	base, _, _ := strings.Cut(resource, "/")
-	clusterScoped, known = coreResourceScopes[base]
-	return clusterScoped, known
+	clusterScoped, decided = resources[base]
+	return clusterScoped, decided
 }

@@ -106,7 +106,15 @@ func ruleAllows(rule Resource, info *apirequest.RequestInfo) bool {
 // The resource's scope decides, and a cluster rule covers the named get
 // like the collection.
 func namespaceAllowed(rule Resource, info *apirequest.RequestInfo) bool {
-	if clusterScoped, _ := CoreResourceScope(info.APIGroup, info.Resource); clusterScoped {
+	// What sb does not decide the scope of is not granted at all: the
+	// policy could not check the rule against the resource's real
+	// scope. The load rejects those rules; this guards what reaches
+	// the policy another way.
+	clusterScoped, decided := ResourceScope(info.APIGroup, info.Resource)
+	if !decided {
+		return false
+	}
+	if clusterScoped {
 		return rule.Scope == "cluster" || rule.Namespace == "*"
 	}
 	if info.Namespace == "" {

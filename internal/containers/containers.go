@@ -221,24 +221,31 @@ func nonEmpty(out []byte) []string {
 // listing is the source of truth, not sb's records. What the runtime
 // answers without removing is a failed removal: the listing after it
 // must come back empty, and it is an error when it does not.
-func RemoveSession(ctx context.Context, r Runtime, sessionID string) error {
+//
+// found reports whether the first listing saw any container of the
+// session: what the runtime has committed. For a creation whose result
+// is not fixed, that listing is the only confirmation of its end — one
+// create commits exactly one container, so nothing of it can appear
+// after the removal of what it committed.
+func RemoveSession(ctx context.Context, r Runtime, sessionID string) (found bool, err error) {
 	ids, err := ListSession(ctx, r, sessionID)
 	if err != nil {
-		return err
+		return false, err
 	}
+	found = len(ids) > 0
 	for _, id := range ids {
 		if err := RemoveByID(ctx, r, id); err != nil {
-			return err
+			return found, err
 		}
 	}
 	left, err := ListSession(ctx, r, sessionID)
 	if err != nil {
-		return err
+		return found, err
 	}
 	if len(left) > 0 {
-		return fmt.Errorf("%s: remove left containers behind: %s", r, strings.Join(left, " "))
+		return found, fmt.Errorf("%s: remove left containers behind: %s", r, strings.Join(left, " "))
 	}
-	return nil
+	return found, nil
 }
 
 // RemoveByID stops and removes the container with the given ID. The output

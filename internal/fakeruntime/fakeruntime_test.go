@@ -28,7 +28,7 @@ func TestFakesAnswerRuntimeCalls(t *testing.T) {
 	}
 
 	// RemoveSession stops and removes by label.
-	if err := containers.RemoveSession(context.Background(), containers.Docker, "sidA"); err != nil {
+	if _, err := containers.RemoveSession(context.Background(), containers.Docker, "sidA"); err != nil {
 		t.Fatalf("RemoveSession: %v", err)
 	}
 	if state := stateText(t); strings.Contains(state, "cid1") {
@@ -202,7 +202,7 @@ func TestRemoveSessionKillsStalledRuntime(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	err := containers.RemoveSession(ctx, containers.Docker, "sidA")
+	_, err := containers.RemoveSession(ctx, containers.Docker, "sidA")
 	if err == nil {
 		t.Fatal("RemoveSession() with a stalled runtime, want error")
 	}
@@ -231,7 +231,7 @@ func TestRemoveSessionDetectsLingeringRuntime(t *testing.T) {
 	}
 	t.Setenv("SB_FAKE_RM_LINGER", linger)
 
-	if err := containers.RemoveSession(context.Background(), containers.Docker, "sidA"); err == nil {
+	if _, err := containers.RemoveSession(context.Background(), containers.Docker, "sidA"); err == nil {
 		t.Fatal("RemoveSession() with a lingering runtime, want error")
 	} else if !strings.Contains(err.Error(), "left containers behind") {
 		t.Fatalf("RemoveSession() error = %q; want the leftover containers", err.Error())

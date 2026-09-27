@@ -340,18 +340,23 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 	}
 	// The rule's shape must match the scope the Kubernetes API gives
 	// the resource: a cluster-scoped one takes scope: cluster, a
-	// namespaced one a namespace.
-	if clusterScoped, known := k8sproxy.CoreResourceScope(*d.Group, d.Resource); known {
-		if clusterScoped {
-			if d.Namespace != nil {
-				return ResourceRule{}, fmt.Errorf("%s is cluster-scoped: give scope: cluster, not a namespace", d.Resource)
-			}
-			if d.Scope == nil {
-				return ResourceRule{}, fmt.Errorf("%s is cluster-scoped: give scope: cluster", d.Resource)
-			}
-		} else if d.Scope != nil {
-			return ResourceRule{}, fmt.Errorf("%s is namespaced: give a namespace, not scope: cluster", d.Resource)
+	// namespaced one a namespace. What sb does not decide — anything
+	// outside the stable API — is not loadable: the policy could not
+	// check the rule against the resource's real scope, so the config
+	// would promise more than the authorization grants.
+	clusterScoped, decided := k8sproxy.ResourceScope(*d.Group, d.Resource)
+	if !decided {
+		return ResourceRule{}, fmt.Errorf("resource %q in group %q is not one sb decides the scope of (the stable API's resources only); remove the rule", d.Resource, *d.Group)
+	}
+	if clusterScoped {
+		if d.Namespace != nil {
+			return ResourceRule{}, fmt.Errorf("%s is cluster-scoped: give scope: cluster, not a namespace", d.Resource)
 		}
+		if d.Scope == nil {
+			return ResourceRule{}, fmt.Errorf("%s is cluster-scoped: give scope: cluster", d.Resource)
+		}
+	} else if d.Scope != nil {
+		return ResourceRule{}, fmt.Errorf("%s is namespaced: give a namespace, not scope: cluster", d.Resource)
 	}
 	if d.Namespace == nil && d.Scope == nil {
 		return ResourceRule{}, errors.New("namespace is required (or set scope: cluster for cluster-scoped resources)")
