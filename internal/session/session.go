@@ -61,27 +61,18 @@ func baseDir() (string, error) {
 	var dir string
 	if runtime, ok := os.LookupEnv("XDG_RUNTIME_DIR"); ok && filepath.IsAbs(runtime) {
 		dir = filepath.Join(runtime, "sb")
-		// The anchor is the runtime home: without it there is nothing
-		// above the sb dir at all, and the runtime home's own entry —
-		// pre-existing, or left by a call that created it when
-		// XDG_RUNTIME_DIR pointed at a home that did not exist — is
-		// what its persistence needs, so it is synced on every call.
-		if err := secureMkdir(dir, runtime); err != nil {
+		if err := secureMkdir(dir); err != nil {
 			return "", err
 		}
 	} else {
 		// The fallback's per-uid directory is created and verified first: another
 		// user claiming <tmp>/sb-<uid> must not carry sb's subtree.
 		parent := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", uid()))
-		if err := secureMkdir(parent, parent); err != nil {
+		if err := secureMkdir(parent); err != nil {
 			return "", err
 		}
 		dir = filepath.Join(parent, "sb")
-		// The anchor is the per-uid directory: the sb dir under it
-		// persists the entry of every level of its tree — the per-uid
-		// entry in <tmp>, its own in the per-uid directory — on every
-		// call, not only at the creation that happens to be this one.
-		if err := secureMkdir(dir, parent); err != nil {
+		if err := secureMkdir(dir); err != nil {
 			return "", err
 		}
 	}
@@ -95,21 +86,16 @@ func baseDir() (string, error) {
 // sb that created it, and the record is what finds its containers again
 // after the restart.
 //
-// The anchor — the home the tree sits under — is the state home with
-// XDG_STATE_HOME, the user's home without it: the levels above the sb
-// dir down from it — the state home under its own parent, .local and
-// state under the home — are the tree sb's own calls may have built,
-// and each one's entry is synced on every call, so a call that left a
-// level behind without its sync does not have the next one skip it.
+// The tree sb's own calls may have built holds every level from the
+// first existing one down to the sb dir — the state home itself, or
+// .local and state under the home — and each one's entry is what the
+// creation persists and every call confirms: a call that left a level
+// behind without its sync does not have the next one skip it.
 func stateBaseDir() (string, error) {
 	var dir string
 	if state, ok := os.LookupEnv("XDG_STATE_HOME"); ok && filepath.IsAbs(state) {
 		dir = filepath.Join(state, "sb")
-		// The anchor is the state home: the sb dir under it
-		// persists the entry of every level of its tree — its own
-		// entry in its parent, the sb entry in it — on every call,
-		// not only at the creation that happens to be this one.
-		if err := secureMkdir(dir, state); err != nil {
+		if err := secureMkdir(dir); err != nil {
 			return "", fmt.Errorf("state dir %s: %w", dir, err)
 		}
 	} else {
@@ -118,13 +104,7 @@ func stateBaseDir() (string, error) {
 			return "", fmt.Errorf("state dir: %w", err)
 		}
 		dir = filepath.Join(home, ".local", "state", "sb")
-		// The anchor is the home: the levels between it and the sb
-		// dir — .local, the state home — are the tree sb's own calls
-		// may have built, and each one's entry is synced on every
-		// call. The home's own entry — pre-existing, or left by a
-		// call that created it — is synced on every call with them:
-		// it is what their persistence needs.
-		if err := secureMkdir(dir, home); err != nil {
+		if err := secureMkdir(dir); err != nil {
 			return "", fmt.Errorf("state dir %s: %w", dir, err)
 		}
 	}
@@ -146,23 +126,22 @@ func stateBaseDir() (string, error) {
 // stops the creation: the caller gets the failure, not a tree that
 // might not be there.
 //
-// root is the anchor — the top of the tree the path sits in — and
-// every level of it from root down to dir — existing or not, created
-// by this call or left by a failed one — gets its entry synced after
-// the creation: what sb might have built is not its existence but its
-// persistence that the next call needs, and a level that exists is
-// not thereby one whose entry is on the disk. So the tree is returned
-// as usable only when every entry that names it is on the disk —
-// on every call, not only at the creation that happens to be this
-// one. root is above the tree's own top: it is the level whose own
-// entry the tree's persistence needs — the home under which it
-// sits — and its parent's entry is not sb's to persist.
-func secureMkdir(dir, root string) error {
-	missing, err := missingDirs(dir)
+// Then every level of the same tree — the first existing ancestor
+// included, existing or not, created by this call or left by a failed
+// one — gets its entry synced after the creation: what sb might have
+// built is not its existence but its persistence that the next call
+// needs, and a level that exists is not thereby one whose entry is on
+// the disk. So the tree is returned as usable only when every entry
+// that names it is on the disk — on every call, not only at the
+// creation that happens to be this one. What is above the first
+// existing ancestor existed before sb: its entry is not sb's to
+// persist, and none of its own creation either.
+func secureMkdir(dir string) error {
+	levels, err := missingDirs(dir)
 	if err != nil {
 		return err
 	}
-	for _, p := range missing {
+	for _, p := range levels {
 		if err := os.MkdirAll(p, 0o700); err != nil {
 			return err
 		}
@@ -170,7 +149,7 @@ func secureMkdir(dir, root string) error {
 			return err
 		}
 	}
-	for _, p := range ownedTree(root, dir) {
+	for _, p := range levels {
 		if err := syncDirEntry(filepath.Dir(p)); err != nil {
 			return err
 		}
@@ -192,14 +171,20 @@ func secureMkdir(dir, root string) error {
 	return nil
 }
 
-// missingDirs walks up from dir collecting the directories that do not
-// exist yet, shallowest first: what is there already is not sb's to
-// create, and the first existing ancestor is where the walk stops —
-// what is above it existed before sb and is not sb's to sync either.
+// missingDirs lists the levels of the tree that holds dir, shallowest
+// first: the walk goes up from dir and stops at the first existing
+// level — what is above it existed before sb and is neither sb's to
+// create nor sb's to persist — and that level is the tree's top:
+// the levels from it down to dir are the ones sb's own calls may have
+// built, existing or not, created by an earlier call or left by a
+// failed one. What is missing among them is secureMkdir's to create;
+// every one of them is its to persist.
 func missingDirs(dir string) ([]string, error) {
 	var deepest []string // deepest first as walked up
 	for d := dir; ; {
 		if _, err := os.Lstat(d); err == nil {
+			// The first existing level: it is the tree's top.
+			deepest = append(deepest, d)
 			break
 		} else if !os.IsNotExist(err) {
 			return nil, err
@@ -216,36 +201,6 @@ func missingDirs(dir string) ([]string, error) {
 		shallow[len(deepest)-1-i] = d
 	}
 	return shallow, nil
-}
-
-// ownedTree lists the levels of the tree from its root down to dir,
-// shallowest first: the root first, then every level below it. They
-// are sb's own, and each one's entry in its parent is synced before
-// the tree is returned as usable — existing or not: a level a failed
-// call left behind without its sync gets it from the next one.
-func ownedTree(root, dir string) []string {
-	var deepest []string // deepest first as walked up
-	found := false
-	for d := dir; ; {
-		deepest = append(deepest, d)
-		if d == root {
-			found = true
-			break
-		}
-		parent := filepath.Dir(d)
-		if parent == d {
-			break
-		}
-		d = parent
-	}
-	if !found {
-		return []string{dir} // root is not above dir: the tree is dir alone
-	}
-	shallow := make([]string, len(deepest))
-	for i, d := range deepest {
-		shallow[len(deepest)-1-i] = d
-	}
-	return shallow
 }
 
 // syncDirEntry syncs a directory's entries to what the disk holds, and
@@ -286,7 +241,7 @@ func SessionsDir() (string, error) {
 		return "", err
 	}
 	sessions := filepath.Join(dir, "sessions")
-	if err := secureMkdir(sessions, dir); err != nil {
+	if err := secureMkdir(sessions); err != nil {
 		return "", err
 	}
 	return sessions, nil
@@ -302,7 +257,7 @@ func NewIssueDir(sessionID string) (string, error) {
 		return "", err
 	}
 	issue := filepath.Join(dir, "issues", sessionID)
-	if err := secureMkdir(issue, dir); err != nil {
+	if err := secureMkdir(issue); err != nil {
 		return "", err
 	}
 	return issue, nil

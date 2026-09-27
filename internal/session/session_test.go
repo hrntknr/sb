@@ -631,7 +631,10 @@ func TestSyncFailureRetriesTheHomesLevels(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
-	t.Setenv("HOME", home)
+	// The trailing slash: the raw value the anchor is taken from, and
+	// the same place pointed at without it — the levels above the sb
+	// dir hold their guarantee whatever the path says.
+	t.Setenv("HOME", home+"/")
 	if _, err := os.Stat(filepath.Join(home, ".local")); !os.IsNotExist(err) {
 		t.Fatalf(".local exists before the test: %v", err)
 	}
@@ -673,7 +676,10 @@ func TestSyncFailureRetriesTheStateHomesLevel(t *testing.T) {
 	// missing — the reviewer's path for the uncreated state home.
 	tmp := t.TempDir()
 	stateHome := filepath.Join(tmp, "state")
-	t.Setenv("XDG_STATE_HOME", stateHome)
+	// The trailing slash: the raw value the anchor is taken from, and
+	// the same place pointed at without it — the state home's own
+	// entry holds its guarantee whatever the path says.
+	t.Setenv("XDG_STATE_HOME", stateHome+"/")
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	if _, err := os.Stat(stateHome); !os.IsNotExist(err) {
 		t.Fatalf("state home exists before the test: %v", err)
@@ -698,6 +704,49 @@ func TestSyncFailureRetriesTheStateHomesLevel(t *testing.T) {
 		t.Fatalf("SessionsDir() after the sync recovered: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(stateHome, "sb", "sessions")); err != nil {
+		t.Fatalf("sessions dir after the sync recovered: %v", err)
+	}
+}
+
+// TestSyncFailureRetriesAboveTheStateHome covers the levels above the
+// state home: pointed at a state home whose parent is not there either
+// — <stable>/custom/state, with custom and state both missing — the
+// failing sync is the one that holds the parent's entry: the first
+// existing level's, whose child is the parent. While it fails, no call
+// may succeed: from custom missing, the first call stops at the
+// creation of custom, and once custom is there every call stops at its
+// entry. After the sync recovers, the call goes through, and every
+// entry of the tree is on the disk with it.
+func TestSyncFailureRetriesAboveTheStateHome(t *testing.T) {
+	// The first existing level: <stable>, existing, with nothing of
+	// sb's tree under it — the state home's parent (custom) and the
+	// state home itself are both missing.
+	stable := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(stable, "custom", "state"))
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	if _, err := os.Stat(filepath.Join(stable, "custom")); !os.IsNotExist(err) {
+		t.Fatalf("custom exists before the test: %v", err)
+	}
+	real := syncDirEntry
+	defer func() { syncDirEntry = real }()
+	syncDirEntry = func(dir string) error {
+		if dir == stable {
+			return errSyncStopped
+		}
+		return real(dir)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := SessionsDir(); err == nil || !errors.Is(err, errSyncStopped) {
+			t.Fatalf("call %d: SessionsDir() = %v, want the sync of the level above the state home", i, err)
+		}
+	}
+	// The sync recovers: the call goes through, and every entry of
+	// the tree is on the disk with it.
+	syncDirEntry = real
+	if _, err := SessionsDir(); err != nil {
+		t.Fatalf("SessionsDir() after the sync recovered: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stable, "custom", "state", "sb", "sessions")); err != nil {
 		t.Fatalf("sessions dir after the sync recovered: %v", err)
 	}
 }
@@ -1050,7 +1099,10 @@ func TestSyncFailureRetriesTheRuntimeHomesLevel(t *testing.T) {
 	tmp := t.TempDir()
 	runtimeHome := filepath.Join(tmp, "runtime")
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	t.Setenv("XDG_RUNTIME_DIR", runtimeHome)
+	// The trailing slash: the raw value the anchor is taken from, and
+	// the same place pointed at without it — the runtime home's own
+	// entry holds its guarantee whatever the path says.
+	t.Setenv("XDG_RUNTIME_DIR", runtimeHome+"/")
 	if _, err := os.Stat(runtimeHome); !os.IsNotExist(err) {
 		t.Fatalf("runtime home exists before the test: %v", err)
 	}
