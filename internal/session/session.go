@@ -65,12 +65,12 @@ func baseDir() (string, error) {
 		// The fallback's parent is created and verified first: another
 		// user claiming <tmp>/sb-<uid> must not carry sb's subtree.
 		parent := filepath.Join(os.TempDir(), fmt.Sprintf("sb-%d", uid()))
-		if err := secureMkdir(parent); err != nil {
+		if err := secureMkdir(parent, parent); err != nil {
 			return "", err
 		}
 		dir = filepath.Join(parent, "sb")
 	}
-	if err := secureMkdir(dir); err != nil {
+	if err := secureMkdir(dir, dir); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -93,15 +93,16 @@ func stateBaseDir() (string, error) {
 		}
 		dir = filepath.Join(home, ".local", "state", "sb")
 	}
-	if err := secureMkdir(dir); err != nil {
+	if err := secureMkdir(dir, dir); err != nil {
 		return "", fmt.Errorf("state dir %s: %w", dir, err)
 	}
 	return dir, nil
 }
 
-// secureMkdir creates dir 0700 and verifies what is already there: the
-// path must be this user's real directory 0700 before sb writes into it.
-// The verification is on the path itself, not what it points at: a
+// secureMkdir establishes dir as sb's own — created 0700 with the
+// levels above it that do not exist yet, verified: the path must be
+// this user's real directory 0700 before sb writes into it. The
+// verification is on the path itself, not what it points at: a
 // symlink there is its owner's, not sb's, and whoever owns it can
 // replace it afterwards.
 //
@@ -112,7 +113,14 @@ func stateBaseDir() (string, error) {
 // the process that made it was told it succeeded. A sync that fails
 // stops the creation: the caller gets the failure, not a tree that
 // might not be there.
-func secureMkdir(dir string) error {
+//
+// root is the top of the tree the path sits in, and every level of
+// it from root down to dir — existing or not, created by this call
+// or left by a failed one — gets its entry synced after the creation:
+// a call that left a level behind without its sync does not have
+// the next one skip it, so the tree is returned as usable only when
+// every entry that names it is on the disk.
+func secureMkdir(dir, root string) error {
 	missing, err := missingDirs(dir)
 	if err != nil {
 		return err
@@ -121,6 +129,11 @@ func secureMkdir(dir string) error {
 		if err := os.MkdirAll(p, 0o700); err != nil {
 			return err
 		}
+		if err := syncDirEntry(filepath.Dir(p)); err != nil {
+			return err
+		}
+	}
+	for _, p := range ownedTree(root, dir) {
 		if err := syncDirEntry(filepath.Dir(p)); err != nil {
 			return err
 		}
@@ -168,6 +181,36 @@ func missingDirs(dir string) ([]string, error) {
 	return shallow, nil
 }
 
+// ownedTree lists the levels of the tree from its root down to dir,
+// shallowest first: the root first, then every level below it. They
+// are sb's own, and each one's entry in its parent is synced before
+// the tree is returned as usable — existing or not: a level a failed
+// call left behind without its sync gets it from the next one.
+func ownedTree(root, dir string) []string {
+	var deepest []string // deepest first as walked up
+	found := false
+	for d := dir; ; {
+		deepest = append(deepest, d)
+		if d == root {
+			found = true
+			break
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	if !found {
+		return []string{dir} // root is not above dir: the tree is dir alone
+	}
+	shallow := make([]string, len(deepest))
+	for i, d := range deepest {
+		shallow[len(deepest)-1-i] = d
+	}
+	return shallow
+}
+
 // syncDirEntry syncs a directory's entries to what the disk holds, and
 // is the seam the tests hook: a sync that fails is what the tests make
 // happen, checking the creation stops there and the caller gets the
@@ -206,7 +249,7 @@ func SessionsDir() (string, error) {
 		return "", err
 	}
 	sessions := filepath.Join(dir, "sessions")
-	if err := secureMkdir(sessions); err != nil {
+	if err := secureMkdir(sessions, dir); err != nil {
 		return "", err
 	}
 	return sessions, nil
@@ -222,7 +265,7 @@ func NewIssueDir(sessionID string) (string, error) {
 		return "", err
 	}
 	issue := filepath.Join(dir, "issues", sessionID)
-	if err := secureMkdir(issue); err != nil {
+	if err := secureMkdir(issue, dir); err != nil {
 		return "", err
 	}
 	return issue, nil
@@ -473,10 +516,14 @@ func StopSession(dir, name string, lock *Lock, issuanceExited, creationSettled b
 // settleAndRemove removes the session's containers by label and settles
 // the creation with what the removal observes. The listing finds the
 // containers the creation committed — that observation is the evidence
-// the creation settled, and it is persisted before the destruction: a
-// failure after it (a removal that could not finish, an issue dir that
-// could not be deleted) keeps the evidence with the record, so the next
-// sweep does not hold it unsettled forever on an empty listing.
+// the creation settled — and the destruction runs only after the
+// settlement is on the disk: whatever the record says, it goes out
+// again before a single container is destroyed. A save whose sync
+// failed after the rename left the settlement visible at the final
+// name without being on the disk: read back as done, it would have
+// the next stop or skip the save and destroy on what survived no stop —
+// so the save is not skipped, whatever the record says, and the removal
+// proceeds only after a successful one.
 func settleAndRemove(dir string, rec *Record) (found bool, err error) {
 	rt, err := containers.ParseName(rec.Runtime)
 	if err != nil {
@@ -489,11 +536,12 @@ func settleAndRemove(dir string, rec *Record) (found bool, err error) {
 		return false, err
 	}
 	found = len(ids) > 0
-	if found && !rec.CreationSettled {
+	if found {
 		// The creation's committed containers are in hand: the
 		// creation cannot commit anything else (one create commits
 		// exactly one container). The evidence goes out before the
-		// destruction — persist it now.
+		// destruction — persist it now, and only a successful
+		// save lets the destruction run on it.
 		rec.CreationSettled = true
 		if err := SaveRecord(dir, *rec); err != nil {
 			return found, err

@@ -117,9 +117,9 @@ func TestWriteFileAtomicSyncsAfterTheRename(t *testing.T) {
 	if err := os.WriteFile(path, []byte("previous"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	real := syncDir
-	defer func() { syncDir = real }()
-	syncDir = func(dirfd int) error {
+	real := SyncDir
+	defer func() { SyncDir = real }()
+	SyncDir = func(dirfd int) error {
 		// At the sync the rename already happened: the entry is at
 		// the final name and its content is the new one. Before the
 		// rename the name held the previous content — a sync there
@@ -145,9 +145,9 @@ func TestWriteFileAtomicSyncsAfterTheRename(t *testing.T) {
 func TestWriteFileAtomicFailsWhenTheSyncDoes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config")
-	real := syncDir
-	defer func() { syncDir = real }()
-	syncDir = func(dirfd int) error { return errSyncFailed }
+	real := SyncDir
+	defer func() { SyncDir = real }()
+	SyncDir = func(dirfd int) error { return errSyncFailed }
 	if err := WriteFileAtomic(path, 0o600, []byte("content")); err == nil || !errors.Is(err, errSyncFailed) {
 		t.Fatalf("WriteFileAtomic() = %v, want the sync's failure", err)
 	}

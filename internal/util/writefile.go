@@ -45,7 +45,7 @@ func WriteFileAtomic(path string, mode os.FileMode, content []byte) error {
 	// runtime's own disk — so the write is not successful until the
 	// directory's entries are on disk too. It fails here, the caller
 	// keeps what it had: a missing or stale file, not a half-rename.
-	if err := syncDir(dirfd); err != nil {
+	if err := SyncDir(dirfd); err != nil {
 		return fmt.Errorf("sync %s: %w", dir, err)
 	}
 	return nil
@@ -97,10 +97,12 @@ func randomSuffix() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// syncDir syncs a directory's entries to what the disk holds, and is
+// SyncDir syncs a directory's entries to what the disk holds, and is
 // the seam the tests hook: a sync that fails is what the tests make
 // happen, checking that the failure is the caller's and not the
-// writing's.
-var syncDir = func(dirfd int) error {
+// writing's. It is exported for the packages whose writes go through
+// this one: their tests hook it from outside, the same way this
+// package's own tests do from inside.
+var SyncDir = func(dirfd int) error {
 	return unix.Fsync(dirfd)
 }

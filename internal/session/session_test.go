@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hrntknr/sb/internal/fakeruntime"
+	"github.com/hrntknr/sb/internal/util"
 	"golang.org/x/sys/unix"
 )
 
@@ -585,6 +586,34 @@ func TestSyncFailureStopsTheCreation(t *testing.T) {
 // sync: the creation's stop, not the sync's own error text.
 var errSyncStopped = errors.New("sync stopped for the test")
 
+// TestSyncFailurePersistsAcrossCalls covers the sync failure through the
+// calls: with the sync failing, no call may succeed — each one has to
+// establish the tree's entries before it may return the tree as usable,
+// and each one stops at the sync. The hole this pins is the third call
+// of an empty state home: everything exists, nothing synced, a success
+// without a single entry on the disk — the levels a failed call left
+// behind are not the next one's to skip.
+func TestSyncFailurePersistsAcrossCalls(t *testing.T) {
+	// The state home exists, empty: what a real boot leaves there.
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	real := syncDirEntry
+	defer func() { syncDirEntry = real }()
+	syncDirEntry = func(dir string) error { return errSyncStopped }
+	for i := 1; i <= 3; i++ {
+		if _, err := SessionsDir(); err == nil || !errors.Is(err, errSyncStopped) {
+			t.Fatalf("call %d: SessionsDir() = %v, want the sync's failure", i, err)
+		}
+	}
+	// The sync succeeds: the call goes through, and the tree is on
+	// the disk.
+	syncDirEntry = real
+	if _, err := SessionsDir(); err != nil {
+		t.Fatalf("SessionsDir() after the sync recovered: %v", err)
+	}
+}
+
 // TestStateDirRefusesAWrongOwner covers the state dir's own directory:
 // an <XDG_STATE_HOME>/sb that exists as another user's (uid 1 here) is
 // refused — what sb writes under it would sit in another user's tree,
@@ -822,6 +851,100 @@ func TestStopSessionSettlesBeforeTheRemoval(t *testing.T) {
 		t.Fatalf("container survived the stop: %q", state)
 	}
 }
+
+// TestStopSessionRetriesTheFailedSettlementSave covers the failed save
+// being read back: the settlement save's sync failed after the rename —
+// the settlement is visible at the record's final name without being on
+// the disk — and the next stop or sweep reads that content. The listing
+// finds the session's containers; whatever the record says, the
+// settlement goes out again, and the destruction runs only after a
+// successful save: while the sync fails, rm is not called at all.
+func TestStopSessionRetriesTheFailedSettlementSave(t *testing.T) {
+	fakeruntime.Install(t, t.TempDir())
+	dir := testSessionsDir(t)
+
+	// An unsettled record and its container in the runtime's state:
+	// the listing would find the container, so the settlement could
+	// confirm it. The lock first (as the owner would take it), then
+	// the record.
+	lock := mustAcquire(t, dir, "orphan")
+	issueDir, err := NewIssueDir("sidOrphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSaveRecord(t, dir, Record{Name: "orphan", ID: "sidOrphan", Runtime: "docker", IssueDir: issueDir})
+	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
+
+	// The save's sync fails after the rename: the settlement is
+	// visible at the record's final name without being on the
+	// disk. A stop or a sweep reading it back sees the container's
+	// creation settled and could skip the save.
+	real := util.SyncDir
+	defer func() { util.SyncDir = real }()
+	util.SyncDir = func(dirfd int) error { return errSaveSyncStopped }
+
+	// The immediate stop: the settlement save fails, and the removal
+	// does not run on it. No rm in the calls log; the container stays.
+	if err := StopSession(dir, "orphan", lock, true, false); err == nil {
+		t.Fatal("StopSession: want the settlement save's failure")
+	}
+	if rmCalled(t) {
+		t.Fatal("rm ran while the settlement save's sync fails")
+	}
+
+	// The next sweep reads the record back: the failed save's rename
+	// is visible, so the record says settled — the same elision would
+	// skip the save and destroy on what survived no save. Whatever
+	// the record says, the save goes out again, and the removal runs
+	// only after a successful one: no rm again.
+	if err := Sweep(dir); err == nil {
+		t.Fatal("Sweep: want the settlement save's failure")
+	}
+	if rmCalled(t) {
+		t.Fatal("rm ran while the settlement save's sync fails")
+	}
+
+	// The record stays for the next sweep, and the container stays
+	// with it: nothing was destroyed on the unsaved settlement.
+	if _, err := LoadRecord(dir, "orphan"); err != nil {
+		t.Fatalf("record did not survive the failed save: %v", err)
+	}
+	if state := stateText(t); !strings.Contains(state, "cidOrphan") {
+		t.Fatal("container did not survive the failed save")
+	}
+
+	// The sync succeeds: the next sweep runs the save, and the
+	// removal after it — rm, the record dropped, the containers
+	// gone.
+	util.SyncDir = real
+	if err := Sweep(dir); err != nil {
+		t.Fatalf("Sweep after the sync recovered: %v", err)
+	}
+	if !rmCalled(t) {
+		t.Fatal("rm did not run after the settlement save's sync recovered")
+	}
+	if _, err := LoadRecord(dir, "orphan"); err == nil {
+		t.Fatal("record survived the sweep after the sync recovered")
+	}
+	if state := stateText(t); strings.Contains(state, "cidOrphan") {
+		t.Fatal("container survived the sweep after the sync recovered")
+	}
+}
+
+// rmCalled reports whether the runtime's CLI was asked to remove
+// anything: the calls log carries every call the runtime received.
+func rmCalled(t *testing.T) bool {
+	t.Helper()
+	data, err := os.ReadFile(os.Getenv("SB_TEST_CALLS_LOG"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Contains(string(data), "\nrm -f ")
+}
+
+// errSaveSyncStopped is the failure the test injects into the record
+// save's sync: the settlement save's, after the rename.
+var errSaveSyncStopped = errors.New("save sync stopped for the test")
 
 // TestNewIssueDirFallsBackPerUser covers the issue dir's fallback: without
 // a usable XDG_RUNTIME_DIR, the issue dir lives under this user's own
