@@ -24,8 +24,8 @@ const testProxyPort = 16443
 
 func TestTargetsAllowReadWriteToIncludeRead(t *testing.T) {
 	targets := Targets{
-		{Mode: ReadWrite, Context: "pear", ClusterScope: true},
-		{Mode: Read, Context: "*", ClusterScope: true},
+		{Mode: ReadWrite, Context: "pear"},
+		{Mode: Read, Context: "*"},
 	}
 
 	tests := []struct {
@@ -43,7 +43,7 @@ func TestTargetsAllowReadWriteToIncludeRead(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := targets.Allows(tt.verb, tt.context, tt.namespace); got != tt.want {
+		if got := targets.Allows(tt.verb, tt.context, tt.namespace, false); got != tt.want {
 			t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.context, tt.namespace, got, tt.want)
 		}
 	}
@@ -59,32 +59,49 @@ func TestEmptyTargetsDenyAll(t *testing.T) {
 		{Read, "default"},
 		{ReadWrite, "default"},
 	} {
-		if targets.Allows(tt.verb, "pear", tt.namespace) {
+		if targets.Allows(tt.verb, "pear", tt.namespace, false) {
 			t.Fatalf("empty targets allowed (%q, %q)", tt.verb, tt.namespace)
 		}
 	}
 }
 
+// Regression: requests that access Secret resources are denied unless the
+// target grants them via secret: true in the config.
+func TestTargetsGateSecretsOnSecretField(t *testing.T) {
+	denied := Targets{{Mode: Read, Context: "dev"}}
+	granted := Targets{{Mode: Read, Context: "dev", Secret: true}}
+
+	if denied.Allows(Read, "dev", "default", true) {
+		t.Fatal("secret request allowed by a target without Secret")
+	}
+	if !denied.Allows(Read, "dev", "default", false) {
+		t.Fatal("non-secret request denied by a target without Secret")
+	}
+	if !granted.Allows(Read, "dev", "default", true) {
+		t.Fatal("secret request denied by a target with Secret")
+	}
+}
+
 func TestSetTargetsUpdatesPolicy(t *testing.T) {
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "proxy.local")
-	if !proxy.allows(Read, "dev", "") {
+	proxy := New(Targets{{Mode: Read, Context: "dev"}}, "proxy.local")
+	if !proxy.allows(Read, "dev", "", false) {
 		t.Fatal("initial target should be allowed")
 	}
 
-	proxy.SetTargets(Targets{{Mode: Read, Context: "prod", ClusterScope: true}})
+	proxy.SetTargets(Targets{{Mode: Read, Context: "prod"}})
 
-	if proxy.allows(Read, "dev", "") {
+	if proxy.allows(Read, "dev", "", false) {
 		t.Fatal("old context should be denied after SetTargets")
 	}
-	if !proxy.allows(Read, "prod", "") {
+	if !proxy.allows(Read, "prod", "", false) {
 		t.Fatal("new context should be allowed after SetTargets")
 	}
 }
 
 func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
-	targets := Targets{{Mode: ReadWrite, Context: "pear", ClusterScope: true}}
+	targets := Targets{{Mode: ReadWrite, Context: "pear"}}
 
-	if got := targets.Allows(Read, "Pear", "default"); got {
+	if got := targets.Allows(Read, "Pear", "default", false); got {
 		t.Fatalf("Allows(%q, %q) = %v, want false", Read, "Pear", got)
 	}
 }
@@ -92,7 +109,7 @@ func TestTargetsAllowContextIsCaseSensitive(t *testing.T) {
 func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
 	targets := Targets{
 		{Mode: ReadWrite, Context: "prod", Namespaces: []string{"team-*"}},
-		{Mode: Read, Context: "*", ClusterScope: true},
+		{Mode: Read, Context: "*"},
 	}
 
 	tests := []struct {
@@ -111,7 +128,7 @@ func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := targets.Allows(tt.verb, tt.context, tt.namespace); got != tt.want {
+			if got := targets.Allows(tt.verb, tt.context, tt.namespace, false); got != tt.want {
 				t.Fatalf("Allows(%q, %q, %q) = %v, want %v", tt.verb, tt.context, tt.namespace, got, tt.want)
 			}
 		})
@@ -123,14 +140,14 @@ func TestTargetsAllowsNamespaceRestriction(t *testing.T) {
 // another context to the same cluster allows it.
 func TestTargetsIsolateSameClusterDifferentContexts(t *testing.T) {
 	targets := Targets{
-		{Mode: ReadWrite, Context: "dev", ClusterScope: true},
-		{Mode: Read, Context: "prod", ClusterScope: true},
+		{Mode: ReadWrite, Context: "dev"},
+		{Mode: Read, Context: "prod"},
 	}
 
-	if !targets.Allows(ReadWrite, "dev", "") {
+	if !targets.Allows(ReadWrite, "dev", "", false) {
 		t.Fatal("dev context should allow read-write")
 	}
-	if targets.Allows(ReadWrite, "prod", "") {
+	if targets.Allows(ReadWrite, "prod", "", false) {
 		t.Fatal("prod context should deny read-write even though dev shares its cluster")
 	}
 }
@@ -162,7 +179,7 @@ func TestRequestVerbClassifiesKubernetesActions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := classifyRequest(tt.method, tt.path); got != tt.want {
+			if got, _, _ := classifyRequest(tt.method, tt.path); got != tt.want {
 				t.Fatalf("classifyRequest(%q, %q) verb = %q, want %q", tt.method, tt.path, got, tt.want)
 			}
 		})
@@ -185,7 +202,7 @@ func TestClassifyRequestNamespace(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, got := classifyRequest(tt.method, tt.path); got != tt.want {
+			if _, got, _ := classifyRequest(tt.method, tt.path); got != tt.want {
 				t.Fatalf("classifyRequest(%q, %q) namespace = %q, want %q", tt.method, tt.path, got, tt.want)
 			}
 		})
@@ -451,7 +468,7 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 }
 
 func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
-	proxy := New(Targets{{Mode: ReadWrite, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: ReadWrite, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev", nil)
@@ -465,7 +482,7 @@ func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
 }
 
 func TestServeRejectsInvalidToken(t *testing.T) {
-	proxy := New(Targets{{Mode: ReadWrite, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: ReadWrite, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev/api", nil)
@@ -475,6 +492,65 @@ func TestServeRejectsInvalidToken(t *testing.T) {
 	proxy.serveHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+// Regression: the proxy must reject requests that access Secret resources
+// unless the policy grants them (secret: true).
+func TestServeRejectsSecretsWithoutPermission(t *testing.T) {
+	proxy := New(Targets{{Mode: ReadWrite, Context: "dev"}}, "localhost")
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.local/dev/api/v1/namespaces/default/secrets", nil)
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	rec := httptest.NewRecorder()
+
+	proxy.serveHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (Secrets denied without secret: true)", rec.Code, http.StatusForbidden)
+	}
+}
+
+// Regression: with secret: true, Secret requests pass through to the
+// upstream cluster.
+func TestServeAllowsSecretsWithPermission(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/namespaces/default/secrets" {
+			t.Fatalf("upstream path = %q, want /api/v1/namespaces/default/secrets", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{{Mode: Read, Context: "dev", Secret: true}}, "localhost")
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	req, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/dev/api/v1/namespaces/default/secrets", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer downstream-token")
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	req.URL.Scheme = "https"
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 }
 
@@ -494,7 +570,7 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: Read, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -539,8 +615,8 @@ func TestServeIsolatesSameClusterDifferentContexts(t *testing.T) {
 	writeSharedClusterSourceKubeconfig(t, sourcePath, upstream.URL)
 
 	proxy := New(Targets{
-		{Mode: ReadWrite, Context: "dev", ClusterScope: true},
-		{Mode: Read, Context: "prod", ClusterScope: true},
+		{Mode: ReadWrite, Context: "dev"},
+		{Mode: Read, Context: "prod"},
 	}, "localhost")
 	proxy.tokens = map[string]string{"dev-token": "dev", "prod-token": "prod"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -597,7 +673,7 @@ func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, idToken)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: Read, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -638,7 +714,7 @@ func TestServeProxiesOIDCAuthProviderPerContext(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCMultiContextSourceKubeconfig(t, sourcePath, upstream.URL, adminToken, pfnToken)
 
-	proxy := New(Targets{{Mode: Read, Context: "*", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: Read, Context: "*"}}, "localhost")
 	proxy.tokens = map[string]string{
 		"downstream-admin-token": "pfcp-yh1-01",
 		"downstream-pfn-token":   "pfcp-pfn-yh1-01",
@@ -698,7 +774,7 @@ func TestServeRefreshesOIDCAuthProviderAndPersistsUpstreamConfig(t *testing.T) {
 	issuerCA := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.Certificate().Raw})
 	writeOIDCRefreshSourceKubeconfig(t, sourcePath, upstream.URL, issuer.URL, base64.StdEncoding.EncodeToString(issuerCA), testIDToken(t, time.Now().Add(-time.Hour)))
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: Read, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -741,7 +817,7 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, oldToken)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: Read, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -867,7 +943,7 @@ func TestServeTLSVerifiedAgainstEmbeddedCA(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(Targets{{Mode: Read, Context: "dev", ClusterScope: true}}, "localhost")
+	proxy := New(Targets{{Mode: Read, Context: "dev"}}, "localhost")
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	content, _, err := proxy.renderKubeconfig(testProxyPort, []kubeconfigContext{{Name: "dev"}}, "dev")
 	if err != nil {

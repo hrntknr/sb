@@ -7,9 +7,9 @@ import (
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
-// forwardChannel bridges a downstream channel to the upstream, filtering
-// downstream requests through allow when non-nil.
-func forwardChannel(upstream *cryptossh.Client, ch cryptossh.NewChannel, allow func(*cryptossh.Request) bool) {
+// forwardChannel bridges a downstream channel to the upstream, relaying
+// downstream requests.
+func forwardChannel(upstream *cryptossh.Client, ch cryptossh.NewChannel) {
 	remote, remoteRequests, err := upstream.OpenChannel(ch.ChannelType(), ch.ExtraData())
 	if err != nil {
 		ch.Reject(cryptossh.ConnectionFailed, err.Error())
@@ -25,7 +25,7 @@ func forwardChannel(upstream *cryptossh.Client, ch cryptossh.NewChannel, allow f
 	// still on its way back to the downstream client.
 	var pending sync.WaitGroup
 	go func() {
-		forwardRequests(localRequests, remote, allow, &pending)
+		forwardRequests(localRequests, remote, &pending)
 		// The downstream channel closed; close the upstream too so remote
 		// commands do not outlive the client that started them.
 		_ = remote.Close()
@@ -38,38 +38,53 @@ func forwardChannel(upstream *cryptossh.Client, ch cryptossh.NewChannel, allow f
 // channel is closed only after the upstream channel closed and in-flight
 // requests finished, so requests the upstream sent before closing
 // (exit-status, exit-signal) are always delivered first; without this,
-// clients miss the remote exit status and report the session as a connection
-// failure.
+// clients miss the remote exit status and report the session as a
+// connection failure.
+//
+// CloseWrite marks a channel EOF, and any later WriteExtended on that
+// channel returns io.EOF and drops the data. Each side therefore waits
+// for all of its writers before closing for write: without this, stderr
+// relayed by the slower copy is silently lost.
 func pipe(local, remote cryptossh.Channel, upstreamRequests <-chan *cryptossh.Request, pending *sync.WaitGroup) {
+	var toRemote sync.WaitGroup
+	toRemote.Add(2)
 	go func() {
+		defer toRemote.Done()
 		_, _ = io.Copy(remote, local)
+	}()
+	go func() {
+		defer toRemote.Done()
+		_, _ = io.Copy(remote.Stderr(), local.Stderr())
+	}()
+	go func() {
+		toRemote.Wait()
 		_ = remote.CloseWrite()
 	}()
 	relayed := make(chan struct{})
+	stderr := make(chan struct{})
 	go func() {
 		for req := range upstreamRequests {
 			forwardRequest(local, req)
 		}
 		close(relayed)
 	}()
+	go func() {
+		_, _ = io.Copy(local.Stderr(), remote.Stderr())
+		close(stderr)
+	}()
 	_, _ = io.Copy(local, remote)
-	_ = local.CloseWrite()
 	<-relayed
+	<-stderr
+	_ = local.CloseWrite()
 	pending.Wait()
 	_ = local.Close()
 	_ = remote.Close()
 }
 
-func forwardRequests(requests <-chan *cryptossh.Request, channel cryptossh.Channel, allow func(*cryptossh.Request) bool, pending *sync.WaitGroup) {
+func forwardRequests(requests <-chan *cryptossh.Request, channel cryptossh.Channel, pending *sync.WaitGroup) {
 	for req := range requests {
 		pending.Add(1)
-		if allow != nil && !allow(req) {
-			if req.WantReply {
-				req.Reply(false, nil)
-			}
-		} else {
-			forwardRequest(channel, req)
-		}
+		forwardRequest(channel, req)
 		pending.Done()
 	}
 }
@@ -83,17 +98,9 @@ func forwardRequest(channel cryptossh.Channel, req *cryptossh.Request) {
 
 // forwardGlobalRequests relays connection-global requests (remote port
 // forwarding, keepalives) to the upstream connection, including reply
-// payloads such as the port assigned by "tcpip-forward 0". When forwarding
-// is not allowed, requests are rejected so remote forwarding does not
-// silently pass.
-func forwardGlobalRequests(requests <-chan *cryptossh.Request, upstream *cryptossh.Client, allow bool) {
+// payloads such as the port assigned by "tcpip-forward 0".
+func forwardGlobalRequests(requests <-chan *cryptossh.Request, upstream *cryptossh.Client) {
 	for req := range requests {
-		if !allow {
-			if req.WantReply {
-				req.Reply(false, nil)
-			}
-			continue
-		}
 		ok, payload, err := upstream.SendRequest(req.Type, req.WantReply, req.Payload)
 		if req.WantReply {
 			req.Reply(err == nil && ok, payload)

@@ -156,9 +156,19 @@ func dialUpstream(config sshConfig, agentSocketPath string) (*cryptossh.Client, 
 		return nil, config.wrapError(err)
 	}
 	if config.ProxyCommand != "" && !strings.EqualFold(config.ProxyCommand, "none") {
-		return config.wrapClient(dialUpstreamProxyCommand(config.ProxyCommand, config.matchAddr(), clientConfig))
+		return config.wrapClient(dialUpstreamProxyCommand(expandProxyCommand(config.ProxyCommand, config), config.matchAddr(), clientConfig))
 	}
 	return config.wrapClient(cryptossh.Dial("tcp", config.Addr(), clientConfig))
+}
+
+// expandProxyCommand replaces the ssh tokens in a ProxyCommand: %%,
+// %h (the resolved target hostname), %p (the port), and %r (the remote
+// username).
+func expandProxyCommand(command string, config sshConfig) string {
+	if command == "" {
+		return command
+	}
+	return strings.NewReplacer("%%", "%", "%h", config.Host, "%p", config.Port, "%r", config.User).Replace(command)
 }
 
 func (c sshConfig) Addr() string {

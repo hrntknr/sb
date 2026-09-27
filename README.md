@@ -72,21 +72,17 @@ By default the config is read from `$XDG_CONFIG_HOME/sb/config.yaml` (typically 
 
 ```yaml
 ssh:
-  - host: github.com            # omitting commands allows everything, including shell and port forwarding
+  - host: github.com
   - host: "*.hrntknr.net"
-  - host: "*"
-    commands:                   # restrict to specific commands
-      - cat
-      - ls
-      - kubectl get
 k8s:
   - context: pear               # kubeconfig context names
     mode: rw                    # r (read-only) / rw (read-write)
+    secret: false               # allow Secret access; default false
   - context: test
     mode: rw
   - context: "*"
     mode: r
-    namespace: default          # omit for cluster scope
+    namespace: default          # omit for every namespace (and cluster scope)
 aws:
   - profile: dev                 # source AWS profile name
     roleArn: arn:aws:iam::123456789012:role/sb-dev
@@ -102,9 +98,9 @@ proxy:
   sshAgentEnv: ~/.cache/sb-agent.env
 ```
 
-`host`, `context`, `namespace`, and `commands` all support glob patterns (`*` matches any string, `?` matches a single character). `commands` is split into tokens and each token is matched.
+`host`, `context`, and `namespace` support glob patterns (`*` matches any string, `?` matches a single character).
 
-SSH `host` rules match the `HostName` resolved by `ssh -G` on the machine running sb, not the alias typed by the client. For example, `Host gw` with `HostName g.hrntknr.net` matches a policy for `*.hrntknr.net`.
+SSH `host` rules match the `HostName` resolved by `ssh -G` on the machine running sb, not the alias typed by the client. For example, `Host gw` with `HostName g.hrntknr.net` matches a policy for `*.hrntknr.net`. Connections to hosts that no longer match any target are closed when the config reloads.
 
 ### Container: `container`
 
@@ -136,7 +132,7 @@ $ sb run -- claude --settings '{"sandbox":{"enabled":false}}'
 
 Entries from `conf.d/` are merged: `runtime` and `image` are overridden by later files, and `mounts` and `environments` are appended with exact duplicates removed.
 
-k8s policy is keyed by **kubeconfig context name**. Contexts that point at the same cluster are isolated from each other, so granting `rw` to the `dev` context does not grant `rw` to a `prod` context even when both use the same cluster.
+k8s policy is keyed by **kubeconfig context name**. Contexts that point at the same cluster are isolated from each other, so granting `rw` to the `dev` context does not grant `rw` to a `prod` context even when both use the same cluster. A `namespace` restricts the target to that namespace and disables cluster scope (non-namespaced resources and non-resource requests like API discovery); omitting it grants every namespace and cluster scope. `secret: true` additionally allows Secret access (get/list Secret resources); without it, requests that access Secret resources are denied.
 
 ### AWS profiles
 

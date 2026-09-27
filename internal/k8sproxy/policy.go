@@ -15,19 +15,23 @@ const (
 
 // Target grants Mode access to kubeconfig contexts matching the Context glob.
 // Policy is keyed by context name, so contexts that point at the same cluster
-// are isolated from each other. A nil Namespaces allows any namespace;
-// otherwise only listed namespace globs are allowed. ClusterScope permits
-// cluster-scoped (non-namespaced) requests.
+// are isolated from each other. A nil Namespaces allows any namespace and
+// cluster-scoped requests; otherwise only listed namespace globs are
+// allowed and cluster-scoped requests are denied. Secret (when false) denies
+// access to Secret resources.
 type Target struct {
-	Mode         Verb
-	Context      string
-	Namespaces   []string
-	ClusterScope bool
+	Mode       Verb
+	Context    string
+	Namespaces []string
+	Secret     bool
 }
 
 type Targets []Target
 
-func (t Targets) Allows(verb Verb, context, namespace string) bool {
+// Allows reports whether verb is granted to context. secret marks requests
+// that access Secret resources, which the policy additionally gates on
+// Secret.
+func (t Targets) Allows(verb Verb, context, namespace string, secret bool) bool {
 	context = strings.TrimSpace(context)
 	namespace = strings.TrimSpace(namespace)
 	for _, rule := range t {
@@ -37,8 +41,13 @@ func (t Targets) Allows(verb Verb, context, namespace string) bool {
 		if !util.Match(rule.Context, context) {
 			continue
 		}
+		if secret && !rule.Secret {
+			continue
+		}
 		if namespace == "" {
-			if rule.ClusterScope {
+			// Cluster-scoped and non-resource requests: allowed only by
+			// targets granted every namespace.
+			if rule.Namespaces == nil {
 				return true
 			}
 			continue

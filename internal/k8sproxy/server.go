@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 
@@ -62,12 +63,13 @@ func (p *Proxy) SetTargets(targets Targets) {
 	p.mu.Unlock()
 }
 
-// allows reports whether the current policy permits the request.
-func (p *Proxy) allows(verb Verb, context, namespace string) bool {
+// allows reports whether the current policy permits the request. secret
+// marks requests that access Secret resources.
+func (p *Proxy) allows(verb Verb, context, namespace string, secret bool) bool {
 	p.mu.RLock()
 	targets := p.Targets
 	p.mu.RUnlock()
-	return targets.Allows(verb, context, namespace)
+	return targets.Allows(verb, context, namespace, secret)
 }
 
 func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -86,8 +88,8 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request path", http.StatusBadRequest)
 		return
 	}
-	verb, namespace := classifyRequest(r.Method, upstreamPath)
-	if !p.allows(verb, context, namespace) {
+	verb, namespace, resource := classifyRequest(r.Method, upstreamPath)
+	if !p.allows(verb, context, namespace, resource == "secrets") {
 		slog.Warn("rejected k8s request by policy", "context", context, "method", r.Method, "path", upstreamPath)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
@@ -134,7 +136,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.Out.URL.Scheme = target.Scheme
 			req.Out.URL.Host = target.Host
-			req.Out.URL.Path = upstreamPath
+			req.Out.URL.Path = path.Join(target.Path, upstreamPath)
 			req.Out.Host = target.Host
 			req.Out.Header.Del("Authorization")
 			if config.BearerToken != "" {
@@ -171,33 +173,34 @@ func oidcCacheHost(host, context string, authProviderConfig map[string]string) s
 	return host + "#" + url.PathEscape(context) + ":" + hex.EncodeToString(hash.Sum(nil))
 }
 
-// classifyRequest maps a request to its policy verb and namespace. Read covers
-// get/list/watch and self-subject access reviews; everything else (including
+// classifyRequest maps a request to its policy verb, namespace, and
+// resource name (empty for non-resource requests). Read covers get/list/watch
+// and self-subject access reviews; everything else (including
 // exec/attach/portforward/proxy subresources) is read-write.
-func classifyRequest(method, path string) (Verb, string) {
+func classifyRequest(method, path string) (Verb, string, string) {
 	info, err := requestInfoFactory.NewRequestInfo(&http.Request{
 		Method: method,
 		URL:    &url.URL{Path: path},
 	})
 	if err != nil || !info.IsResourceRequest {
 		if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
-			return Read, ""
+			return Read, "", ""
 		}
-		return ReadWrite, ""
+		return ReadWrite, "", ""
 	}
 
 	if info.APIGroup == "authorization.k8s.io" && info.Resource == "selfsubjectaccessreviews" && info.Verb == "create" {
-		return Read, info.Namespace
+		return Read, info.Namespace, info.Resource
 	}
 	switch info.Subresource {
 	case "attach", "exec", "portforward", "proxy":
-		return ReadWrite, info.Namespace
+		return ReadWrite, info.Namespace, info.Resource
 	}
 	switch info.Verb {
 	case "get", "list", "watch":
-		return Read, info.Namespace
+		return Read, info.Namespace, info.Resource
 	default:
-		return ReadWrite, info.Namespace
+		return ReadWrite, info.Namespace, info.Resource
 	}
 }
 

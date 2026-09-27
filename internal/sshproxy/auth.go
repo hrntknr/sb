@@ -11,18 +11,21 @@ import (
 )
 
 // upstreamAuthMethods collects public key auth from the identity files and
-// certificates and the ssh-agent listening on agentSocketPath. The returned
-// agent connection (if any) must be closed once the upstream handshake is
-// done; the signers sign through it.
+// certificates and the ssh-agent listening on agentSocketPath. All signers
+// are offered in one method: x/crypto skips an auth method name once it
+// failed, so separate publickey methods would never fall through to the
+// agent keys. The returned agent connection (if any) must be closed once
+// the upstream handshake is done; the signers sign through it.
 func upstreamAuthMethods(config sshConfig, agentSocketPath string) ([]cryptossh.AuthMethod, net.Conn, error) {
 	identitySigners := identityFileSigners(config.IdentityFiles)
 	agentSigners, agentConn := sshAgentSigners(agentSocketPath)
 	signers := append(append([]cryptossh.Signer{}, identitySigners...), agentSigners...)
 
+	certs := certificateSigners(signers, config.CertificateFiles)
+	all := append(append(append([]cryptossh.Signer{}, certs...), identitySigners...), agentSigners...)
+
 	var auth []cryptossh.AuthMethod
-	auth = appendPublicKeys(auth, certificateSigners(signers, config.CertificateFiles))
-	auth = appendPublicKeys(auth, identitySigners)
-	auth = appendPublicKeys(auth, agentSigners)
+	auth = appendPublicKeys(auth, all)
 	if len(auth) == 0 {
 		if agentConn != nil {
 			agentConn.Close()

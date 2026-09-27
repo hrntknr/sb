@@ -177,8 +177,9 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 	for _, mount := range mounts {
 		args = append(args, "-v", mount)
 	}
+	args = append(args, "-i")
 	if tty {
-		args = append(args, "-i", "-t")
+		args = append(args, "-t")
 	}
 	return append(append(args, image), userArgs...)
 }
@@ -188,9 +189,9 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 // accepts as the container identifier for exec. workdir, when non-empty,
 // sets the working directory (-w/--workdir).
 func ExecArgs(name, workdir string, tty bool, command []string) []string {
-	args := []string{"exec"}
+	args := []string{"exec", "-i"}
 	if tty {
-		args = append(args, "-i", "-t")
+		args = append(args, "-t")
 	}
 	if workdir != "" {
 		args = append(args, "-w", workdir)

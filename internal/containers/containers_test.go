@@ -72,7 +72,7 @@ func TestArgs(t *testing.T) {
 			userArgs: []string{"zsh", "-l"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
-				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+				"-i", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
 			name:     "podman without tty",
@@ -83,7 +83,7 @@ func TestArgs(t *testing.T) {
 			userArgs: []string{"npm", "install"},
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
-				"ghcr.io/hrntknr/sh:full", "npm", "install"},
+				"-i", "ghcr.io/hrntknr/sh:full", "npm", "install"},
 		},
 		{
 			name:     "apple tty with a command",
@@ -118,7 +118,7 @@ func TestArgs(t *testing.T) {
 			image:   "ghcr.io/hrntknr/sh:full",
 			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
-				"ghcr.io/hrntknr/sh:full"},
+				"-i", "ghcr.io/hrntknr/sh:full"},
 		},
 	}
 	for _, tt := range tests {
@@ -141,8 +141,8 @@ func TestExecArgs(t *testing.T) {
 		want    []string
 	}{
 		{"tty", "dev", "", true, []string{"zsh", "-l"}, []string{"exec", "-i", "-t", "dev", "zsh", "-l"}},
-		{"no tty", "dev", "", false, []string{"kubectl", "get", "pods"}, []string{"exec", "dev", "kubectl", "get", "pods"}},
-		{"workdir", "dev", "/work", false, []string{"pwd"}, []string{"exec", "-w", "/work", "dev", "pwd"}},
+		{"no tty", "dev", "", false, []string{"kubectl", "get", "pods"}, []string{"exec", "-i", "dev", "kubectl", "get", "pods"}},
+		{"workdir", "dev", "/work", false, []string{"pwd"}, []string{"exec", "-i", "-w", "/work", "dev", "pwd"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

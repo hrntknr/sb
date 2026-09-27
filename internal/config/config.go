@@ -68,14 +68,14 @@ type file struct {
 }
 
 type sshTarget struct {
-	Host     string   `yaml:"host"`
-	Commands []string `yaml:"commands"`
+	Host string `yaml:"host"`
 }
 
 type k8sTarget struct {
 	Context   string `yaml:"context"`
 	Mode      string `yaml:"mode"`
 	Namespace string `yaml:"namespace"`
+	Secret    bool   `yaml:"secret"`
 }
 
 type awsTarget struct {
@@ -182,17 +182,7 @@ func build(f file) (Config, error) {
 		if strings.TrimSpace(item.Host) == "" {
 			return Config{}, fmt.Errorf("ssh target %d: host is required", i)
 		}
-		target := sshproxy.Target{Host: item.Host}
-		if len(item.Commands) > 0 {
-			target.Commands = item.Commands
-		} else {
-			// No command restriction: allow everything including shell and
-			// port forwarding.
-			target.Commands = []string{"*"}
-			target.Shell = true
-			target.Forward = true
-		}
-		ssh = append(ssh, target)
+		ssh = append(ssh, sshproxy.Target{Host: item.Host})
 	}
 
 	k8s := make([]k8sproxy.Target, 0, len(f.K8s))
@@ -209,11 +199,9 @@ func build(f file) (Config, error) {
 		default:
 			return Config{}, fmt.Errorf("k8s target %d: invalid mode %q", i, item.Mode)
 		}
-		target := k8sproxy.Target{Mode: mode, Context: item.Context}
+		target := k8sproxy.Target{Mode: mode, Context: item.Context, Secret: item.Secret}
 		if namespace := strings.TrimSpace(item.Namespace); namespace != "" {
 			target.Namespaces = []string{namespace}
-		} else {
-			target.ClusterScope = true
 		}
 		k8s = append(k8s, target)
 	}

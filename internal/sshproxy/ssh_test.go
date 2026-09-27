@@ -3,6 +3,7 @@ package sshproxy
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,10 +16,10 @@ import (
 
 const testProxyPort = 12222
 
-func TestCapabilityHostGlobs(t *testing.T) {
+func TestAllowsHostGlobs(t *testing.T) {
 	targets := Targets{
-		{Host: "github.com", Shell: true, Forward: true},
-		{Host: "*.example.net", Shell: true, Forward: true},
+		{Host: "github.com"},
+		{Host: "*.example.net"},
 	}
 
 	tests := []struct {
@@ -32,89 +33,73 @@ func TestCapabilityHostGlobs(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		if got := !targets.Capability(tt.host).Empty(); got != tt.want {
-			t.Fatalf("Capability(%q) non-empty = %v, want %v", tt.host, got, tt.want)
+		if got := targets.Allows(tt.host); got != tt.want {
+			t.Fatalf("Allows(%q) = %v, want %v", tt.host, got, tt.want)
 		}
-	}
-}
-
-func TestCapabilityAllowsExec(t *testing.T) {
-	targets := Targets{
-		{Host: "github.com", Commands: []string{"*"}, Shell: true, Forward: true},
-		{Host: "*", Commands: []string{"cat", "kubectl get"}},
-	}
-
-	tests := []struct {
-		host    string
-		command string
-		want    bool
-	}{
-		{"github.com", "git-upload-pack 'repo.git'", true}, // "*" allows any command
-		{"node.internal", "cat /etc/hosts", true},
-		{"node.internal", "cat", true},
-		{"node.internal", "cata /etc/hosts", false},    // first token must match exactly
-		{"node.internal", "kubectl get pods", true},    // multi-token pattern
-		{"node.internal", "kubectl delete pod", false}, // subcommand not allowed
-		{"node.internal", "kubectl", false},            // too few tokens for pattern
-		{"node.internal", "rm -rf /", false},
-		{"node.internal", "cat a && cat b", true}, // every sub-command allowed
-		{"node.internal", "cat a | kubectl get pods", true},
-		{"node.internal", "cat a; rm -rf /", false}, // one sub-command denied
-		{"node.internal", "cat a && kubectl delete x", false},
-		{"node.internal", "cat $(rm -rf /)", false}, // command substitution evaluated
-		{"node.internal", "cat `rm -rf /`", false},  // backtick substitution evaluated
-		{"node.internal", "(cat a; rm b)", false},   // subshell evaluated
-		{"node.internal", "cat 'a b'", true},        // quoting handled
-		{"node.internal", "$CMD a", false},          // non-literal command name denied
-		{"node.internal", "cat a > out", false},     // write redirection denied
-		{"node.internal", "cat a >> out", false},    // append redirection denied
-		{"node.internal", "cat < in", false},        // read redirection denied
-		{"node.internal", "cat a && kubectl get pods", true},
-		{"node.internal", "cat &&", false}, // parse error
-		{"node.internal", "", false},
-	}
-
-	for _, tt := range tests {
-		if got := targets.Capability(tt.host).AllowsExec(tt.command); got != tt.want {
-			t.Fatalf("Capability(%q).AllowsExec(%q) = %v, want %v", tt.host, tt.command, got, tt.want)
-		}
-	}
-}
-
-func TestCapabilityShellAndForwardOnlyWhenUnrestricted(t *testing.T) {
-	targets := Targets{
-		{Host: "github.com", Shell: true, Forward: true},
-		{Host: "*", Commands: []string{"cat"}},
-	}
-
-	if c := targets.Capability("github.com"); !c.Shell || !c.Forward {
-		t.Fatalf("Capability(github.com) = %+v, want shell and forward", c)
-	}
-	if c := targets.Capability("node.internal"); c.Shell || c.Forward {
-		t.Fatalf("Capability(node.internal) = %+v, want no shell/forward", c)
 	}
 }
 
 func TestEmptyTargetsDenyAll(t *testing.T) {
 	var targets Targets
-	if c := targets.Capability("github.com"); !c.Empty() {
-		t.Fatalf("empty targets produced capability: %+v", c)
+	if targets.Allows("github.com") {
+		t.Fatal("empty targets allowed github.com")
 	}
 }
 
 func TestSetTargetsUpdatesPolicy(t *testing.T) {
-	proxy := New(Targets{{Host: "a.example", Commands: []string{"*"}}}, nil)
-	if proxy.capability("a.example").Empty() {
+	proxy := New(Targets{{Host: "a.example"}}, nil)
+	if !proxy.targetAllows("a.example") {
 		t.Fatal("initial target should be allowed")
 	}
 
-	proxy.SetTargets(Targets{{Host: "b.example", Commands: []string{"*"}}})
+	proxy.SetTargets(Targets{{Host: "b.example"}})
 
-	if !proxy.capability("a.example").Empty() {
+	if proxy.targetAllows("a.example") {
 		t.Fatal("old target should be denied after SetTargets")
 	}
-	if proxy.capability("b.example").Empty() {
+	if !proxy.targetAllows("b.example") {
 		t.Fatal("new target should be allowed after SetTargets")
+	}
+}
+
+// SetTargets must close tracked connections whose host no longer matches any
+// target, so a revoked host cannot keep using the proxy.
+func TestSetTargetsClosesExistingConnections(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	revoked, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	kept, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+
+	// Both hosts are allowed initially; only b.example survives the reload.
+	proxy := New(Targets{{Host: "*.example"}}, nil)
+	if !proxy.trackConn(revoked, "a.example") {
+		t.Fatal("initial target should be allowed")
+	}
+	if !proxy.trackConn(kept, "b.example") {
+		t.Fatal("initial wildcard target should be allowed")
+	}
+
+	proxy.SetTargets(Targets{{Host: "b.example"}})
+
+	buf := make([]byte, 1)
+	if _, err := revoked.Read(buf); err == nil {
+		t.Fatal("the revoked connection should be closed")
+	}
+	if err := kept.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	if _, err := kept.Read(buf); !os.IsTimeout(err) {
+		t.Fatalf("kept connection read error = %v, want read timeout (still open)", err)
 	}
 }
 
@@ -400,13 +385,13 @@ func TestResolveTargetMatchesResolvedHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
-	proxy := New(Targets{{Host: "*.example.net", Commands: []string{"cat"}}}, nil)
-	cfg, capability, ok := proxy.resolveTarget("proxy-ssh alice gw 22")
-	if !ok || cfg.Host != "gateway.example.net" || cfg.RequestedHost != "gw" || !capability.AllowsExec("cat /etc/hosts") {
-		t.Fatalf("resolveTarget() = %+v, %+v, %v", cfg, capability, ok)
+	proxy := New(Targets{{Host: "*.example.net"}}, nil)
+	cfg, ok := proxy.resolveTarget("proxy-ssh alice gw 22")
+	if !ok || cfg.Host != "gateway.example.net" || cfg.RequestedHost != "gw" {
+		t.Fatalf("resolveTarget() = %+v, %v", cfg, ok)
 	}
-	proxy.SetTargets(Targets{{Host: "gw", Commands: []string{"*"}}})
-	if _, _, ok := proxy.resolveTarget("proxy-ssh alice gw 22"); ok {
+	proxy.SetTargets(Targets{{Host: "gw"}})
+	if _, ok := proxy.resolveTarget("proxy-ssh alice gw 22"); ok {
 		t.Fatal("requested alias granted access to an unlisted resolved hostname")
 	}
 }

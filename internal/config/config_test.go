@@ -217,13 +217,15 @@ func TestLoadMainOnly(t *testing.T) {
 ssh:
   - host: github.com
   - host: "*.example.net"
-    commands: [cat]
 k8s:
   - context: dev
     mode: r
   - context: prod
     mode: rw
     namespace: default
+  - context: stage
+    mode: r
+    secret: true
 `)
 
 	cfg, err := Load(path)
@@ -237,21 +239,21 @@ k8s:
 	if cfg.SSH[0].Host != "github.com" {
 		t.Errorf("SSH[0] = %+v, want Host=github.com", cfg.SSH[0])
 	}
-	if !cfg.SSH[0].Shell || !cfg.SSH[0].Forward {
-		t.Errorf("SSH[0] unrestricted should enable shell/forward, got %+v", cfg.SSH[0])
-	}
-	if cfg.SSH[1].Host != "*.example.net" || len(cfg.SSH[1].Commands) != 1 || cfg.SSH[1].Commands[0] != "cat" {
-		t.Errorf("SSH[1] = %+v, want *.example.net with [cat]", cfg.SSH[1])
+	if cfg.SSH[1].Host != "*.example.net" {
+		t.Errorf("SSH[1] = %+v, want Host=*.example.net", cfg.SSH[1])
 	}
 
-	if len(cfg.K8s) != 2 {
-		t.Fatalf("K8s len = %d, want 2", len(cfg.K8s))
+	if len(cfg.K8s) != 3 {
+		t.Fatalf("K8s len = %d, want 3", len(cfg.K8s))
 	}
-	if cfg.K8s[0].Context != "dev" || cfg.K8s[0].Mode != k8sproxy.Read || !cfg.K8s[0].ClusterScope {
-		t.Errorf("K8s[0] = %+v", cfg.K8s[0])
+	if cfg.K8s[0].Context != "dev" || cfg.K8s[0].Mode != k8sproxy.Read || cfg.K8s[0].Namespaces != nil {
+		t.Errorf("K8s[0] = %+v, want dev/r without a namespace", cfg.K8s[0])
 	}
-	if cfg.K8s[1].Context != "prod" || cfg.K8s[1].Mode != k8sproxy.ReadWrite {
-		t.Errorf("K8s[1] = %+v", cfg.K8s[1])
+	if cfg.K8s[1].Context != "prod" || cfg.K8s[1].Mode != k8sproxy.ReadWrite || len(cfg.K8s[1].Namespaces) != 1 || cfg.K8s[1].Namespaces[0] != "default" {
+		t.Errorf("K8s[1] = %+v, want prod/rw restricted to default", cfg.K8s[1])
+	}
+	if !cfg.K8s[2].Secret {
+		t.Errorf("K8s[2].Secret = false, want true")
 	}
 }
 
@@ -268,7 +270,6 @@ k8s:
 	writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), `
 ssh:
   - host: github.com
-    commands: [cat]
   - host: internal.example
 k8s:
   - context: dev
@@ -289,12 +290,6 @@ k8s:
 	if cfg.SSH[0].Host != "github.com" {
 		t.Errorf("SSH[0].Host = %q, want github.com", cfg.SSH[0].Host)
 	}
-	if len(cfg.SSH[0].Commands) != 1 || cfg.SSH[0].Commands[0] != "cat" {
-		t.Errorf("SSH[0] = %+v, want overridden with [cat]", cfg.SSH[0])
-	}
-	if cfg.SSH[0].Shell || cfg.SSH[0].Forward {
-		t.Errorf("SSH[0] shell/forward should be false after override, got %+v", cfg.SSH[0])
-	}
 	if cfg.SSH[1].Host != "*.hrntknr.net" {
 		t.Errorf("SSH[1].Host = %q, want *.hrntknr.net", cfg.SSH[1].Host)
 	}
@@ -308,38 +303,40 @@ k8s:
 	if cfg.K8s[0].Context != "dev" || cfg.K8s[0].Mode != k8sproxy.ReadWrite {
 		t.Errorf("K8s[0] = %+v, want dev rw", cfg.K8s[0])
 	}
-	if cfg.K8s[1].Context != "prod" || cfg.K8s[1].Mode != k8sproxy.Read {
-		t.Errorf("K8s[1] = %+v, want prod r", cfg.K8s[1])
+	if cfg.K8s[1].Context != "prod" || cfg.K8s[1].Mode != k8sproxy.Read || len(cfg.K8s[1].Namespaces) != 1 || cfg.K8s[1].Namespaces[0] != "default" {
+		t.Errorf("K8s[1] = %+v, want prod r restricted to default", cfg.K8s[1])
 	}
 }
 
 func TestLoadConfDOrderedAlphabetically(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "config.yaml"), `
-ssh:
-  - host: github.com
-    commands: [cat]
+k8s:
+  - context: dev
+    mode: r
 `)
 	writeFile(t, filepath.Join(dir, "conf.d", "a.yaml"), `
-ssh:
-  - host: github.com
-    commands: [ls]
+k8s:
+  - context: dev
+    mode: rw
+    namespace: team-a
 `)
 	writeFile(t, filepath.Join(dir, "conf.d", "b.yaml"), `
-ssh:
-  - host: github.com
-    commands: [echo]
+k8s:
+  - context: dev
+    mode: rw
+    namespace: team-b
 `)
 
 	cfg, err := Load(filepath.Join(dir, "config.yaml"))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if len(cfg.SSH) != 1 {
-		t.Fatalf("SSH len = %d, want 1", len(cfg.SSH))
+	if len(cfg.K8s) != 1 {
+		t.Fatalf("K8s len = %d, want 1", len(cfg.K8s))
 	}
-	if cfg.SSH[0].Commands[0] != "echo" {
-		t.Errorf("expected last conf.d to win, got %+v", cfg.SSH[0].Commands)
+	if cfg.K8s[0].Mode != k8sproxy.ReadWrite || len(cfg.K8s[0].Namespaces) != 1 || cfg.K8s[0].Namespaces[0] != "team-b" {
+		t.Errorf("expected last conf.d to win, got %+v", cfg.K8s[0])
 	}
 }
 
@@ -412,8 +409,9 @@ ssh:
   - host: github.com
 `)
 	writeFile(t, filepath.Join(dir, "conf.d", "bad.yaml"), `
-ssh:
-  - commands: [cat]
+k8s:
+  - context: dev
+    mode: admin
 `)
 
 	_, err := Load(filepath.Join(dir, "config.yaml"))

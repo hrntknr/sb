@@ -15,8 +15,8 @@ import (
 
 // Serve accepts downstream connections. Each connection carries an SSH session
 // whose exec payload names the real target ("proxy-ssh <user> <host> <port>");
-// the inner SSH traffic on that session is policy-checked and forwarded to the
-// upstream host.
+// the inner SSH traffic on that session is checked against the host policy
+// and forwarded to the upstream host.
 func (p *Proxy) Serve(l net.Listener) error {
 	config := &cryptossh.ServerConfig{PublicKeyCallback: p.authorizeIssuedKey}
 	hostSigner, err := p.getOrCreateHostCASigner()
@@ -35,6 +35,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 }
 
 func (p *Proxy) serveOuterConn(conn net.Conn, config *cryptossh.ServerConfig) {
+	defer p.untrackConn(conn)
 	server, chans, reqs, err := cryptossh.NewServerConn(conn, config)
 	if err != nil {
 		_ = conn.Close()
@@ -52,11 +53,11 @@ func (p *Proxy) serveOuterConn(conn net.Conn, config *cryptossh.ServerConfig) {
 		if err != nil {
 			continue
 		}
-		go p.serveOuterSession(channel, requests)
+		go p.serveOuterSession(conn, channel, requests)
 	}
 }
 
-func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cryptossh.Request) {
+func (p *Proxy) serveOuterSession(conn net.Conn, channel cryptossh.Channel, requests <-chan *cryptossh.Request) {
 	defer channel.Close()
 	for req := range requests {
 		if req.Type != "exec" {
@@ -70,50 +71,83 @@ func (p *Proxy) serveOuterSession(channel cryptossh.Channel, requests <-chan *cr
 			req.Reply(false, nil)
 			return
 		}
-		cfg, capability, ok := p.resolveTarget(payload.Command)
-		if !ok {
+		cfg, ok := p.resolveTarget(payload.Command)
+		if !ok || !p.trackConn(conn, cfg.Host) {
 			slog.Warn("rejected ssh proxy command", "command", payload.Command)
 			req.Reply(false, nil)
 			return
 		}
 		slog.Info("proxying ssh connection", "requested_user", cfg.User, "host", cfg.Host, "port", cfg.Port)
 		req.Reply(true, nil)
-		p.serveInnerSSH(channel, cfg, capability)
+		p.serveInnerSSH(channel, cfg)
 		return
 	}
 }
 
 // SetTargets replaces the policy targets, called on config reloads.
+// Downstream connections whose host no longer matches any target are
+// closed.
 func (p *Proxy) SetTargets(targets Targets) {
 	p.mu.Lock()
 	p.Targets = targets
+	closing := make([]net.Conn, 0, len(p.conns))
+	for conn, host := range p.conns {
+		if targets.Allows(host) {
+			continue
+		}
+		delete(p.conns, conn)
+		closing = append(closing, conn)
+	}
 	p.mu.Unlock()
+	for _, conn := range closing {
+		_ = conn.Close()
+	}
 }
 
-// capability returns the current policy capability for host.
-func (p *Proxy) capability(host string) Capability {
+// trackConn registers conn as dialing host so SetTargets can close it when
+// the host is no longer allowed, and reports whether the current policy
+// allows host.
+func (p *Proxy) trackConn(conn net.Conn, host string) bool {
 	p.mu.Lock()
-	targets := p.Targets
+	if p.conns == nil {
+		p.conns = make(map[net.Conn]string)
+	}
+	p.conns[conn] = host
+	allowed := p.Targets.Allows(host)
 	p.mu.Unlock()
-	return targets.Capability(host)
+	return allowed
+}
+
+func (p *Proxy) untrackConn(conn net.Conn) {
+	p.mu.Lock()
+	delete(p.conns, conn)
+	p.mu.Unlock()
 }
 
 // resolveTarget parses a "proxy-ssh <user> <host> <port>" exec payload,
-// resolves the upstream ssh config, and checks that the host has a capability.
-func (p *Proxy) resolveTarget(command string) (cfg sshConfig, capability Capability, ok bool) {
+// resolves the upstream ssh config, and checks that the host is allowed by
+// the policy.
+func (p *Proxy) resolveTarget(command string) (sshConfig, bool) {
 	fields := strings.Fields(command)
 	if len(fields) != 4 || fields[0] != "proxy-ssh" || fields[1] == "" || fields[2] == "" || !validPort(fields[3]) {
-		return sshConfig{}, Capability{}, false
+		return sshConfig{}, false
 	}
 	cfg, err := upstreamConfig(fields[1], fields[2], fields[3])
 	if err != nil {
-		return sshConfig{}, Capability{}, false
+		return sshConfig{}, false
 	}
-	capability = p.capability(cfg.Host)
-	if capability.Empty() {
-		return sshConfig{}, Capability{}, false
+	if !p.targetAllows(cfg.Host) {
+		return sshConfig{}, false
 	}
-	return cfg, capability, true
+	return cfg, true
+}
+
+// targetAllows reports whether the current policy allows connections to host.
+func (p *Proxy) targetAllows(host string) bool {
+	p.mu.Lock()
+	targets := p.Targets
+	p.mu.Unlock()
+	return targets.Allows(host)
 }
 
 func validPort(port string) bool {
@@ -124,7 +158,7 @@ func validPort(port string) bool {
 // serveInnerSSH terminates the inner SSH handshake on the outer session
 // channel (presenting a host certificate for the requested host) and forwards
 // channels to the upstream connection.
-func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, cfg sshConfig, capability Capability) {
+func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, cfg sshConfig) {
 	serverConfig, err := p.innerServerConfig(cfg.RequestedHost)
 	if err != nil {
 		return
@@ -142,47 +176,14 @@ func (p *Proxy) serveInnerSSH(channel cryptossh.Channel, cfg sshConfig, capabili
 	}
 	defer upstream.Close()
 
-	go forwardGlobalRequests(reqs, upstream, capability.Forward)
-	if capability.Forward {
-		// Reverse forwarding: channels the upstream opens in response to
-		// forwarded-tcpip requests go back to the downstream client.
-		go reverseForwardChannels(server, upstream)
-	}
+	go forwardGlobalRequests(reqs, upstream)
+	// Reverse forwarding: channels the upstream opens in response to
+	// forwarded-tcpip requests go back to the downstream client.
+	go reverseForwardChannels(server, upstream)
 
 	for ch := range chans {
-		go serveInnerChannel(upstream, capability, ch)
+		go forwardChannel(upstream, ch)
 	}
-}
-
-func serveInnerChannel(upstream *cryptossh.Client, capability Capability, ch cryptossh.NewChannel) {
-	if ch.ChannelType() != "session" {
-		if !capability.Forward {
-			ch.Reject(cryptossh.Prohibited, "forbidden")
-			return
-		}
-		forwardChannel(upstream, ch, nil)
-		return
-	}
-	forwardChannel(upstream, ch, func(req *cryptossh.Request) bool {
-		switch req.Type {
-		case "exec":
-			if !capability.AllowsExec(execCommand(req)) {
-				slog.Warn("rejected ssh exec by policy", "command", execCommand(req))
-				return false
-			}
-			return true
-		case "shell", "subsystem":
-			return capability.Shell
-		default:
-			return true
-		}
-	})
-}
-
-func execCommand(req *cryptossh.Request) string {
-	var payload struct{ Command string }
-	_ = cryptossh.Unmarshal(req.Payload, &payload)
-	return payload.Command
 }
 
 // innerServerConfig signs a fresh host key with the proxy host CA for the

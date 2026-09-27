@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,13 +46,16 @@ type Proxy struct {
 	mu           sync.Mutex
 	issuedKey    string
 	hostCASigner cryptossh.Signer
+	// conns tracks downstream connections by the upstream host they dial,
+	// so SetTargets can close them when the host is no longer allowed.
+	conns map[net.Conn]string
 }
 
 func New(targets Targets, agentSocket func() string) *Proxy {
 	if agentSocket == nil {
 		agentSocket = func() string { return os.Getenv("SSH_AUTH_SOCK") }
 	}
-	return &Proxy{Targets: targets, AgentSocket: agentSocket}
+	return &Proxy{Targets: targets, AgentSocket: agentSocket, conns: make(map[net.Conn]string)}
 }
 
 // WriteConfig issues downstream credentials and writes the ssh config, private

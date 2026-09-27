@@ -117,14 +117,16 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 
 	select {
 	case err := <-proxyErr:
+		// The proxy stopped (failure or interruption). The child may not
+		// have received anything: kill it and remove the container so it
+		// cannot outlive its credentials.
+		_ = child.Process.Kill()
+		childErr := <-waitErr
+		containers.ForceRemove(rt, dir)
 		if err != nil {
-			_ = child.Process.Kill()
-			<-waitErr
-			containers.ForceRemove(rt, dir)
 			return fmt.Errorf("proxy: %w", err)
 		}
-		// Interrupted: the child got the signal too; wait for it to exit.
-		return exitStatus(<-waitErr)
+		return exitStatus(childErr)
 	case err := <-waitErr:
 		stop()
 		return exitStatus(err)

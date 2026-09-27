@@ -98,18 +98,21 @@ func AllServices(mode string) []Service {
 }
 
 // assumedRole returns the role ARN to assume for a profile from matching
-// targets. Matching targets must agree on the role. An empty role means no
-// role is assumed and the source profile's own credentials are used.
+// targets. Matching targets must agree on the role (an empty RoleARN means
+// the source profile's own credentials are used and no role is assumed).
 func assumedRole(targets []Target, profile string) (string, error) {
-	role := ""
+	role, matched := "", false
 	for _, target := range targets {
 		if !util.Match(target.Profile, profile) {
 			continue
 		}
-		if role != "" && role != target.RoleARN {
+		if !matched {
+			role, matched = target.RoleARN, true
+			continue
+		}
+		if role != target.RoleARN {
 			return "", errConflictingRoles
 		}
-		role = target.RoleARN
 	}
 	return role, nil
 }
