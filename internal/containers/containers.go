@@ -319,22 +319,36 @@ func ParseName(name string) (Runtime, error) {
 	return r, nil
 }
 
-// Args builds the runtime CLI arguments that run a container with the
-// sb credentials under dir mounted at /root (read-only), followed by the
-// user's own arguments. host is the value ResolveHost returned. name and
-// network, when non-empty, are passed to the runtime as --name and
-// --network. envs are environment variables (KEY=VALUE, or just KEY to
-// inherit from sb's own environment). mounts are extra "source:target"
-// volumes, with ~ already expanded and ":ro" appended for read-only mounts.
-// labels are --label arguments: sb marks its containers with the session
-// label so they can be found and removed without sb's own state. image is
-// inserted before userArgs, which form the container command. init, when
-// set, passes --init so the command runs under an init process as PID 1
-// that forwards signals and reaps zombies, which the user's command (a
-// shell, node, ...) would not do on its own. The runtime records the
-// container ID in a cidfile under dir, for ForceRemove.
-func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts, labels []string, image string, init bool, userArgs []string) []string {
-	args := []string{"run", "--rm", "--cidfile", cidFile(dir)}
+// Protocol identifies a credential protocol sb issues: the proxy serves
+// it and the container mounts the credentials under /root for it. The
+// zero value is no protocol — nothing is served, issued, or mounted.
+type Protocol uint8
+
+const (
+	ProtocolSSH Protocol = 1 << iota
+	ProtocolK8s
+	ProtocolAWS
+)
+
+// CreateArgs builds the runtime CLI arguments that create the container
+// stopped — nothing runs yet. The sb credentials under dir are mounted
+// at /root (read-only) for the protocols in use: a protocol without
+// rules issues nothing, so nothing is mounted under its name either.
+// The user's own arguments are the container's command, and the session
+// label marks it as sb's to stop and remove. The runtime records the
+// container ID in a cidfile under dir once the container exists.
+//
+// host is the value ResolveHost returned. name and network, when
+// non-empty, are passed to the runtime as --name and --network. envs are
+// environment variables (KEY=VALUE, or just KEY to inherit from sb's own
+// environment). mounts are extra "source:target" volumes, with ~ already
+// expanded and ":ro" appended for read-only mounts. labels are --label
+// arguments. image is inserted before userArgs, which form the container
+// command. init, when set, passes --init so the command runs under an
+// init process as PID 1 that forwards signals and reaps zombies, which
+// the user's command (a shell, node, ...) would not do on its own.
+func CreateArgs(r Runtime, host, dir string, protocols Protocol, name, network string, envs []string, tty bool, mounts, labels []string, image string, init bool, userArgs []string) []string {
+	args := []string{"create", "--cidfile", CidFile(dir)}
 	if init {
 		args = append(args, "--init")
 	}
@@ -353,11 +367,15 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 	if r == Docker && host == dockerHost {
 		args = append(args, "--add-host", dockerHost+":host-gateway")
 	}
-	args = append(args,
-		"-v", filepath.Join(dir, ".ssh")+":/root/.ssh:ro",
-		"-v", filepath.Join(dir, ".kube")+":/root/.kube:ro",
-		"-v", filepath.Join(dir, ".aws")+":/root/.aws:ro",
-	)
+	if protocols&ProtocolSSH != 0 {
+		args = append(args, "-v", filepath.Join(dir, ".ssh")+":/root/.ssh:ro")
+	}
+	if protocols&ProtocolK8s != 0 {
+		args = append(args, "-v", filepath.Join(dir, ".kube")+":/root/.kube:ro")
+	}
+	if protocols&ProtocolAWS != 0 {
+		args = append(args, "-v", filepath.Join(dir, ".aws")+":/root/.aws:ro")
+	}
 	for _, mount := range mounts {
 		args = append(args, "-v", mount)
 	}
@@ -383,13 +401,25 @@ func ExecArgs(container, workdir string, tty bool, command []string) []string {
 	return append(append(args, container), command...)
 }
 
-// ForceRemove force-removes the container whose ID Args had the runtime
-// record in the cidfile under dir, stopping it if it still runs: killing
-// the runtime CLI is not enough, since the container lives outside its
-// process (in the docker or podman daemon, or the apple machine). A
+// StartArgs builds the runtime CLI arguments that start the created
+// container and attach to it: the CLI's streams are the container's, its
+// exit is the container's. With tty, the CLI also carries stdin to the
+// container; without it, the container's stdin stays closed.
+func StartArgs(id string, tty bool) []string {
+	args := []string{"start", "-a"}
+	if tty {
+		args = append(args, "-i")
+	}
+	return append(args, id)
+}
+
+// ForceRemove force-removes the container whose ID CreateArgs had the
+// runtime record in the cidfile under dir, stopping it if it still runs:
+// killing the runtime CLI is not enough, since the container lives outside
+// its process (in the docker or podman daemon, or the apple machine). A
 // missing or empty cidfile — the container never started — is a no-op.
 func ForceRemove(r Runtime, dir string) {
-	data, err := os.ReadFile(cidFile(dir))
+	data, err := os.ReadFile(CidFile(dir))
 	if err != nil {
 		return
 	}
@@ -398,7 +428,10 @@ func ForceRemove(r Runtime, dir string) {
 	}
 }
 
-func cidFile(dir string) string {
+// CidFile is the path of the file the runtime records the container ID
+// in: what CreateArgs passes as --cidfile, and what sb reads once the
+// container exists.
+func CidFile(dir string) string {
 	return filepath.Join(dir, "cid")
 }
 

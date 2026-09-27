@@ -8,150 +8,218 @@ import (
 	"testing"
 )
 
-func TestArgs(t *testing.T) {
+// TestCreateArgs covers CreateArgs: the arguments that create the container
+// stopped — nothing runs yet — with the sb credentials mounted and the
+// session label set.
+func TestCreateArgs(t *testing.T) {
+	// everyProtocol: the configuration has a rule per protocol, so the
+	// credentials of all three are mounted.
+	const everyProtocol = ProtocolSSH | ProtocolK8s | ProtocolAWS
 	tests := []struct {
-		name     string
-		runtime  Runtime
-		host     string
-		cname    string
-		network  string
-		envs     []string
-		tty      bool
-		mounts   []string
-		labels   []string
-		image    string
-		init     bool
-		userArgs []string
-		want     []string
+		name      string
+		runtime   Runtime
+		host      string
+		protocols Protocol
+		cname     string
+		network   string
+		envs      []string
+		tty       bool
+		mounts    []string
+		labels    []string
+		image     string
+		init      bool
+		userArgs  []string
+		want      []string
 	}{
 		{
-			name:     "docker via host-gateway",
-			runtime:  Docker,
-			host:     dockerHost,
-			tty:      true,
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
+			name:      "docker via host-gateway",
+			runtime:   Docker,
+			host:      dockerHost,
+			protocols: everyProtocol,
+			tty:       true,
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid", "--add-host", "host.docker.internal:host-gateway",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "init flag comes after the cidfile",
-			runtime:  Docker,
-			host:     dockerHost,
-			tty:      true,
-			image:    "ghcr.io/hrntknr/sh:full",
-			init:     true,
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--init", "--add-host", "host.docker.internal:host-gateway",
+			name:      "init flag comes after the cidfile",
+			runtime:   Docker,
+			host:      dockerHost,
+			protocols: everyProtocol,
+			tty:       true,
+			image:     "ghcr.io/hrntknr/sh:full",
+			init:      true,
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid", "--init", "--add-host", "host.docker.internal:host-gateway",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "name and network come before the image",
-			runtime:  Docker,
-			host:     "localhost",
-			cname:    "dev",
-			network:  "host",
-			envs:     []string{"FOO=bar", "LANG"},
-			tty:      true,
-			mounts:   []string{"/home/me/.claude:/root/.claude"},
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
+			name:      "name and network come before the image",
+			runtime:   Docker,
+			host:      "localhost",
+			protocols: everyProtocol,
+			cname:     "dev",
+			network:   "host",
+			envs:      []string{"FOO=bar", "LANG"},
+			tty:       true,
+			mounts:    []string{"/home/me/.claude:/root/.claude"},
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid", "--name", "dev", "--network", "host",
 				"--env", "FOO=bar", "--env", "LANG",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "session labels come before the credential mounts",
-			runtime:  Docker,
-			host:     "192.168.1.5",
-			labels:   []string{"sb.session.id=3f9a1d2c4e5b6078"},
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+			name:      "session labels come before the credential mounts",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: everyProtocol,
+			labels:    []string{"sb.session.id=3f9a1d2c4e5b6078"},
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
 				"--label", "sb.session.id=3f9a1d2c4e5b6078",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "docker with resolved host ip has no add-host",
-			runtime:  Docker,
-			host:     "192.168.1.5",
-			tty:      false,
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+			name:      "docker with resolved host ip has no add-host",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: everyProtocol,
+			tty:       false,
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "podman without tty",
-			runtime:  Podman,
-			host:     podmanHost,
-			tty:      false,
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"npm", "install"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+			name:      "podman without tty",
+			runtime:   Podman,
+			host:      podmanHost,
+			protocols: everyProtocol,
+			tty:       false,
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"npm", "install"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"ghcr.io/hrntknr/sh:full", "npm", "install"},
 		},
 		{
-			name:     "apple tty with a command",
-			runtime:  Apple,
-			host:     appleHost,
-			tty:      true,
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+			name:      "apple tty with a command",
+			runtime:   Apple,
+			host:      appleHost,
+			protocols: everyProtocol,
+			tty:       true,
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "config mounts come after credentials and before user args",
-			runtime:  Docker,
-			host:     "192.168.1.5",
-			tty:      true,
-			mounts:   []string{"/home/me/.claude:/root/.claude", "/home/me/.config/opencode:/root/.config/opencode"},
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+			name:      "config mounts come after credentials and before user args",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: everyProtocol,
+			tty:       true,
+			mounts:    []string{"/home/me/.claude:/root/.claude", "/home/me/.config/opencode:/root/.config/opencode"},
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-v", "/home/me/.claude:/root/.claude",
 				"-v", "/home/me/.config/opencode:/root/.config/opencode",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:     "read-only mounts carry the ro option through",
-			runtime:  Docker,
-			host:     "192.168.1.5",
-			tty:      true,
-			mounts:   []string{"/home/me/.claude:/root/.claude:ro"},
-			image:    "ghcr.io/hrntknr/sh:full",
-			userArgs: []string{"zsh", "-l"},
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+			name:      "read-only mounts carry the ro option through",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: everyProtocol,
+			tty:       true,
+			mounts:    []string{"/home/me/.claude:/root/.claude:ro"},
+			image:     "ghcr.io/hrntknr/sh:full",
+			userArgs:  []string{"zsh", "-l"},
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
 				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
 				"-v", "/home/me/.claude:/root/.claude:ro",
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
-			name:    "no args runs the image default",
+			name:      "no args runs the image default",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: everyProtocol,
+			tty:       false,
+			image:     "ghcr.io/hrntknr/sh:full",
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
+				"ghcr.io/hrntknr/sh:full"},
+		},
+		{
+			name:      "only the ssh protocol in use mounts only its credentials",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: ProtocolSSH,
+			tty:       false,
+			image:     "ghcr.io/hrntknr/sh:full",
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
+				"-v", "/tmp/sb/.ssh:/root/.ssh:ro",
+				"ghcr.io/hrntknr/sh:full"},
+		},
+		{
+			name:      "the k8s and aws protocols in use mount both their credentials",
+			runtime:   Docker,
+			host:      "192.168.1.5",
+			protocols: ProtocolK8s | ProtocolAWS,
+			tty:       false,
+			image:     "ghcr.io/hrntknr/sh:full",
+			want: []string{"create", "--cidfile", "/tmp/sb/cid",
+				"-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
+				"ghcr.io/hrntknr/sh:full"},
+		},
+		{
+			name:    "no protocol in use mounts no credentials",
 			runtime: Docker,
 			host:    "192.168.1.5",
 			tty:     false,
 			image:   "ghcr.io/hrntknr/sh:full",
-			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
-				"-v", "/tmp/sb/.ssh:/root/.ssh:ro", "-v", "/tmp/sb/.kube:/root/.kube:ro", "-v", "/tmp/sb/.aws:/root/.aws:ro",
-				"ghcr.io/hrntknr/sh:full"},
+			want:    []string{"create", "--cidfile", "/tmp/sb/cid", "ghcr.io/hrntknr/sh:full"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.labels, tt.image, tt.init, tt.userArgs)
+			got := CreateArgs(tt.runtime, tt.host, "/tmp/sb", tt.protocols, tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.labels, tt.image, tt.init, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("Args() = %v, want %v", got, tt.want)
+				t.Errorf("CreateArgs() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestStartArgs covers StartArgs: the arguments that start the created
+// container and attach to it.
+func TestStartArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		tty  bool
+		want []string
+	}{
+		{"tty carries stdin", "c1", true, []string{"start", "-a", "-i", "c1"}},
+		{"no tty closes the container's stdin", "c1", false, []string{"start", "-a", "c1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StartArgs(tt.id, tt.tty); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("StartArgs() = %v, want %v", got, tt.want)
 			}
 		})
 	}

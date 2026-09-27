@@ -304,7 +304,7 @@ func Sweep(dir string) error {
 		if lock == nil {
 			continue // a live session holds it
 		}
-		if err := StopSession(dir, name, lock, true); err != nil {
+		if err := StopSession(dir, name, lock, true, true); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -316,10 +316,12 @@ func Sweep(dir string) error {
 // label, the issue dir is deleted, then the record; whatever it is that
 // fails keeps what the retry needs — the record stays — and releases the
 // lock either way: after this, nothing of sb holds the name. With the
-// issuing tasks still writing (issuanceExited false) the issue dir is
-// not deleted: the removal would race what they are still writing; the
-// record stays, and the next sweep retries with it.
-func StopSession(dir, name string, lock *Lock, issuanceExited bool) error {
+// issuing tasks still writing (issuanceExited false) or the container
+// creation still in flight (creationSettled false, its result unknown),
+// the issue dir is not deleted: the removal would race what they are
+// still writing or creating; the record stays, and the next sweep
+// retries with it.
+func StopSession(dir, name string, lock *Lock, issuanceExited, creationSettled bool) error {
 	defer lock.Release()
 	rec, err := LoadRecord(dir, name)
 	if err != nil {
@@ -328,10 +330,11 @@ func StopSession(dir, name string, lock *Lock, issuanceExited bool) error {
 	if err := removeContainers(&rec); err != nil {
 		return ReclaimError(rec, dir)
 	}
-	if !issuanceExited {
-		// The issuing tasks are still writing the issue dir: removing
-		// it would race what they are writing next. The record
-		// stays; the next sweep retries with it.
+	if !issuanceExited || !creationSettled {
+		// The issuing tasks are still writing the issue dir, or the
+		// creation's result is still unknown: what the removal lists
+		// is not the whole truth yet. The record stays; the next
+		// sweep retries with it.
 		return ReclaimError(rec, dir)
 	}
 	if rec.IssueDir != "" {

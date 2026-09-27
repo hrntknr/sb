@@ -44,29 +44,47 @@ func TestFakesAnswerRuntimeCalls(t *testing.T) {
 	}
 }
 
-func TestFakesRunRegistersAndWritesCidfile(t *testing.T) {
+// TestFakesCreateRegistersAndStartAttaches covers the fakes' container
+// lifecycle: create registers the container stopped and writes the
+// cidfile; start attaches to the created container and lives until stdin
+// closes (an empty stdin in tests: right away).
+func TestFakesCreateRegistersAndStartAttaches(t *testing.T) {
 	Install(t, t.TempDir())
 	setState(t, "old sb.session.id=oldsid\n")
 
-	// run registers the container, writes the cidfile, and lives until stdin
-	// closes (an empty stdin in tests: right away).
+	// create registers the container stopped, writes the cidfile, and
+	// exits: nothing runs yet.
 	cidfile := t.TempDir() + "/cid"
-	fake(t, "docker", "run --rm --cidfile "+cidfile+" --label sb.session.id=sidNew --init ghcr.io/hrntknr/sh:full zsh -l")
+	if err := fake(t, "docker", "create --cidfile "+cidfile+" --label sb.session.id=sidNew --init ghcr.io/hrntknr/sh:full zsh -l"); err != nil {
+		t.Fatal(err)
+	}
 	if cid := strings.TrimSpace(read(t, cidfile)); cid != "fake-container-1" {
 		t.Fatalf("cidfile = %q; want fake-container-1", cid)
 	}
 	if state := stateText(t); !strings.Contains(state, "fake-container-1 sb.session.id=sidNew\n") {
-		t.Fatalf("state after run: %q; want the container with the sb label", state)
+		t.Fatalf("state after create: %q; want the container with the sb label", state)
 	}
 
-	// The next run takes the next id; the old container is untouched.
+	// The next create takes the next id; the old container is untouched.
 	cidfile2 := t.TempDir() + "/cid"
-	fake(t, "docker", "run --cidfile "+cidfile2+" --label sb.session.id=sidNew image")
+	if err := fake(t, "docker", "create --cidfile "+cidfile2+" --label sb.session.id=sidNew image"); err != nil {
+		t.Fatal(err)
+	}
 	if cid := strings.TrimSpace(read(t, cidfile2)); cid != "fake-container-2" {
 		t.Fatalf("cidfile2 = %q; want fake-container-2", cid)
 	}
 	if state := stateText(t); !strings.Contains(state, "old sb.session.id=oldsid\n") {
 		t.Fatalf("state: %q; the old container stayed", state)
+	}
+
+	// start attaches to the created container and lives until stdin
+	// closes. An id the state does not know starts nothing: no container
+	// of that name was created.
+	if err := fake(t, "docker", "start -a -i fake-container-1 zsh -l"); err != nil {
+		t.Fatalf("start of the created container: %v", err)
+	}
+	if err := fake(t, "docker", "start -a -i fake-container-404 zsh -l"); err == nil {
+		t.Fatal("start of an unknown container: no error")
 	}
 }
 
@@ -130,27 +148,30 @@ func read(t *testing.T, path string) string {
 	return string(data)
 }
 
-// TestFakesRunWithLifetime covers the lifetime path: with
-// SB_FAKE_RUN_LIFETIME set, run stays alive until the file is gone.
-func TestFakesRunWithLifetime(t *testing.T) {
+// TestFakesStartWithLifetime covers the lifetime path: with
+// SB_FAKE_START_LIFETIME set, start stays alive until the file is gone.
+func TestFakesStartWithLifetime(t *testing.T) {
 	dir := t.TempDir()
 	Install(t, dir)
 	lifetime := filepath.Join(dir, "lifetime")
 	if err := os.WriteFile(lifetime, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SB_FAKE_RUN_LIFETIME", lifetime)
-	cidfile := filepath.Join(t.TempDir(), "cid")
+	t.Setenv("SB_FAKE_START_LIFETIME", lifetime)
+	// The container create registers: start attaches to it.
+	if err := fake(t, "docker", "create --cidfile "+filepath.Join(t.TempDir(), "cid")+" --label sb.session.id=sidA image"); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() {
-		cmd := exec.Command("docker", strings.Fields("run --cidfile "+cidfile+" --label sb.session.id=sidA image")...)
+		cmd := exec.Command("docker", strings.Fields("start -a -i fake-container-1")...)
 		cmd.Stdin = nil
 		done <- cmd.Run()
 	}()
-	// The run stays alive while the lifetime file exists.
+	// The start stays alive while the lifetime file exists.
 	select {
 	case err := <-done:
-		t.Fatalf("run ended while the lifetime file exists: %v", err)
+		t.Fatalf("start ended while the lifetime file exists: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 	if err := os.Remove(lifetime); err != nil {
@@ -159,10 +180,10 @@ func TestFakesRunWithLifetime(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("run: %v", err)
+			t.Fatalf("start: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("run never ended after the lifetime file was removed")
+		t.Fatal("start never ended after the lifetime file was removed")
 	}
 }
 

@@ -20,17 +20,39 @@ import (
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
-// TestShutdownCutsStuckCleanupAtDeadline covers the deadline of the stop
-// flow: a connection whose cleanup never finishes — a transfer that never
-// goes idle — is closed, and Shutdown does not wait for its cleanup past
-// the deadline.
-func TestShutdownCutsStuckCleanupAtDeadline(t *testing.T) {
+// TestBeginStopCutsTheOpenConnections covers the stop's beginning: the set
+// is closed — nothing may join it anymore — and every connection open at
+// the stop is closed with it: no transfer on it keeps operating after
+// the stop. Its cleanup never finishing — a transfer that never goes
+// idle — is what Shutdown waits for, cut at its deadline.
+func TestBeginStopCutsTheOpenConnections(t *testing.T) {
 	proxy := New(nil, nil)
 	server, client := net.Pipe()
 	if !proxy.track(server) {
 		t.Fatal("track rejected the connection")
 	}
 
+	// The deadline turns a connection that was not closed into a read
+	// timeout: a blocking Read here would hang the test otherwise.
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stop begins: the connection open at it is closed here.
+	proxy.BeginStop()
+	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("the connection was not closed by BeginStop: %v", err)
+	}
+
+	// The set is closed: nothing may join it anymore.
+	late, latePeer := net.Pipe()
+	defer latePeer.Close()
+	if proxy.track(late) {
+		t.Fatal("track accepted a connection after the stop began")
+	}
+
+	// Shutdown waits for the connection's cleanup: nothing untracks it,
+	// so it returns at the deadline, not later.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
@@ -41,12 +63,6 @@ func TestShutdownCutsStuckCleanupAtDeadline(t *testing.T) {
 	}
 	if waited > 2*time.Second {
 		t.Fatalf("Shutdown waited %v; want it cut at the deadline", waited)
-	}
-
-	// The connection was closed: the transfer on it is cancelled.
-	_ = client.SetReadDeadline(time.Now().Add(time.Second))
-	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
-		t.Fatalf("the connection was not closed by Shutdown: %v", err)
 	}
 }
 

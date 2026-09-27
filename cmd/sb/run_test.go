@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,7 +28,7 @@ func setupRunTest(t *testing.T) string {
 	if err := os.WriteFile(lifetime, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("SB_FAKE_RUN_LIFETIME", lifetime)
+	t.Setenv("SB_FAKE_START_LIFETIME", lifetime)
 	return lifetime
 }
 
@@ -102,7 +103,7 @@ func waitForSessionRecord(t *testing.T, name string) {
 // its result. It uses the environment setupRunTest left behind.
 func runUntilDone(t *testing.T, name string) error {
 	t.Helper()
-	lifetime := os.Getenv("SB_FAKE_RUN_LIFETIME")
+	lifetime := os.Getenv("SB_FAKE_START_LIFETIME")
 	done := make(chan error, 1)
 	go func() {
 		cmd := &cobra.Command{}
@@ -243,18 +244,20 @@ func TestRunContainerKeepsLiveSessions(t *testing.T) {
 	}
 }
 
-// waitForStateLine polls the fake runtime's state until it holds a line
-// carrying text, so a test never races the CLI's registration.
-func waitForStateLine(t *testing.T, text string) {
+// waitForContainerID polls until the named session's record carries the
+// container ID: the creation settled — its result fixed — so a test never
+// races the run's startup.
+func waitForContainerID(t *testing.T, name string) {
 	t.Helper()
+	dir := sessionsDir(t)
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(stateText(t), text) {
+		if rec, err := session.LoadRecord(dir, name); err == nil && rec.ContainerID != "" {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("fake runtime state never held %q: %q", text, stateText(t))
+	t.Fatalf("session %q: container ID never recorded", name)
 }
 
 // TestRunContainerStopsWhenOnlySbGetsTheSignal covers the blocker: SIGTERM
@@ -266,8 +269,8 @@ func TestRunContainerStopsWhenOnlySbGetsTheSignal(t *testing.T) {
 	setupRunTest(t)
 	// The run never ends by itself: the CLI ignores TERM and INT and
 	// stays alive until its caller kills it.
-	t.Setenv("SB_FAKE_RUN_IGNORE_SIGNALS", "ignore")
-	os.Unsetenv("SB_FAKE_RUN_LIFETIME")
+	t.Setenv("SB_FAKE_START_IGNORE_SIGNALS", "ignore")
+	os.Unsetenv("SB_FAKE_START_LIFETIME")
 
 	done := make(chan error, 1)
 	go func() {
@@ -275,9 +278,9 @@ func TestRunContainerStopsWhenOnlySbGetsTheSignal(t *testing.T) {
 		cmd.SetContext(context.Background())
 		done <- runContainer(cmd, testOptions(t), "default", "", false, nil)
 	}()
-	// The child registered the session's container: the run is live past
-	// its signal handler — only sb's PID receiving the signal ends it.
-	waitForStateLine(t, "sb.session.id=")
+	// The creation settled: the run is live past its signal handler —
+	// only sb's PID receiving the signal ends it.
+	waitForContainerID(t, "default")
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +307,72 @@ func TestRunContainerStopsWhenOnlySbGetsTheSignal(t *testing.T) {
 		t.Fatalf("lock still held after the stop: %v", err)
 	} else {
 		lock.Release()
+	}
+}
+
+// TestRunContainerKeepsTheRecordWhileTheCreationIsInFlight covers the
+// blocker: a stop that lands while the creation is still in flight. What
+// the stop's listing answers about the session is not the whole truth —
+// the runtime may still commit the creation — so the stop may not settle
+// the reclaim on it: the record stays, and whatever the creation commits
+// after sb is gone is the next sweep's to reclaim.
+func TestRunContainerKeepsTheRecordWhileTheCreationIsInFlight(t *testing.T) {
+	setupRunTest(t)
+	dir := sessionsDir(t)
+
+	// The creation is in flight: the CLI does not answer while this
+	// exists.
+	slow := filepath.Join(t.TempDir(), "slow")
+	if err := os.WriteFile(slow, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_CREATE_SLOW", slow)
+
+	done := make(chan error, 1)
+	go func() {
+		cmd := &cobra.Command{}
+		cmd.SetContext(context.Background())
+		done <- runContainer(cmd, testOptions(t), "default", "", false, nil)
+	}()
+	waitForSessionRecord(t, "default")
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		// The stop kept the record: nothing of the session is settled on
+		// the listing's answer while the creation is in flight.
+		if err == nil {
+			t.Fatal("run: want the record kept for the next sweep")
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatal("the stop flow did not complete after the signal")
+	}
+
+	// The record stays: nothing of the session is dropped.
+	if _, err := os.Stat(session.RecordPath(dir, "default")); os.IsNotExist(err) {
+		t.Fatal("record dropped while the creation was in flight")
+	}
+
+	// Whatever the creation commits after sb is gone — the runtime
+	// completing it — is the next sweep's to reclaim. The creation no
+	// longer in flight, the next run's own creation settles normally:
+	// model the container existing now, then sweep it away.
+	os.Remove(slow)
+	t.Setenv("SB_FAKE_CREATE_SLOW", "")
+	rec, err := session.LoadRecord(dir, "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addStateLine(t, "cidLate sb.session.id="+rec.ID+"\n")
+	if err := runUntilDone(t, "fresh"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(session.RecordPath(dir, "default")); !os.IsNotExist(err) {
+		t.Fatalf("record survived the sweep: %v", err)
+	}
+	if state := stateText(t); strings.Contains(state, "cidLate") {
+		t.Fatalf("container survived the sweep: %q", state)
 	}
 }
 
@@ -366,7 +435,7 @@ func TestRunContainerExitWithFailedRemovalShowsRecovery(t *testing.T) {
 	}
 	t.Setenv("SB_FAKE_RM_LINGER", linger)
 	// The container exits 42 once its wait is over.
-	t.Setenv("SB_FAKE_RUN_EXIT_CODE", "42")
+	t.Setenv("SB_FAKE_START_EXIT_CODE", "42")
 
 	done := make(chan error, 1)
 	go func() {
@@ -375,7 +444,7 @@ func TestRunContainerExitWithFailedRemovalShowsRecovery(t *testing.T) {
 		done <- runContainer(cmd, testOptions(t), "default", "", false, nil)
 	}()
 	waitForSessionRecord(t, "default")
-	if err := os.Remove(os.Getenv("SB_FAKE_RUN_LIFETIME")); err != nil {
+	if err := os.Remove(os.Getenv("SB_FAKE_START_LIFETIME")); err != nil {
 		t.Fatal(err)
 	}
 	err := <-done
@@ -438,7 +507,7 @@ func recordNames(t *testing.T, dir string) []string {
 // same way runs beside the first instead of refusing its name.
 func TestRunContainerGeneratesNamesWhenOmitted(t *testing.T) {
 	setupRunTest(t)
-	lifetime := os.Getenv("SB_FAKE_RUN_LIFETIME")
+	lifetime := os.Getenv("SB_FAKE_START_LIFETIME")
 	dir := sessionsDir(t)
 
 	done := make(chan error, 2)
@@ -481,5 +550,56 @@ func TestRunContainerGeneratesNamesWhenOmitted(t *testing.T) {
 	}
 	if state := stateText(t); strings.Contains(state, "sb.session.id=") {
 		t.Fatalf("containers survived the stop: %q", state)
+	}
+}
+
+// TestRunSweepFailureShowsOnStderr covers the orphan reclaim failure's
+// report: whatever the log level (the default drops log lines), the
+// sweep's failure must be on stderr — the orphans stay for the next
+// sweep, and nothing else will say why.
+func TestRunSweepFailureShowsOnStderr(t *testing.T) {
+	setupRunTest(t)
+	// An orphan whose reclaim fails: its runtime does not resolve, so
+	// the sweep cannot remove its containers and keeps its record.
+	sessions := sessionsDir(t)
+	if err := session.SaveRecord(sessions, session.Record{
+		Name: "orphan", ID: "sidOrphan", Runtime: "sb-missing", IssueDir: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// stderr carries the sweep's failure whatever the log level: the
+	// capture holds it while the run uses it.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = saved })
+
+	// The run proceeds: the orphan's failure is background — the run's
+	// own session starts and reclaims cleanly after it.
+	if err := runUntilDone(t, "default"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sweep's failure is on stderr: what stayed, and why.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "session sweep failed") {
+		t.Fatalf("stderr does not carry the sweep's failure: %q", out)
+	}
+	if !strings.Contains(string(out), "sb-missing") {
+		t.Fatalf("stderr does not name what stayed behind: %q", out)
+	}
+	// The orphan's record stays: the next sweep retries with it.
+	if _, err := session.LoadRecord(sessions, "orphan"); err != nil {
+		t.Fatalf("orphan's record did not stay: %v", err)
 	}
 }

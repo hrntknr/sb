@@ -89,13 +89,24 @@ To convert, decide per host:
 | `- host: github.com` with `commands` omitted (shell + forward + any exec) | `- host: github.com` + `access: full` (same meaning) |
 | any rule you do not want to grant in full | drop the entry |
 
+v2:
+
 ```yaml
-# v2                        # v3
-ssh:                        ssh:
-  - host: github.com          - host: github.com
-    commands:                     access: full
+ssh:
+  - host: github.com
+    commands:
       - cat
       - ls
+```
+
+becomes:
+
+v3:
+
+```yaml
+ssh:
+  - host: github.com
+    access: full
 ```
 
 Review each host: a v2 `commands` rule that felt limited now becomes an explicit full grant. If that is not what you want, remove the host from the config and reach it directly instead.
@@ -115,12 +126,24 @@ v2 granted `r`/`rw` on a context. With `namespace: default` set, the grants appl
 
 `mode: r` granted all resources read access in the namespace; v3 requires listing each resource you actually use:
 
+v2:
+
 ```yaml
-# v2                          # v3
-k8s:                          k8s:
-  - context: dev                - context: dev
-    mode: r                       resources:
-    namespace: default              - group: ""
+k8s:
+  - context: dev
+    mode: r
+    namespace: default
+```
+
+becomes:
+
+v3:
+
+```yaml
+k8s:
+  - context: dev
+    resources:
+      - group: ""
         resource: pods
         namespace: default
         verbs: [get, list, watch]
@@ -128,19 +151,31 @@ k8s:                          k8s:
 
 For an omitted `namespace`, convert the resources you used — namespaced resources keep working with `namespace: "*"`, and cluster-scoped resources (like `namespaces`) need `scope: cluster`:
 
+v2:
+
 ```yaml
-# v2                                # v3
-k8s:                                k8s:
-  - context: dev                      - context: dev
-    mode: r                             resources:
-    # namespace omitted                    - group: ""
-                                            resource: pods
-                                            namespace: "*"
-                                            verbs: [get, list, watch]
-                                          - group: ""
-                                            resource: namespaces
-                                            scope: cluster
-                                            verbs: [get, list, watch]
+k8s:
+  - context: dev
+    mode: r
+    # namespace omitted
+```
+
+becomes:
+
+v3:
+
+```yaml
+k8s:
+  - context: dev
+    resources:
+      - group: ""
+        resource: pods
+        namespace: "*"
+        verbs: [get, list, watch]
+      - group: ""
+        resource: namespaces
+        scope: cluster
+        verbs: [get, list, watch]
 ```
 
 Rules:
@@ -160,17 +195,34 @@ What changes when differs per side: the host-side source's connection and auth s
 
 AWS is the mechanical conversion:
 
+v2:
+
 ```yaml
-# v2                          # v3
-aws:                           aws:
-  - profile: dev                - profile: dev
-    roleArn: arn:...             # roleArn: arn:... (unchanged, optional)
-    regions: [eu-west-1]         regions: [eu-west-1]
-    services:                    services:
-      - name: dynamodb             - name: dynamodb
-        mode: r                      mode: ro
-      - name: sts                   - name: sts
-        mode: rw                      mode: rw
+aws:
+  - profile: dev
+    roleArn: arn:...
+    regions: [eu-west-1]
+    services:
+      - name: dynamodb
+        mode: r
+      - name: sts
+        mode: rw
+```
+
+becomes:
+
+v3:
+
+```yaml
+aws:
+  - profile: dev
+    # roleArn: arn:... (unchanged, optional)
+    regions: [eu-west-1]
+    services:
+      - name: dynamodb
+        mode: ro
+      - name: sts
+        mode: rw
 ```
 
 - `mode: r` → `mode: ro`. `ro` has the same judgment as v2's `r`: an operation passes only when every action exercising it is allowed by the AWS ReadOnlyAccess policy.
@@ -180,17 +232,34 @@ aws:                           aws:
 
 ## Container: `environments` list → `environment` map
 
+v2:
+
 ```yaml
-# v2                          # v3
-container:                     container:
-  runtime: docker                runtime: docker
-  image: ghcr.io/hrntknr/sh:full  image: ghcr.io/hrntknr/sh:full
-  mounts:                        mounts:
-    - ~/.claude:/root/.claude      - source: ~/.claude
-    - /srv/work:/work                target: /root/.claude
-  environments:                       readOnly: false
-    - FOO=bar                      - source: /srv/work
-    - LANG                           target: /work
+container:
+  runtime: docker
+  image: ghcr.io/hrntknr/sh:full
+  mounts:
+    - ~/.claude:/root/.claude
+    - /srv/work:/work
+  environments:
+    - FOO=bar
+    - LANG
+```
+
+becomes:
+
+v3:
+
+```yaml
+container:
+  runtime: docker
+  image: ghcr.io/hrntknr/sh:full
+  mounts:
+    - source: ~/.claude
+      target: /root/.claude
+      readOnly: false
+    - source: /srv/work
+      target: /work
   environment:
     FOO: {value: bar}
     LANG: {inherit: true}

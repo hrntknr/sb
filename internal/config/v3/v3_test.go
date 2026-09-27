@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -233,7 +234,9 @@ func TestLoadInvalid(t *testing.T) {
 		{"k8s whitespace group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \" \"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", `invalid group " "`},
 		{"k8s missing namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        verbs: [get]\n", "namespace is required (or set scope: cluster"},
 		{"k8s empty namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: \"\"\n        verbs: [get]\n", "namespace must not be empty"},
-		{"k8s namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        scope: cluster\n        verbs: [get]\n", "namespace and scope are mutually exclusive"},
+		{"k8s namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        scope: cluster\n        verbs: [get]\n", "give a namespace, not scope: cluster"},
+		{"k8s cluster-scoped with a namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: nodes\n        namespace: default\n        verbs: [get]\n", "nodes is cluster-scoped: give scope: cluster, not a namespace"},
+		{"k8s cluster-scoped without scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: namespaces\n        verbs: [get]\n", "namespaces is cluster-scoped: give scope: cluster"},
 		{"k8s invalid scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        scope: node\n        verbs: [get]\n", `invalid scope "node" (want cluster)`},
 		{"k8s missing verbs", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n", "verbs is required"},
 		{"k8s unsupported verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, create]\n", `unsupported verb "create"`},
@@ -474,6 +477,64 @@ func TestLoadMountAmbiguity(t *testing.T) {
 			t.Fatalf("Load() error = %v", err)
 		}
 	})
+}
+
+// The yaml blocks in docs/migration.md, and the conversion examples'
+// two sides: each example is a v2 block, the "becomes:" separator, and
+// the v3 conversion.
+var (
+	yamlBlockRe   = regexp.MustCompile("(?s)```yaml\n(.*?)\n```")
+	examplePairRe = regexp.MustCompile("(?s)v2:\n\n```yaml\n(.*?)\n```\n\nbecomes:\n\nv3:\n\n```yaml\n(.*?)\n```")
+)
+
+// The conversion examples in docs/migration.md: the v3 sides must load
+// through the config loader exactly as the doc shows them, and the v2
+// sides must be rejected — the same rejection the doc tells the reader
+// to expect. The complete example at the top loads as-is.
+func TestMigrationDocExamples(t *testing.T) {
+	// The doc is at the repository root: the package sits three levels
+	// under it (internal/config/v3).
+	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "migration.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(doc)
+
+	// The complete example at the top: it loads as-is.
+	blocks := yamlBlockRe.FindAllStringSubmatch(content, -1)
+	if len(blocks) == 0 {
+		t.Fatal("no yaml blocks in docs/migration.md")
+	}
+	if _, err := loadDocYAML(t, blocks[0][1], ""); err != nil {
+		t.Fatalf("the complete example: Load() error = %v", err)
+	}
+
+	// Each conversion example: the v3 side loads (the doc shows the
+	// section; the version header the complete example carries is
+	// added for it), and the v2 side is rejected.
+	pairs := examplePairRe.FindAllStringSubmatch(content, -1)
+	if len(pairs) != 5 {
+		t.Fatalf("found %d conversion examples in docs/migration.md; want 5 — update this count when the doc changes", len(pairs))
+	}
+	for i, pair := range pairs {
+		if _, err := loadDocYAML(t, pair[1], "version: 3\n"); err == nil {
+			t.Fatalf("example %d: the v2 side loaded; want it rejected (v2 is not a v3 config)", i+1)
+		}
+		if _, err := loadDocYAML(t, pair[2], "version: 3\n"); err != nil {
+			t.Fatalf("example %d: the v3 side: Load() error = %v", i+1, err)
+		}
+	}
+}
+
+// loadDocYAML loads yaml as a config: header is prepended, so a doc's
+// section loads the way the complete example does.
+func loadDocYAML(t *testing.T, yaml, header string) (Config, error) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir) // the examples mount from ~; keep the expansion in the test
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, header+yaml)
+	return Load(path)
 }
 
 func writeFile(t *testing.T, path, content string) {

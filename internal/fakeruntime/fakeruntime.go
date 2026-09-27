@@ -2,12 +2,8 @@
 // podman, and the apple container CLI) for tests. The fakes are driven by
 // three files: a container state (one "<id> <label>" line per container),
 // a run counter, and a calls log; they answer sb's container-runtime calls
-// (ps, ls, rm, run, exec, info) from the state, so sb's session code can
-// be tested against a runtime that behaves like the real one.
-//
-// The fakes diverge from the real CLIs in one way on purpose: run does not
-// remove its container when it exits (real runtimes do, with --rm). What
-// the CLI leaves behind is exactly what sb's own reclamation must clean.
+// (ps, ls, rm, create, start, exec, info) from the state, so sb's session
+// code can be tested against a runtime that behaves like the real one.
 package fakeruntime
 
 import (
@@ -23,7 +19,7 @@ type Files struct {
 	// State lists the containers the runtimes "have", one "<id> <label>"
 	// line per container.
 	State string
-	// Counter is where run takes its ids from.
+	// Counter is where create takes its ids from.
 	Counter string
 	// Calls records one line per ps, rm, or exec call, with the arguments.
 	Calls string
@@ -32,8 +28,8 @@ type Files struct {
 // Install writes the fake runtime binaries into binDir (docker, podman,
 // container), puts binDir first on PATH, and creates the state, counter, and
 // calls files as SB_FAKE_STATE, SB_FAKE_COUNTER, and SB_TEST_CALLS_LOG for
-// the fakes. Set SB_FAKE_RUN_LIFETIME afterwards to keep a run alive after
-// its stdin closes.
+// the fakes. Set SB_FAKE_START_LIFETIME afterwards to keep a start alive
+// after its stdin closes.
 func Install(t testing.TB, binDir string) Files {
 	t.Helper()
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -79,18 +75,21 @@ func shellQuote(path string) string { return fmt.Sprintf("%q", path) }
 const fakeScript = `#!/bin/sh
 # Fake container runtime CLI for sb's tests. Driven by:
 #   SB_FAKE_STATE      containers the runtime "has": "<id> <label>" lines
-#   SB_FAKE_COUNTER    where run takes its ids from
+#   SB_FAKE_COUNTER    where create takes its ids from
 #   SB_TEST_CALLS_LOG  one line per call: "<subcommand> <args joined>"
-#   SB_FAKE_RUN_LIFETIME     while this file exists a run stays alive; without
-#                            it, run lives until stdin closes
+#   SB_FAKE_START_LIFETIME     while this file exists a start stays alive; without
+#                            it, start lives until stdin closes
 #   SB_FAKE_STALL           while this path exists the CLI never answers
 #                            (a runtime that hangs: sb's deadline kills it)
 #   SB_FAKE_RM_LINGER       rm -f answers without removing: the containers
 #                            stay behind the call (a runtime that leaves them)
-#   SB_FAKE_RUN_IGNORE_SIGNALS  run ignores TERM/INT and never exits by
+#   SB_FAKE_START_IGNORE_SIGNALS  start ignores TERM/INT and never exits by
 #                            itself: the caller must kill the CLI
-#   SB_FAKE_RUN_EXIT_CODE  the code run exits with once its wait is over
+#   SB_FAKE_START_EXIT_CODE  the code start exits with once its wait is over
 #                            (the container's exit: sb keeps it as its own)
+#   SB_FAKE_CREATE_SLOW      while this path exists the creation is in
+#                            flight: the call does not answer (a creation
+#                            the runtime has not committed yet)
 #   SB_FAKE_PIPE_CHILD      while this path exists the CLI answers, exits,
 #                            and leaves a child holding its stdio (a runtime
 #                            whose grandchildren keep the pipes open past
@@ -179,8 +178,14 @@ ls)
 	done <"$state"
 	printf '%s]\n' "$out"
 	;;
-run)
-	# run <args>: register the container, write the cidfile, then live.
+create)
+	# create <args>: register the container stopped, write the cidfile,
+	# and exit: nothing runs yet — that is start's. While
+	# SB_FAKE_CREATE_SLOW exists the creation is in flight: the call does
+	# not answer.
+	if [ -e "${SB_FAKE_CREATE_SLOW:-}" ]; then
+		while [ -e "$SB_FAKE_CREATE_SLOW" ]; do sleep 0.05; done
+	fi
 	cidfile=""
 	label=""
 	while [ $# -gt 0 ]; do
@@ -197,11 +202,22 @@ run)
 	id="fake-container-$n"
 	printf '%s\n' "$id" >"$cidfile"
 	printf '%s %s\n' "$id" "$label" >>"$state"
-	if [ -e "${SB_FAKE_RUN_LIFETIME:-}" ]; then
+	exit 0
+	;;
+start)
+	# start <args>: the created container runs. The id the state knows
+	# is what starts; one the state does not know starts nothing: no
+	# container of that name was created.
+	id=""
+	for a in "$@"; do
+		if grep -q "^$a " "$state"; then id=$a; break; fi
+	done
+	[ -n "$id" ] || exit 1
+	if [ -e "${SB_FAKE_START_LIFETIME:-}" ]; then
 		# Alive until the lifetime file is gone: the caller ends the
 		# session at its own pace.
-		while [ -e "$SB_FAKE_RUN_LIFETIME" ]; do sleep 0.05; done
-	elif [ -n "${SB_FAKE_RUN_IGNORE_SIGNALS:-}" ]; then
+		while [ -e "$SB_FAKE_START_LIFETIME" ]; do sleep 0.05; done
+	elif [ -n "${SB_FAKE_START_IGNORE_SIGNALS:-}" ]; then
 		# Ignores TERM and INT and never exits by itself: ending the
 		# run is the caller's to do, not the CLI's.
 		trap '' TERM INT
@@ -211,7 +227,7 @@ run)
 		cat >/dev/null
 	fi
 	# The CLI's exit: the container's exit code, sb's to keep as its own.
-	exit "${SB_FAKE_RUN_EXIT_CODE:-0}"
+	exit "${SB_FAKE_START_EXIT_CODE:-0}"
 	;;
 exec)
 	# exec <args>: the container id is the first arg the state knows; the

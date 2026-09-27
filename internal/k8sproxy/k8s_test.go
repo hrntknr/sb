@@ -158,11 +158,13 @@ func TestTargetsAllNamespacesAndClusterScope(t *testing.T) {
 		{"dev pods in default", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", true},
 		{"dev pods in other", "dev", http.MethodGet, "/api/v1/namespaces/other/pods/nginx", true},
 		{"dev all-namespaces list", "dev", http.MethodGet, "/api/v1/pods", true},
-		// dev: scope cluster covers the cluster-scoped collection; the
-		// named GET carries the namespace of the path, which no
-		// cluster-scoped rule covers
+		// dev: scope cluster covers the cluster-scoped collection and
+		// the named get alike. The namespace of the path (the
+		// namespaces collection is named under
+		// /api/v1/namespaces/<name>) is the parsing, not a scope: the
+		// resource's scope decides, not the namespace it came on.
 		{"dev list namespaces (cluster-scoped)", "dev", http.MethodGet, "/api/v1/namespaces", true},
-		{"dev get one named namespace", "dev", http.MethodGet, "/api/v1/namespaces/foo", false},
+		{"dev get one named namespace", "dev", http.MethodGet, "/api/v1/namespaces/foo", true},
 		// prod: one named namespace only
 		{"prod pods in default", "prod", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", true},
 		{"prod pods in other", "prod", http.MethodGet, "/api/v1/namespaces/other/pods/nginx", false},

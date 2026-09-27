@@ -15,7 +15,11 @@ import (
 const (
 	defaultConfigDir  = "sb"
 	defaultConfigFile = "config.yaml"
-	defaultListenAddr = ":0"
+	// defaultListenAddr is the default listen address of the credential
+	// proxies: loopback, a free port. Downstreams reach them on the same
+	// host; listening beyond loopback is the --*-listen flags' call, and
+	// it requires --host (the host written into the credentials they use).
+	defaultListenAddr = "127.0.0.1:0"
 )
 
 func main() {

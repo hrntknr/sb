@@ -78,8 +78,9 @@ func (p *Proxy) stopContext() context.Context {
 }
 
 // BeginStop starts the shutdown: everything the open connections started
-// upstream — dials, handshakes, ProxyCommand children — is cancelled
-// here, once. The connections themselves are closed by Shutdown.
+// upstream — dials, handshakes, ProxyCommand children — is cancelled here,
+// once, and the connections themselves are closed: no operation reaches
+// the upstream after it — their cleanups follow.
 func (p *Proxy) BeginStop() {
 	p.stopContext()
 	p.stopMu.Lock()
@@ -88,6 +89,7 @@ func (p *Proxy) BeginStop() {
 	if cancel != nil {
 		cancel()
 	}
+	p.conns.closeAll()
 }
 
 // WriteConfig issues downstream credentials and writes the ssh config, private

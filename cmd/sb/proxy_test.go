@@ -49,6 +49,19 @@ func writeK8sSource(t *testing.T, path string) {
 	}
 }
 
+// proxyTestConfig returns a config with one rule per protocol in use:
+// ssh and k8s. The aws issuance's startup resolves its sessions against
+// the source, so a test that wants the aws protocol in use provides a
+// working source for it and adds its rule on its own.
+func proxyTestConfig() v3.Config {
+	return v3.Config{
+		SSH: []v3.SSHRule{{Host: "github.com"}},
+		K8s: []v3.K8sRule{{Context: "dev", Resources: []v3.ResourceRule{{
+			Group: "", Resource: "namespaces", Namespace: "*", Scope: "cluster", Verbs: []string{"get", "list"},
+		}}}},
+	}
+}
+
 // startProxyBounded runs startProxy with a return bound: a start that does
 // not return — a ready that never comes, an issuance that never begins —
 // is a hung start, and the bound reports it instead of waiting forever.
@@ -87,7 +100,15 @@ func TestStartProxyFailureStopsTheOtherSide(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	_, err := startProxy(ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	// One rule per protocol in use: the ssh and k8s sides start, and the
+	// aws side's issuance starts too — the failure stops it mid-flight.
+	cfg := proxyTestConfig()
+	cfg.AWS = []v3.AWSRule{{
+		Profile:  "dev",
+		RoleARN:  "arn:aws:iam::123456789012:role/dev",
+		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
+	}}
+	_, err := startProxy(ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a corrupt upstream kubeconfig; want a failure")
 	}
@@ -118,7 +139,15 @@ func TestStartProxyCancelledDuringStartup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the run is cancelled before anything starts
 	issueDir := t.TempDir()
-	_, err := startProxy(ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	// One rule per protocol in use: the cancelled run is a failed start
+	// for every protocol, and nothing the failed start issued stays.
+	cfg := proxyTestConfig()
+	cfg.AWS = []v3.AWSRule{{
+		Profile:  "dev",
+		RoleARN:  "arn:aws:iam::123456789012:role/dev",
+		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
+	}}
+	_, err := startProxy(ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a cancelled run; want a failure")
 	}
@@ -130,6 +159,81 @@ func TestStartProxyCancelledDuringStartup(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("%s still exists after the failed start: %v", name, err)
 		}
+	}
+}
+
+// TestStartProxyStartsOnlyConfiguredProtocols covers the protocol set the
+// start serves: only the protocols the configuration has rules for are
+// started. The k8s source is corrupt here — a k8s protocol in use would
+// fail the start on it; the protocol is not in use, so its source is
+// never read, and the start succeeds. The protocols not in use issue
+// nothing: only the ssh protocol's credentials are under the dir, and
+// the stop joins nothing that never started.
+func TestStartProxyStartsOnlyConfiguredProtocols(t *testing.T) {
+	_, kubeconfigPath := startProxyTestEnv(t)
+	// The k8s source is corrupt: a k8s protocol in use would fail the
+	// start on it.
+	if err := os.WriteFile(kubeconfigPath, []byte("not yaml: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	// Only the ssh protocol is in use: one ssh rule.
+	cfg := v3.Config{SSH: []v3.SSHRule{{Host: "github.com"}}}
+	server, err := startProxy(ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	if err != nil {
+		t.Fatalf("startProxy() = %v; want a start that skips the k8s read", err)
+	}
+
+	// Only the ssh protocol's issuance is under the dir: the protocols
+	// not in use issued nothing.
+	if _, err := os.Stat(filepath.Join(issueDir, ".ssh")); err != nil {
+		t.Fatal(".ssh was not issued; want the ssh protocol's issuance")
+	}
+	for _, name := range []string{".kube", ".aws"} {
+		if _, err := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s was issued; the protocol is not in use", name)
+		}
+	}
+
+	// The stop joins nothing that never started: it reports true.
+	if !server.Stop(shutdownCtx()) {
+		t.Fatal("Stop() reported false; nothing is waited for that never started")
+	}
+}
+
+// TestStartProxyWithoutProtocols covers the configuration with no rules
+// at all: no protocol is in use, so nothing is started, issued, or read.
+// The corrupt sources would fail a start that read them; this start
+// does not, and the stop joins nothing — the empty set exits within any
+// deadline.
+func TestStartProxyWithoutProtocols(t *testing.T) {
+	awsSource, kubeconfigPath := startProxyTestEnv(t)
+	// Both sources are corrupt: a protocol in use would fail the start
+	// on its source.
+	if err := os.WriteFile(kubeconfigPath, []byte("not yaml: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(awsSource, []byte("["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	issueDir := t.TempDir()
+	server, err := startProxy(ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	if err != nil {
+		t.Fatalf("startProxy() = %v; want a start that starts nothing", err)
+	}
+	for _, name := range []string{".ssh", ".kube", ".aws"} {
+		if _, err := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s was issued; the protocol is not in use", name)
+		}
+	}
+	if !server.Stop(shutdownCtx()) {
+		t.Fatal("Stop() reported false; nothing is waited for that never started")
 	}
 }
 
@@ -169,7 +273,7 @@ func TestStartProxyK8sSourceReadFailureIsReported(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxyBounded(t, ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a failing source read; want a failure")
 	}
@@ -246,7 +350,7 @@ func TestStartProxyCancelledDuringReadyWait(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
 		cancel()
 	}()
-	server, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxyBounded(t, ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	_ = server
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("startProxy() = %v; want context.Canceled", err)
@@ -348,7 +452,7 @@ func TestStartProxyReportsTheUnfinishedReclamation(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
 		cancel()
 	}()
-	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxyBounded(t, ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err == nil {
 		t.Fatal("startProxy() with a cancelled run; want a failure")
 	}
@@ -388,7 +492,7 @@ func TestStopJoinsTheIssuanceTasks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	server, err := startProxy(ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	server, err := startProxy(ctx, proxyTestConfig(), options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +513,10 @@ func TestStopJoinsTheIssuanceTasks(t *testing.T) {
 		t.Fatal("Stop() did not join the issuing tasks within the deadline")
 	}
 	// The deletion: what the issuing tasks wrote is gone after them.
-	removeIssued(issueDir)
+	// A failing deletion joins the run's result; nothing stays silently.
+	if err := removeIssued(issueDir); err != nil {
+		t.Fatalf("removeIssued() error = %v", err)
+	}
 
 	// The join means the exit: nothing writes anymore. What the source
 	// would have reissued after the deletion does not come back.
@@ -446,4 +553,99 @@ func kubeconfigFifoParts() (first, rest string) {
 		"- name: dev\n  cluster:\n    server: https://127.0.0.1:9999\n    insecure-skip-tls-verify: true\n" +
 			"users:\n- name: dev\n  user:\n    token: upstream-token\n" +
 			"contexts:\n- name: dev\n  context:\n    cluster: dev\n    user: dev\ncurrent-context: dev\n"
+}
+
+// TestProxyExposureRequiresHostBeyondLoopback covers the exposure check:
+// listening beyond loopback must carry --host — the credentials point
+// downstreams at the host they reach the proxy at, and it must be given.
+// Loopback listens need nothing: the defaults bind loopback.
+func TestProxyExposureRequiresHostBeyondLoopback(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr bool
+	}{
+		{"no flags: defaults bind loopback", nil, false},
+		{"loopback listen", []string{"--ssh-listen", "127.0.0.1:2222"}, false},
+		{"wildcard listen", []string{"--ssh-listen", "0.0.0.0:2222"}, true},
+		{"all-interfaces listen", []string{"--ssh-listen", ":2222"}, true},
+		{"named listen", []string{"--aws-listen", "proxy.example:0"}, true},
+		{"address listen", []string{"--k8s-listen", "192.168.1.5:6443"}, true},
+		{"wildcard listen with --host", []string{"--ssh-listen", ":2222", "--host", "proxy.example"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := &options{}
+			cmd := newProxyCommand(opts)
+			if err := cmd.Flags().Parse(tt.args); err != nil {
+				t.Fatal(err)
+			}
+			err := checkProxyExposure(cmd, *opts)
+			if tt.wantErr && err == nil {
+				t.Fatal("checkProxyExposure() = nil; want an error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("checkProxyExposure() = %v; want no error", err)
+			}
+		})
+	}
+}
+
+// TestProxyExposureRejectsWildcardHost covers the host half of the exposure
+// check: the host written into the credentials must be a destination. A
+// wildcard address (0.0.0.0, ::) listens; nothing connects to it.
+func TestProxyExposureRejectsWildcardHost(t *testing.T) {
+	for _, host := range []string{"", "0.0.0.0", "::", "[::]"} {
+		opts := &options{}
+		cmd := newProxyCommand(opts)
+		if err := cmd.Flags().Parse([]string{"--host", host}); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkProxyExposure(cmd, *opts); err == nil {
+			t.Fatalf("checkProxyExposure(--host %q) = nil; want an error", host)
+		}
+	}
+	for _, host := range []string{"localhost", "proxy.example", "127.0.0.1", "::1"} {
+		opts := &options{}
+		cmd := newProxyCommand(opts)
+		if err := cmd.Flags().Parse([]string{"--host", host}); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkProxyExposure(cmd, *opts); err != nil {
+			t.Fatalf("checkProxyExposure(--host %q) = %v; want no error", host, err)
+		}
+	}
+}
+
+// TestRemoveIssued covers the reclamation's own contract: the three
+// subtrees sb issued are removed, anything else in the dir stays, and
+// the removal reports what could not be removed instead of dropping
+// it in a log line.
+func TestRemoveIssued(t *testing.T) {
+	dir := t.TempDir()
+	for _, path := range []string{".ssh/config", ".ssh/id_ed25519", ".ssh/known_hosts", ".kube/config", ".aws/credentials"} {
+		full := filepath.Join(dir, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Someone else's file in the same dir: not sb's to delete.
+	if err := os.WriteFile(filepath.Join(dir, "own.txt"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeIssued(dir); err != nil {
+		t.Fatalf("removeIssued() error = %v", err)
+	}
+	for _, name := range []string{".ssh", ".kube", ".aws"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists after the removal: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "own.txt")); err != nil {
+		t.Fatalf("own.txt did not survive the removal: %v", err)
+	}
 }

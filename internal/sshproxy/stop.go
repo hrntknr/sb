@@ -6,12 +6,11 @@ import (
 	"sync"
 )
 
-// Shutdown stops the proxy's downstream connections: new connections are
-// rejected, open ones are closed, cancelling their transfers and upstream
-// requests, and Shutdown waits for the last connection's cleanup to finish.
-// ctx bounds the wait; after its deadline, Shutdown returns.
+// Shutdown waits for the open connections' cleanups: the connections
+// themselves are closed by BeginStop — each one's transfers and upstream
+// requests cancelled by the cleanup it triggers. ctx bounds the wait;
+// after its deadline, Shutdown returns.
 func (p *Proxy) Shutdown(ctx context.Context) {
-	p.conns.closeAll()
 	p.conns.wait(ctx)
 }
 
@@ -49,8 +48,10 @@ func (c *connSet) untrack(conn net.Conn) {
 	c.wg.Done()
 }
 
-// closeAll closes every tracked connection: their transfers and upstream
-// requests are cancelled by the cleanup this triggers.
+// closeAll closes the set itself and every tracked connection: nothing
+// may join it anymore, and no connection open at the stop keeps operating
+// — its new channels, requests, and data are cut with it. The cleanup
+// this triggers cancels its transfers and upstream requests.
 func (c *connSet) closeAll() {
 	c.mu.Lock()
 	if c.closed {

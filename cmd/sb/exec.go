@@ -14,28 +14,26 @@ import (
 	"golang.org/x/term"
 )
 
-// newExecCommand builds `sb exec [--] <command>...`: run a command
-// inside a container started by `sb run`.
+// newExecCommand builds `sb exec --name name [--] <command>...`: run a
+// command inside a container started by `sb run`.
 func newExecCommand(opts *options) *cobra.Command {
 	var name, workdir string
 	cmd := &cobra.Command{
-		Use:   "exec [--] <command>...",
+		Use:   "exec --name name [--] <command>...",
 		Short: "Run a command inside a container started by sb run",
 		Long: `Run a command inside a container started by sb run, from
-another terminal. It targets the session started with the same --name
-(default "default"): the runtime and container ID come from that
-session's record, cross-checked against the runtime's own records, so a
-dead session or a container that took over the name connects to
-nothing. The command's exit code becomes sb's. Use -- when the command
-starts with -:
+another terminal. It targets the session its --name names: the runtime
+and container ID come from that session's record, cross-checked against
+the runtime's own records, so a dead session or a container that took
+over the name connects to nothing. The current config is not consulted.
+The command's exit code becomes sb's. Use -- when the command starts
+with -:
 
-  sb exec zsh -l
-  sb exec --name dev zsh -l
-  sb exec -- claude --settings '{"sandbox":{"enabled":false}}'
+  sb exec --name default zsh -l
+  sb exec --name dev -- kubectl get pods
+  sb exec --name default -w /work -- pwd
 
---workdir sets the working directory inside the container:
-
-  sb exec -w /work -- kubectl get pods`,
+--workdir sets the working directory inside the container.`,
 		Args:          cobra.MinimumNArgs(1),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -51,7 +49,8 @@ starts with -:
 			return execCommand(*opts, name, workdir, args)
 		},
 	}
-	cmd.Flags().StringVar(&name, "name", "default", "name of the session started by sb run")
+	cmd.Flags().StringVar(&name, "name", "", "name of the session started by sb run")
+	_ = cmd.MarkFlagRequired("name")
 	cmd.Flags().StringVarP(&workdir, "workdir", "w", "", "working directory inside the container")
 	// Flags after the first plain argument belong to the container
 	// command, not to sb.

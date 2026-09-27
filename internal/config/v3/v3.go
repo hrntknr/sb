@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/hrntknr/sb/internal/awsproxy"
+	"github.com/hrntknr/sb/internal/k8sproxy"
 	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -336,6 +337,21 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 	}
 	if d.Scope != nil && *d.Scope != "cluster" {
 		return ResourceRule{}, fmt.Errorf("invalid scope %q (want cluster)", *d.Scope)
+	}
+	// The rule's shape must match the scope the Kubernetes API gives
+	// the resource: a cluster-scoped one takes scope: cluster, a
+	// namespaced one a namespace.
+	if clusterScoped, known := k8sproxy.CoreResourceScope(*d.Group, d.Resource); known {
+		if clusterScoped {
+			if d.Namespace != nil {
+				return ResourceRule{}, fmt.Errorf("%s is cluster-scoped: give scope: cluster, not a namespace", d.Resource)
+			}
+			if d.Scope == nil {
+				return ResourceRule{}, fmt.Errorf("%s is cluster-scoped: give scope: cluster", d.Resource)
+			}
+		} else if d.Scope != nil {
+			return ResourceRule{}, fmt.Errorf("%s is namespaced: give a namespace, not scope: cluster", d.Resource)
+		}
 	}
 	if d.Namespace == nil && d.Scope == nil {
 		return ResourceRule{}, errors.New("namespace is required (or set scope: cluster for cluster-scoped resources)")

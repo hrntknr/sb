@@ -16,7 +16,7 @@ Or run the proxy manually and mount the generated credentials yourself:
 
 ```
 $ tmp=$(mktemp -d)
-$ sb proxy $tmp &
+$ sb proxy --output $tmp &
 $ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.kube -v $tmp/.aws:/root/.aws ghcr.io/hrntknr/sh:full
 ```
 
@@ -62,12 +62,12 @@ Notes:
 
 ## Running commands inside: `sb exec`
 
-While `sb run` is running, `sb exec` runs a command inside its container from another terminal. It targets the session by the name the run used: the runtime, the container ID, and the session label come from that session's record, cross-checked against the runtime's own records, so a session that is not alive, or a container that took over the name, connects to nothing. The current config is not consulted. The command's exit code becomes sb's.
+While `sb run` is running, `sb exec` runs a command inside its container from another terminal. It targets the session its `--name` names (required): the runtime, the container ID, and the session label come from that session's record, cross-checked against the runtime's own records, so a session that is not alive, or a container that took over the name, connects to nothing. The current config is not consulted. The command's exit code becomes sb's.
 
 ```
-$ sb exec zsh -l
+$ sb exec --name default zsh -l
 $ sb exec --name dev -- kubectl get pods
-$ sb exec -w /work -- pwd
+$ sb exec --name default -w /work -- pwd
 ```
 
 
@@ -195,12 +195,13 @@ What sb revokes is bounded by the proxy's lifetime: the credentials it issues wo
 
 Shared flags (available on every subcommand): `--config`, which accepts the v3 form only (`version: 3`; a v2 config is rejected), and `--log-level`. `sb proxy` adds:
 
-| Flag           | Default     | Description                            |
-| -------------- | ----------- | -------------------------------------- |
-| `--host`       | `localhost` | Host written into the generated config |
-| `--ssh-listen` | `:0`        | SSH listen address                     |
-| `--k8s-listen` | `:0`        | k8s listen address                     |
-| `--aws-listen` | `:0`        | AWS listen address                     |
+| Flag           | Default         | Description                                   |
+| -------------- | --------------- | --------------------------------------------- |
+| `--output`     | required        | Directory to write the issued credentials under |
+| `--host`       | `localhost`     | Host written into the generated credentials |
+| `--ssh-listen` | `127.0.0.1:0`   | SSH listen address |
+| `--k8s-listen` | `127.0.0.1:0`   | k8s listen address |
+| `--aws-listen` | `127.0.0.1:0`   | AWS listen address |
 
 ## Build
 

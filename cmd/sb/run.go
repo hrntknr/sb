@@ -4,16 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
-	"time"
 
 	v3 "github.com/hrntknr/sb/internal/config/v3"
 	"github.com/hrntknr/sb/internal/containers"
@@ -104,9 +103,10 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	// Orphans from a killed sb are reclaimed here: their locks are gone,
 	// so the sweep stops and removes their containers by session label.
 	// What the sweep could not remove stays for the next sweep — nothing
-	// may overwrite it.
+	// may overwrite it. Its failure must show whatever the log level
+	// (the default drops log lines): stderr carries it.
 	if err := session.Sweep(sessionsDir); err != nil {
-		slog.Warn("session sweep failed; orphans stay for the next sweep", "error", err)
+		fmt.Fprintf(os.Stderr, "sb: session sweep failed; orphans stay for the next sweep: %v\n", err)
 	}
 	if name == "" {
 		name = session.NewSessionName()
@@ -136,19 +136,21 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	//
 	//   (1) the proxies stop accepting and cancel their upstreams,
 	//       waiting for their cleanups within the deadline — whatever
-	//       the child CLI is doing meanwhile;
-	//   (2) the poller stops, then the session stops: its containers are
-	//       removed by label, its issue dir and record dropped — what
-	//       could not be removed keeps the record for the next sweep;
-	//   (3) the child CLI is killed and reaped within WaitDelay.
+	//       the CLIs are doing meanwhile;
+	//   (2) the session stops: its containers are removed by label, its
+	//       issue dir and record dropped — what could not be removed,
+	//       and what is still being created (its result unknown), keeps
+	//       the record for the next sweep;
+	//   (3) the CLIs are killed and reaped within WaitDelay.
 	//
-	// Nothing in the flow waits for the child's own exit.
+	// Nothing in the flow waits for a CLI's own exit.
 	var (
-		proxy     *proxyServer
-		child     *exec.Cmd
-		pollStop  chan struct{}
-		pollDone  <-chan struct{}
-		childDone <-chan struct{}
+		proxy           *proxyServer
+		create          *exec.Cmd
+		start           *exec.Cmd
+		createDone      <-chan struct{}
+		startDone       <-chan struct{}
+		creationSettled bool
 	)
 	defer func() {
 		var errs []error
@@ -157,7 +159,7 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 		}
 		// (1) Communication cut: the proxies stop accepting, cancel their
 		// upstreams, and are waited for within the deadline — whatever
-		// the child CLI is doing meanwhile.
+		// the CLIs are doing meanwhile.
 		issuanceExited := true
 		if proxy != nil {
 			// The stop joins the issuing tasks within the deadline:
@@ -165,24 +167,23 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 			// the record stay, and the next sweep retries with them.
 			issuanceExited = proxy.Stop(shutdownCtx())
 		}
-		if pollDone != nil {
-			// (2) The poller stops: nothing records the container ID
-			// anymore, whatever the child CLI does next.
-			close(pollStop)
-			<-pollDone
-		}
-		// (3) Container reclaim: the session's containers are removed
+		// (2) Container reclaim: the session's containers are removed
 		// by label, its issue dir and record dropped. What could not be
-		// removed keeps the record for the next sweep.
-		if err := session.StopSession(sessionsDir, name, lock, issuanceExited); err != nil {
+		// removed — or what is still being created, its result unknown —
+		// keeps the record for the next sweep.
+		if err := session.StopSession(sessionsDir, name, lock, issuanceExited, creationSettled); err != nil {
 			errs = append(errs, err)
 		}
-		// (4) Child collection: what is left of the CLI is killed, and
-		// its reaping is bounded by WaitDelay. Nothing in this flow
-		// waits for the child's own exit.
-		if childDone != nil {
-			_ = child.Process.Kill()
-			<-childDone
+		// (3) CLI collection: what is left of them is killed, and the
+		// reaping is bounded by WaitDelay. Nothing in this flow waits
+		// for a CLI's own exit.
+		if createDone != nil {
+			_ = create.Process.Kill()
+			<-createDone
+		}
+		if startDone != nil {
+			_ = start.Process.Kill()
+			<-startDone
 		}
 		if len(errs) > 0 {
 			retErr = errors.Join(errs...)
@@ -202,83 +203,128 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	go func() { proxyErr <- proxy.Wait() }()
 
 	tty := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	child = exec.CommandContext(runCtx, rt.Binary(), containers.Args(
-		rt, host, issueDir, name, network,
+
+	// The creation is its own step: the CLI creates the container stopped,
+	// writes its ID to the cidfile under the issue dir, and exits. Nothing
+	// runs before the container's ID is fixed — the reclaim may not settle
+	// what the runtime has not committed yet.
+	create = exec.CommandContext(runCtx, rt.Binary(), containers.CreateArgs(
+		rt, host, issueDir, enabledProtocols(cfg), name, network,
 		envArgs(cfg.Container.Environment), tty,
 		mountArgs(cfg.Container.Mounts),
 		[]string{containers.SessionLabelArg(sessionID)},
 		image, init, userArgs,
 	)...)
-	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
-	child.WaitDelay = session.RuntimeWait
-	if err := child.Start(); err != nil {
+	// The ID the CLI prints on stdout is noise here; its stderr is the
+	// creation's own complaint.
+	create.Stdout = io.Discard
+	create.Stderr = os.Stderr
+	create.WaitDelay = session.RuntimeWait
+	if err := create.Start(); err != nil {
 		return err
 	}
-	childDone2 := make(chan struct{})
-	childDone = childDone2
-	pollStop = make(chan struct{})
-
-	// The runtime CLI writes the container ID to the cidfile under the
-	// issue dir once the container exists; recording it is what sb exec
-	// verifies against the runtime. The poller stops when the stop flow
-	// starts (pollStop), not when the CLI exits — its recording is not
-	// part of the child's collection.
-	childErr := make(chan error, 1)
+	createDone2 := make(chan struct{})
+	createDone = createDone2
+	createErr := make(chan error, 1)
 	go func() {
-		err := child.Wait()
-		close(childDone2)
-		childErr <- err
-	}()
-	pollDone2 := make(chan struct{})
-	pollDone = pollDone2
-	go func() {
-		defer close(pollDone2)
-		recordContainerID(sessionsDir, &rec, issueDir, pollStop)
+		err := create.Wait()
+		close(createDone2)
+		createErr <- err
 	}()
 
-	// Wait for whatever ends the run. The child's exit is never the
+	// Wait for whatever ends this step. A CLI's exit is never the
 	// condition for stopping: whatever ends it here, the same stop flow
 	// follows on return.
 	select {
 	case err := <-proxyErr:
 		if err != nil {
-			// A proxy component failed: the child is killed and reaped
+			// A proxy component failed: the CLIs are killed and reaped
 			// by the deferred stop flow.
 			retErr = fmt.Errorf("proxy: %w", err)
 			return retErr
 		}
-		// Interrupted: the child was killed by the signal already.
+		// Interrupted: the creation CLI was killed by the signal
+		// already; its result is unknown.
 		retErr = nil
 		return retErr
-	case err := <-childErr:
-		// The child exited by itself: its exit is the run's.
+	case err := <-createErr:
+		if err != nil && runCtx.Err() == nil {
+			// The creation failed on its own: the container never
+			// existed. Its result is settled — the reclaim has
+			// nothing to wait for.
+			creationSettled = true
+			retErr = fmt.Errorf("create: %w", err)
+			return retErr
+		}
+		if err != nil {
+			// Interrupted: the creation CLI was killed
+			// mid-creation; its result is unknown. Nothing starts.
+			retErr = nil
+			return retErr
+		}
+		// The creation settled: the container exists, stopped. Record
+		// its ID in the session record — sb exec verifies against it —
+		// then start it: nothing starts before the ID is fixed.
+		rec.ContainerID = containerID(issueDir)
+		if rec.ContainerID == "" {
+			// The runtime exited without recording an ID: nothing
+			// may start, and the record stays for the next sweep.
+			retErr = errors.New("runtime exited without recording the container ID")
+			return retErr
+		}
+		creationSettled = true
+		if err := session.SaveRecord(sessionsDir, rec); err != nil {
+			retErr = fmt.Errorf("session record: %w", err)
+			return retErr
+		}
+	}
+
+	// The execution is its own step: the CLI starts the created
+	// container and attaches to it — its streams are the container's,
+	// its exit is the container's.
+	start = exec.CommandContext(runCtx, rt.Binary(), containers.StartArgs(rec.ContainerID, tty)...)
+	start.Stdin, start.Stdout, start.Stderr = os.Stdin, os.Stdout, os.Stderr
+	start.WaitDelay = session.RuntimeWait
+	if err := start.Start(); err != nil {
+		return err
+	}
+	startDone2 := make(chan struct{})
+	startDone = startDone2
+	startErr := make(chan error, 1)
+	go func() {
+		err := start.Wait()
+		close(startDone2)
+		startErr <- err
+	}()
+
+	// Wait for whatever ends the run: a proxy component failing, the
+	// interruption, or the start CLI — whose exit is the container's —
+	// exiting by itself.
+	select {
+	case err := <-proxyErr:
+		if err != nil {
+			retErr = fmt.Errorf("proxy: %w", err)
+			return retErr
+		}
+		// Interrupted: the CLIs were killed by the signal already.
+		retErr = nil
+		return retErr
+	case err := <-startErr:
+		// The start CLI exited by itself: its exit is the run's.
 		retErr = exitStatus(err)
 		return retErr
 	}
 }
 
-// recordContainerID waits for the runtime CLI to write the container ID to
-// the cidfile under the issue dir and records it in the session record for
-// sb exec. It returns when stop is closed (the stop flow started) — with or
-// without a cidfile.
-func recordContainerID(sessionsDir string, rec *session.Record, issueDir string, stop <-chan struct{}) {
-	cidPath := filepath.Join(issueDir, "cid")
-	for {
-		if data, err := os.ReadFile(cidPath); err == nil {
-			if cid := strings.TrimSpace(string(data)); cid != "" && cid != rec.ContainerID {
-				rec.ContainerID = cid
-				if err := session.SaveRecord(sessionsDir, *rec); err != nil {
-					slog.Warn("session record: save container ID", "error", err)
-					return
-				}
-			}
-		}
-		select {
-		case <-stop:
-			return
-		case <-time.After(20 * time.Millisecond):
-		}
+// containerID reads the ID the creation CLI recorded in the cidfile under
+// the issue dir: the container's ID, fixed once the CLI exited. An empty
+// answer means the runtime recorded nothing.
+func containerID(issueDir string) string {
+	data, err := os.ReadFile(containers.CidFile(issueDir))
+	if err != nil {
+		return ""
 	}
+	return strings.TrimSpace(string(data))
 }
 
 func resolveRuntime(name string) (containers.Runtime, error) {

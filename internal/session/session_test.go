@@ -222,7 +222,7 @@ func TestStopSessionKeepsTheRecordOnFailedRemoval(t *testing.T) {
 	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
 	t.Setenv("PATH", "/nonexistent")
 
-	err := StopSession(dir, "orphan", lock, true)
+	err := StopSession(dir, "orphan", lock, true, true)
 	if err == nil {
 		t.Fatal("StopSession() succeeded without a runtime, want error")
 	}

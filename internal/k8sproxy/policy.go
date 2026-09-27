@@ -93,16 +93,24 @@ func ruleAllows(rule Resource, info *apirequest.RequestInfo) bool {
 	if !slices.Contains(rule.Verbs, info.Verb) {
 		return false
 	}
-	return namespaceAllowed(rule, info.Namespace)
+	return namespaceAllowed(rule, info)
 }
 
 // namespaceAllowed reports whether the request's namespace is covered:
 // a namespaced request passes in the rule's namespace (or any namespace,
 // with "*"), and a request without a namespace — all namespaces, or a
-// cluster-scoped one — passes only an explicit "*" or a cluster rule.
-func namespaceAllowed(rule Resource, namespace string) bool {
-	if namespace == "" {
+// cluster-scoped collection — passes only an explicit "*" or a cluster
+// rule. A cluster-scoped resource's requests carry the namespace of
+// their path (GET /api/v1/namespaces/foo — the namespace named foo —
+// reads as namespace foo): that namespace is the parsing, not a scope.
+// The resource's scope decides, and a cluster rule covers the named get
+// like the collection.
+func namespaceAllowed(rule Resource, info *apirequest.RequestInfo) bool {
+	if clusterScoped, _ := CoreResourceScope(info.APIGroup, info.Resource); clusterScoped {
 		return rule.Scope == "cluster" || rule.Namespace == "*"
 	}
-	return rule.Namespace == "*" || rule.Namespace == namespace
+	if info.Namespace == "" {
+		return rule.Scope == "cluster" || rule.Namespace == "*"
+	}
+	return rule.Namespace == "*" || rule.Namespace == info.Namespace
 }
