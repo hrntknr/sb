@@ -46,3 +46,23 @@ func TestStoppedContextEndsItsWatchWithTheBase(t *testing.T) {
 		t.Fatal("the context was not done")
 	}
 }
+
+// TestStoppedContextReleaseEndsTheWatch covers the release's end: the
+// watch on the stop ends when the call it carried is over — the
+// context it returned is done being used, its Done does not fire
+// after that, whatever the stop does.
+func TestStoppedContextReleaseEndsTheWatch(t *testing.T) {
+	stop, stopCancel := context.WithCancel(context.Background())
+	defer stopCancel()
+	base, baseCancel := context.WithCancel(context.Background())
+	defer baseCancel()
+
+	ctx, release := StoppedContextRelease(stop, base)
+	release()    // the call it carried is over: the watch ends with it
+	stopCancel() // the stop begins: nothing fires for the context
+	select {
+	case <-ctx.Done():
+		t.Fatal("Done fired after the release; the watch ended with it")
+	default:
+	}
+}

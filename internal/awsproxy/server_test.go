@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -806,6 +807,64 @@ func TestStopCutsTheContainerCredentialsUpstream(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the startup did not return")
 	}
+}
+
+// TestSuccessfulFetchesLeaveNoWatchBehind covers the watch's lifetime:
+// the call's watch — the one that cuts its request when the stop begins
+// — ends with the call, not with the session's stop. A fetch that
+// succeeds without a stop must not leave one watching: each call that
+// completed releases it.
+func TestSuccessfulFetchesLeaveNoWatchBehind(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// No static source credentials: the profile's own fall to the
+	// container endpoint — the chain fetches them there.
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The container credentials endpoint: it serves the credentials
+	// and closes the connection after — the transport's connection
+	// goroutines end when the connection does, not pooled for the
+	// idle timeout.
+	containerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Connection", "close")
+		_, _ = io.WriteString(w, `{"AccessKeyId":"CONTAINER","SecretAccessKey":"secret","Token":"token","Expiration":"2099-01-01T00:00:00Z"}`)
+	}))
+	defer containerServer.Close()
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", containerServer.URL)
+	baseline := runtime.NumGoroutine()
+	for i := 0; i < 4; i++ {
+		// The load builds the chain — the container endpoint's
+		// client — and the fetch goes over it and succeeds: the
+		// credentials come back, no stop ever begins.
+		cfg, err := loadSourceConfig(context.Background(), "dev")
+		if err != nil {
+			t.Fatal(err)
+		}
+		creds, err := cfg.Credentials.Retrieve(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if creds.AccessKeyID != "CONTAINER" {
+			t.Fatalf("the fetch did not reach the endpoint: %v", creds.AccessKeyID)
+		}
+	}
+	// Each fetch's watch ended with it: the count returns to the
+	// baseline. A watch that stayed behind its call would hold the
+	// count above it — one per fetch.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseline+2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the watches did not leave: %d goroutines, want at most %d", runtime.NumGoroutine(), baseline+2)
 }
 
 // TestStopCutsTheSharedConfigAssumeRoleUpstream covers the stop cutting

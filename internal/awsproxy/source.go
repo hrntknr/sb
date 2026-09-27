@@ -65,11 +65,15 @@ func stopAPIOptions(stop context.Context) []func(*middleware.Stack) error {
 			) (middleware.BuildOutput, middleware.Metadata, error) {
 				// The request carries a context the chain suppressed:
 				// the one the cache resolved under, whose Done never
-				// fires. What the transport carries instead is the
-				// session's stop — what the session has already
-				// cancelled is refused, what is in flight is cut when
-				// the stop begins.
-				return next.HandleBuild(util.StoppedContext(stop, ctx), in)
+				// fires. The call carries the session's stop instead:
+				// what the session has already cancelled is refused,
+				// what is in flight is cut when the stop begins — and
+				// the watch that carries it ends with the call: the
+				// release runs when the build returns, so a call
+				// that completed leaves nothing watching the stop.
+				call, release := util.StoppedContextRelease(stop, ctx)
+				defer release()
+				return next.HandleBuild(call, in)
 			}), middleware.After)
 		},
 	}

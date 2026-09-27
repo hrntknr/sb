@@ -37,6 +37,48 @@ func StoppedContext(stop, base context.Context) context.Context {
 	return ctx
 }
 
+// StoppedContextRelease returns a context that is done when the stop
+// begins or the base ends, whichever comes first, and a release that
+// ends the watch: nothing tracks the stop once the release has run,
+// and the context's Done never fires after that. The watch is gone
+// when the release returns. The release runs once.
+func StoppedContextRelease(stop, base context.Context) (context.Context, func()) {
+	if stop == nil {
+		return base, func() {}
+	}
+	if base == nil {
+		return stop, func() {}
+	}
+	ctx := &stoppedContext{stop: stop, base: base, done: make(chan struct{})}
+	if stop.Err() != nil {
+		// The stop already began: the context is cancelled here, not
+		// by a goroutine that runs later.
+		close(ctx.done)
+		return ctx, func() {}
+	}
+	// The rest is done when the stop begins or the base ends,
+	// whichever comes first — the watch ends when the release runs:
+	// nothing fires the context after that.
+	watch := make(chan struct{})
+	gone := make(chan struct{})
+	go func() {
+		defer close(gone)
+		select {
+		case <-stop.Done():
+			close(ctx.done)
+		case <-base.Done():
+			close(ctx.done)
+		case <-watch:
+		}
+	}()
+	return ctx, func() {
+		// The watch is gone when this returns: the goroutine
+		// is not watching the stop anymore.
+		close(watch)
+		<-gone
+	}
+}
+
 type stoppedContext struct {
 	stop, base context.Context
 	done       chan struct{}
