@@ -614,6 +614,94 @@ func TestSyncFailurePersistsAcrossCalls(t *testing.T) {
 	}
 }
 
+// TestSyncFailureRetriesTheHomesLevels covers the fallback's levels above
+// the sb dir: .local and the state home under the home are the tree sb's
+// own calls may have built, and a level that exists is not thereby one
+// whose entry is on the disk. The failing sync is the home's — the sync
+// that persists .local's entry — and while it fails, no call may
+// succeed: from .local missing, every call stops at it. After the sync
+// recovers, the call goes through, and every entry of the tree is on
+// the disk with it.
+func TestSyncFailureRetriesTheHomesLevels(t *testing.T) {
+	// The fallback: no state home, HOME = a home that exists, and
+	// .local missing under it — the reviewer's path: the first call
+	// creates .local and fails at the home's sync, the next one
+	// walks from the .local that exists and would succeed without
+	// a single entry of the levels above it on the disk.
+	home := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("HOME", home)
+	if _, err := os.Stat(filepath.Join(home, ".local")); !os.IsNotExist(err) {
+		t.Fatalf(".local exists before the test: %v", err)
+	}
+	real := syncDirEntry
+	defer func() { syncDirEntry = real }()
+	syncDirEntry = func(dir string) error {
+		if dir == home {
+			return errSyncStopped
+		}
+		return real(dir)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := SessionsDir(); err == nil || !errors.Is(err, errSyncStopped) {
+			t.Fatalf("call %d: SessionsDir() = %v, want the home's sync failure", i, err)
+		}
+	}
+	// The sync recovers: the call goes through, and every entry of
+	// the tree is on the disk with it.
+	syncDirEntry = real
+	if _, err := SessionsDir(); err != nil {
+		t.Fatalf("SessionsDir() after the sync recovered: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "state", "sb", "sessions")); err != nil {
+		t.Fatalf("sessions dir after the sync recovered: %v", err)
+	}
+}
+
+// TestSyncFailureRetriesTheStateHomesLevel covers the state home's own
+// entry under an explicit XDG_STATE_HOME: pointed at a state home that
+// does not exist, sb creates it (the walk includes it), and the sync
+// that persists its entry — the state home's parent's — is what the
+// next call needs: while it fails, no call may succeed. The first call
+// creates the state home and fails at its parent's sync; the next one
+// walks from the state home that exists and would succeed without a
+// single entry of it on the disk. After the sync recovers, the call
+// goes through, and the state home's entry is on the disk with it.
+func TestSyncFailureRetriesTheStateHomesLevel(t *testing.T) {
+	// The state home: under a temp dir that exists (its parent), and
+	// missing — the reviewer's path for the uncreated state home.
+	tmp := t.TempDir()
+	stateHome := filepath.Join(tmp, "state")
+	t.Setenv("XDG_STATE_HOME", stateHome)
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	if _, err := os.Stat(stateHome); !os.IsNotExist(err) {
+		t.Fatalf("state home exists before the test: %v", err)
+	}
+	real := syncDirEntry
+	defer func() { syncDirEntry = real }()
+	syncDirEntry = func(dir string) error {
+		if dir == tmp {
+			return errSyncStopped
+		}
+		return real(dir)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := SessionsDir(); err == nil || !errors.Is(err, errSyncStopped) {
+			t.Fatalf("call %d: SessionsDir() = %v, want the state home's parent's sync failure", i, err)
+		}
+	}
+	// The sync recovers: the call goes through, and the state
+	// home's entry is on the disk with it.
+	syncDirEntry = real
+	if _, err := SessionsDir(); err != nil {
+		t.Fatalf("SessionsDir() after the sync recovered: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateHome, "sb", "sessions")); err != nil {
+		t.Fatalf("sessions dir after the sync recovered: %v", err)
+	}
+}
+
 // TestStateDirRefusesAWrongOwner covers the state dir's own directory:
 // an <XDG_STATE_HOME>/sb that exists as another user's (uid 1 here) is
 // refused — what sb writes under it would sit in another user's tree,
@@ -945,6 +1033,47 @@ func rmCalled(t *testing.T) bool {
 // errSaveSyncStopped is the failure the test injects into the record
 // save's sync: the settlement save's, after the rename.
 var errSaveSyncStopped = errors.New("save sync stopped for the test")
+
+// TestSyncFailureRetriesTheRuntimeHomesLevel covers the runtime home's
+// own entry under an explicit XDG_RUNTIME_DIR: pointed at a runtime
+// home that does not exist, sb creates it (the walk includes it), and
+// the sync that persists its entry — the runtime home's parent's — is
+// what the next call needs: while it fails, no call may succeed. The
+// first call creates the runtime home and fails at its parent's sync;
+// the next one walks from the runtime home that exists and would
+// succeed without a single entry of it on the disk. After the sync
+// recovers, the call goes through, and the runtime home's entry is on
+// the disk with it.
+func TestSyncFailureRetriesTheRuntimeHomesLevel(t *testing.T) {
+	// The runtime home: under a temp dir that exists (its parent),
+	// and missing — the same shape as the state home's, this side.
+	tmp := t.TempDir()
+	runtimeHome := filepath.Join(tmp, "runtime")
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", runtimeHome)
+	if _, err := os.Stat(runtimeHome); !os.IsNotExist(err) {
+		t.Fatalf("runtime home exists before the test: %v", err)
+	}
+	real := syncDirEntry
+	defer func() { syncDirEntry = real }()
+	syncDirEntry = func(dir string) error {
+		if dir == tmp {
+			return errSyncStopped
+		}
+		return real(dir)
+	}
+	for i := 1; i <= 3; i++ {
+		if _, err := NewIssueDir("sid"); err == nil || !errors.Is(err, errSyncStopped) {
+			t.Fatalf("call %d: NewIssueDir() = %v, want the runtime home's parent's sync failure", i, err)
+		}
+	}
+	// The sync recovers: the call goes through, and the runtime
+	// home's entry is on the disk with it.
+	syncDirEntry = real
+	if _, err := NewIssueDir("sid"); err != nil {
+		t.Fatalf("NewIssueDir() after the sync recovered: %v", err)
+	}
+}
 
 // TestNewIssueDirFallsBackPerUser covers the issue dir's fallback: without
 // a usable XDG_RUNTIME_DIR, the issue dir lives under this user's own
