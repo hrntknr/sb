@@ -463,7 +463,7 @@ func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
 	proxy := New(testPolicy("dev"), "proxy.local")
-	cancel := runSyncConfig(t, proxy, dir)
+	cancel := runSyncConfig(t, proxy, testProxyPort, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -476,7 +476,7 @@ func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 	// issuance read the changed source there.
 	writeSourceKubeconfig(t, sourcePath, "dev", "prod")
 	proxy2 := New(testPolicy("dev", "prod"), "proxy.local")
-	cancel2 := runSyncConfig(t, proxy2, dir)
+	cancel2 := runSyncConfig(t, proxy2, testProxyPort, dir)
 	defer cancel2()
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
@@ -489,7 +489,7 @@ func TestSyncConfigUsesUpstreamCurrentContextInitially(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev")
-	cancel := runSyncConfig(t, New(testPolicy("prod", "dev"), "proxy.local"), dir)
+	cancel := runSyncConfig(t, New(testPolicy("prod", "dev"), "proxy.local"), testProxyPort, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -508,7 +508,7 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 	// Session 1: the initial issuance renders with the source's current
 	// context (prod).
 	proxy := New(testPolicy("prod", "dev"), "proxy.local")
-	cancel := runSyncConfig(t, proxy, dir)
+	cancel := runSyncConfig(t, proxy, testProxyPort, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -531,7 +531,7 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 	// The next session: its initial issuance reads the inner override
 	// and keeps it.
 	proxy2 := New(testPolicy("prod", "dev"), "proxy.local")
-	cancel2 := runSyncConfig(t, proxy2, dir)
+	cancel2 := runSyncConfig(t, proxy2, testProxyPort, dir)
 	defer cancel2()
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
@@ -544,7 +544,7 @@ func TestSyncConfigUsesUpstreamNamespaceInitially(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "apps"}, "dev")
-	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), dir)
+	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), testProxyPort, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -563,7 +563,7 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 	// Session 1: the initial issuance renders with the source's
 	// namespace (apps).
 	proxy := New(testPolicy("dev"), "proxy.local")
-	cancel := runSyncConfig(t, proxy, dir)
+	cancel := runSyncConfig(t, proxy, testProxyPort, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -585,7 +585,7 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 	// The next session: its initial issuance reads the inner override
 	// and keeps it, even against the source's namespace.
 	proxy2 := New(testPolicy("dev"), "proxy.local")
-	cancel2 := runSyncConfig(t, proxy2, dir)
+	cancel2 := runSyncConfig(t, proxy2, testProxyPort, dir)
 	defer cancel2()
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
@@ -611,7 +611,7 @@ func TestSyncConfigEmptyDirWritesUnderWorkingDir(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "dev")
-	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), "")
+	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), testProxyPort, "")
 	defer cancel()
 
 	waitFor(t, func() bool {
@@ -1294,17 +1294,18 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	// whose initial issuance resolves the rewritten source, and a
 	// request made with what it issued — the generated kubeconfig's URL
 	// and token — no internal state set by hand.
-	issueDir := t.TempDir()
-	proxy2 := New(testPolicy("dev"), "localhost")
-	cancel2 := runSyncConfig(t, proxy2, issueDir)
-	defer cancel2()
-	// The issued kubeconfig's server URL names this port; the proxy
-	// serves there for the request to reach.
-	listener2, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", testProxyPort))
+	// The session's own listener comes first, on a dynamic port: the
+	// issuance names that port in the generated kubeconfig, and the
+	// proxy serves on that listener for the request to reach it.
+	listener2, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Listen() error = %v", err)
 	}
 	defer listener2.Close()
+	issueDir := t.TempDir()
+	proxy2 := New(testPolicy("dev"), "localhost")
+	cancel2 := runSyncConfig(t, proxy2, listener2.Addr().(*net.TCPAddr).Port, issueDir)
+	defer cancel2()
 	go func() {
 		_ = proxy2.Serve(listener2)
 	}()
@@ -1571,13 +1572,17 @@ func TestRenderKubeconfigIPv6Host(t *testing.T) {
 	}
 }
 
-func runSyncConfig(t *testing.T, proxy *Proxy, dir string) context.CancelFunc {
+// runSyncConfig starts the proxy's session issuance on port: the port
+// the issuance names in the generated kubeconfig. A test that serves
+// holds its own listener on that port — the proxy serves there; the
+// rest only read what the issuance wrote.
+func runSyncConfig(t *testing.T, proxy *Proxy, port int, dir string) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	ready := make(chan error, 1)
 	go func() {
-		errc <- proxy.SyncConfig(ctx, testProxyPort, dir, ready)
+		errc <- proxy.SyncConfig(ctx, port, dir, ready)
 	}()
 	if err := <-ready; err != nil {
 		t.Fatal(err)
