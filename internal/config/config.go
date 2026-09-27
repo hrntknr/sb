@@ -81,6 +81,7 @@ type k8sTarget struct {
 type awsTarget struct {
 	Profile  string             `yaml:"profile"`
 	RoleARN  string             `yaml:"roleArn"`
+	Mode     string             `yaml:"mode"`
 	Services []awsproxy.Service `yaml:"services"`
 	Regions  []string           `yaml:"regions"`
 }
@@ -218,18 +219,34 @@ func build(f file) (Config, error) {
 	}
 	aws := make([]awsproxy.Target, 0, len(f.AWS))
 	for i, item := range f.AWS {
-		if strings.TrimSpace(item.Profile) == "" || len(item.Services) == 0 {
-			return Config{}, fmt.Errorf("aws target %d: profile and services are required", i)
+		if strings.TrimSpace(item.Profile) == "" {
+			return Config{}, fmt.Errorf("aws target %d: profile is required", i)
 		}
 		if item.RoleARN != "" && !awsproxy.ValidRoleARN(item.RoleARN) {
 			return Config{}, fmt.Errorf("aws target %d: invalid roleArn %q", i, item.RoleARN)
 		}
+		switch item.Mode {
+		case "", "r", "rw":
+		default:
+			return Config{}, fmt.Errorf("aws target %d: invalid mode %q", i, item.Mode)
+		}
+		if len(item.Services) == 0 {
+			if item.Mode != "r" && item.Mode != "rw" {
+				return Config{}, fmt.Errorf("aws target %d: services or mode are required", i)
+			}
+			item.Services = awsproxy.AllServices(item.Mode)
+		}
+		services := make([]awsproxy.Service, 0, len(item.Services))
 		for _, service := range item.Services {
+			if service.Mode == "" {
+				service.Mode = item.Mode
+			}
 			if !awsproxy.ValidService(service) {
 				return Config{}, fmt.Errorf("aws target %d: unsupported service/mode %q/%q", i, service.Name, service.Mode)
 			}
+			services = append(services, service)
 		}
-		aws = append(aws, awsproxy.Target{Profile: item.Profile, RoleARN: item.RoleARN, Services: item.Services, Regions: item.Regions})
+		aws = append(aws, awsproxy.Target{Profile: item.Profile, RoleARN: item.RoleARN, Services: services, Regions: item.Regions})
 	}
 
 	var container Container

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/hrntknr/sb/internal/util"
@@ -81,6 +82,19 @@ func ValidService(service Service) bool {
 	entry, forwardable := serviceEndpoints[service.Name]
 	_, allowed := allowedOperations[service.Name]
 	return allowed && forwardable && supportedProtocols[entry.Protocol] && (service.Mode == "r" || service.Mode == "rw")
+}
+
+// AllServices returns every service that could also be granted explicitly,
+// with mode.
+func AllServices(mode string) []Service {
+	services := make([]Service, 0, len(serviceEndpoints))
+	for name := range serviceEndpoints {
+		if ValidService(Service{Name: name, Mode: mode}) {
+			services = append(services, Service{Name: name, Mode: mode})
+		}
+	}
+	sort.Slice(services, func(i, j int) bool { return services[i].Name < services[j].Name })
+	return services
 }
 
 // assumedRole returns the role ARN to assume for a profile from matching

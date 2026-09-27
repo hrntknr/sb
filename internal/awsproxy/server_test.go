@@ -493,6 +493,36 @@ func TestReloadDoesNotRecacheOldSourceCredentials(t *testing.T) {
 	}
 }
 
+// TestUpstreamCredentialsFromLoginSession verifies source credentials resolve
+// through the SDK's native login session support: the token cache created by
+// `aws login` supplies short-term credentials without any CLI invocation.
+func TestUpstreamCredentialsFromLoginSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, ".aws", "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, ".aws", "credentials"))
+	if err := os.MkdirAll(filepath.Join(home, ".aws", "login", "cache"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	session := "arn:aws:iam::123456789012:user/test"
+	if err := os.WriteFile(filepath.Join(home, ".aws", "config"), []byte("[profile dev]\nlogin_session = "+session+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(session))
+	token := `{"accessToken":{"accessKeyId":"LOGINRESOLVED","secretAccessKey":"login-secret","sessionToken":"login-token","accountId":"123456789012","expiresAt":"2099-01-01T00:00:00Z"},"tokenType":"bearer","refreshToken":"refresh","identityToken":"identity","clientId":"client","dpopKey":"dpop"}`
+	if err := os.WriteFile(filepath.Join(home, ".aws", "login", "cache", hex.EncodeToString(sum[:])+".json"), []byte(token), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "sts", Mode: "r"}}}}, "localhost")
+	creds, err := p.upstreamCredentials(context.Background(), "dev", p.targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.AccessKeyID != "LOGINRESOLVED" || creds.SessionToken != "login-token" {
+		t.Fatalf("upstream credentials = %+v, want the login session token's", creds)
+	}
+}
+
 func TestUpstreamCredentialsWithoutRole(t *testing.T) {
 	p, _ := awsTestProxy(t)
 	// With no roleArn the proxy must use the source profile's own

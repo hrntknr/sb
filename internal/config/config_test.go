@@ -92,6 +92,95 @@ func TestLoadAWSRejectsUnknownServices(t *testing.T) {
 	}
 }
 
+func TestLoadAWSProfileLevelMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: dev
+    mode: r
+    services:
+      - name: sts
+      - name: dynamodb
+        mode: rw
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AWS[0].Services[0] != (awsproxy.Service{Name: "sts", Mode: "r"}) {
+		t.Fatalf("Services[0] = %+v, want sts/r inherited from the profile-level mode", cfg.AWS[0].Services[0])
+	}
+	if cfg.AWS[0].Services[1] != (awsproxy.Service{Name: "dynamodb", Mode: "rw"}) {
+		t.Fatalf("Services[1] = %+v, want dynamodb/rw overriding the profile-level mode", cfg.AWS[0].Services[1])
+	}
+}
+
+func TestLoadAWSProfileLevelModeInvalid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: dev
+    mode: admin
+    services:
+      - name: sts
+        mode: r
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), `invalid mode "admin"`) {
+		t.Fatalf("Load() error = %v, want invalid mode", err)
+	}
+}
+
+func TestLoadAWSProfileLevelModeMissingEverywhere(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: dev
+    services:
+      - name: sts
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unsupported service/mode") {
+		t.Fatalf("Load() error = %v, want unsupported service/mode", err)
+	}
+}
+
+func TestLoadAWSAllServicesNoServices(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: default
+    mode: rw
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	services := cfg.AWS[0].Services
+	if len(services) == 0 {
+		t.Fatal("Services should expand to every supported service")
+	}
+	var sts *awsproxy.Service
+	for i := range services {
+		if services[i].Name == "sts" {
+			sts = &services[i]
+		}
+	}
+	if sts == nil || sts.Mode != "rw" {
+		t.Fatalf("sts service = %+v, want sts/rw", sts)
+	}
+}
+
+func TestLoadAWSWithoutModeOrServices(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	writeFile(t, path, `aws:
+  - profile: dev
+    roleArn: arn:aws:iam::123456789012:role/dev
+`)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "services or mode are required") {
+		t.Fatalf("Load() error = %v, want services or mode are required", err)
+	}
+}
+
 func TestLoadAWSAllowsLargeCombinations(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

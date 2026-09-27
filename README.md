@@ -91,11 +91,13 @@ aws:
   - profile: dev                 # source AWS profile name
     roleArn: arn:aws:iam::123456789012:role/sb-dev
     regions: [eu-west-1]        # optional; defaults to all regions
+    mode: r                     # default for services without their own mode
     services:
-      - name: dynamodb
-        mode: r                  # r (ReadOnlyAccess actions) / rw (all operations)
-      - name: sts
-        mode: r
+      - name: dynamodb        # inherits the default r
+      - name: ec2
+        mode: rw               # overrides the default
+  - profile: default            # no services: mode applies to every service
+    mode: rw
 proxy:
   sshAgentEnv: ~/.cache/sb-agent.env
 ```
@@ -138,7 +140,7 @@ k8s policy is keyed by **kubeconfig context name**. Contexts that point at the s
 
 ### AWS profiles
 
-AWS policy is keyed by **source profile name**. Each allowed profile is written to the generated `.aws/config` and `.aws/credentials` with a new proxy-only key and an HTTPS `endpoint_url` (and `ca_bundle`). The proxy verifies SigV4, checks the profile, region, service, and operation, then signs upstream requests with the assumed role's credentials — without a session policy: the proxy filter alone enforces the policy, and the role's own IAM permissions are the only AWS-side upper bound. `roleArn` may be omitted: without it the proxy signs upstream requests with the source profile's own credentials and no role is assumed; `roleArn` must otherwise match `arn:aws:iam::<account>:role/<name>`. When set, the source profile must be able to call `sts:AssumeRole` on that role and the role must trust that source principal, and matching targets must agree on the role. Long-running sessions are refreshed automatically. The source credentials never enter the container.
+AWS policy is keyed by **source profile name**. Each allowed profile is written to the generated `.aws/config` and `.aws/credentials` with a new proxy-only key and an HTTPS `endpoint_url` (and `ca_bundle`). The proxy verifies SigV4, checks the profile, region, service, and operation, then signs upstream requests with the assumed role's credentials — without a session policy: the proxy filter alone enforces the policy, and the role's own IAM permissions are the only AWS-side upper bound. `roleArn` may be omitted: without it the proxy signs upstream requests with the source profile's own credentials and no role is assumed; `roleArn` must otherwise match `arn:aws:iam::<account>:role/<name>`. When set, the source profile must be able to call `sts:AssumeRole` on that role and the role must trust that source principal, and matching targets must agree on the role. Long-running sessions are refreshed automatically. The source credentials never enter the container. A `mode` on the target (`r` = ReadOnlyAccess actions only, `rw` = all operations) is the default for its `services`; each service's own `mode` overrides it. `services` may be omitted: the mode then applies to every supported service. Source profiles using login sessions (`aws login`, `login_session`) resolve natively through the SDK, which reads and refreshes the token cache `aws login` wrote under `~/.aws/login/cache`.
 
 `services` supports JSON (`X-Amz-Target`), Query (form-encoded `Action`), and EC2 POST APIs covered by the embedded [AWS Service Reference](https://docs.aws.amazon.com/service-authorization/latest/reference/service-reference.html) — currently 128 services, including `sts`, `ec2`, `dynamodb`, `logs`, `kinesis`, `iam`, `ses`, `budgets`, and Cost Explorer. REST (`route53`, `s3` itself), CBOR, SigV2, multi-endpoint services that cannot be represented by one fixed or regional host template, and console-only services (`a2c`) are rejected when loading the config. For `r`, an operation is permitted only when every action exercising it matches the [AWS ReadOnlyAccess policy](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/ReadOnlyAccess.html). Operations with any non-read-only action or without an operation-to-action mapping fail closed for `r`. A supported service without any read operation has an empty `read` list.
 
