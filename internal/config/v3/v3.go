@@ -1,5 +1,4 @@
-// Package v3 loads the sb v3 policy config. A v3 config starts with
-// version: 3; a v2 config is rejected without interpretation.
+// Package v3 loads the sb v3 policy config.
 package v3
 
 import (
@@ -104,7 +103,6 @@ type Env struct {
 
 // document is the yaml schema of one config file.
 type document struct {
-	Version   *int           `yaml:"version"`
 	Container *containerFile `yaml:"container"`
 	SSH       []sshRule      `yaml:"ssh"`
 	K8s       []k8sRule      `yaml:"k8s"`
@@ -647,12 +645,6 @@ func loadFile(path string) (document, error) {
 			return document{}, errors.New("parse config: multiple yaml documents (only one document per file)")
 		}
 		return document{}, fmt.Errorf("parse config: %w", err2)
-	}
-	if doc.Version == nil {
-		return document{}, errors.New("version: 3 is required")
-	}
-	if *doc.Version != 3 {
-		return document{}, fmt.Errorf("unsupported version %d (want 3)", *doc.Version)
 	}
 	return doc, nil
 }

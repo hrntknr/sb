@@ -14,8 +14,7 @@ func TestRenderConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	path := filepath.Join(dir, "config.yaml")
-	writeConfig(t, path, `version: 3
-container:
+	writeConfig(t, path, `container:
   runtime: docker
   image: ghcr.io/hrntknr/sh:full
   mounts:

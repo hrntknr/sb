@@ -13,8 +13,7 @@ import (
 )
 
 // designExample is the config example from V3_DESIGN.md.
-const designExample = `version: 3
-container:
+const designExample = `container:
   runtime: docker
   image: ghcr.io/hrntknr/sh:full
   mounts:
@@ -106,8 +105,8 @@ func TestLoadValid(t *testing.T) {
 		check  func(*testing.T, Config)
 	}{
 		{
-			name:   "minimal version only",
-			config: "version: 3\n",
+			name:   "empty config",
+			config: "",
 			check: func(t *testing.T, cfg Config) {
 				if len(cfg.SSH) != 0 || len(cfg.K8s) != 0 || len(cfg.AWS) != 0 || cfg.Container.Image != "" {
 					t.Fatalf("empty config should load zero values, got %+v", cfg)
@@ -116,7 +115,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "ssh without user and port",
-			config: "version: 3\nssh:\n  - host: github.com\n    access: full\n",
+			config: "ssh:\n  - host: github.com\n    access: full\n",
 			check: func(t *testing.T, cfg Config) {
 				if cfg.SSH[0].User != "" || cfg.SSH[0].Port != 0 {
 					t.Errorf("SSH[0] = %+v, want user/port unset", cfg.SSH[0])
@@ -125,7 +124,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "core group explicit empty string",
-			config: "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n",
+			config: "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n",
 			check: func(t *testing.T, cfg Config) {
 				if cfg.K8s[0].Resources[0].Group != "" {
 					t.Errorf("Group = %q, want empty core API group", cfg.K8s[0].Resources[0].Group)
@@ -134,7 +133,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "namespace all and scope cluster",
-			config: "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: \"*\"\n        verbs: [get, list, watch]\n      - group: \"\"\n        resource: namespaces\n        scope: cluster\n        verbs: [get, list, watch]\n",
+			config: "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: \"*\"\n        verbs: [get, list, watch]\n      - group: \"\"\n        resource: namespaces\n        scope: cluster\n        verbs: [get, list, watch]\n",
 			check: func(t *testing.T, cfg Config) {
 				if cfg.K8s[0].Resources[0].Namespace != "*" {
 					t.Errorf("Namespace = %q, want *", cfg.K8s[0].Resources[0].Namespace)
@@ -146,7 +145,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "aws with roleArn and regions omitted",
-			config: "version: 3\naws:\n  - profile: dev\n    roleArn: arn:aws:iam::123456789012:role/sb-dev\n    services:\n      - name: dynamodb\n        mode: ro\n      - name: sts\n        mode: rw\n",
+			config: "aws:\n  - profile: dev\n    roleArn: arn:aws:iam::123456789012:role/sb-dev\n    services:\n      - name: dynamodb\n        mode: ro\n      - name: sts\n        mode: rw\n",
 			check: func(t *testing.T, cfg Config) {
 				if cfg.AWS[0].RoleARN != "arn:aws:iam::123456789012:role/sb-dev" || len(cfg.AWS[0].Regions) != 0 {
 					t.Errorf("AWS[0] = %+v", cfg.AWS[0])
@@ -158,7 +157,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "aws profile and region patterns",
-			config: "version: 3\naws:\n  - profile: \"dev-*\"\n    regions: [\"eu-*\"]\n    services:\n      - name: dynamodb\n        mode: ro\n",
+			config: "aws:\n  - profile: \"dev-*\"\n    regions: [\"eu-*\"]\n    services:\n      - name: dynamodb\n        mode: ro\n",
 			check: func(t *testing.T, cfg Config) {
 				if cfg.AWS[0].Profile != "dev-*" || len(cfg.AWS[0].Regions) != 1 || cfg.AWS[0].Regions[0] != "eu-*" {
 					t.Errorf("AWS = %+v, want pattern profile and region", cfg.AWS)
@@ -167,7 +166,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "container runtime auto and readOnly mount",
-			config: "version: 3\ncontainer:\n  runtime: auto\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n      target: /work\n      readOnly: true\n",
+			config: "container:\n  runtime: auto\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n      target: /work\n      readOnly: true\n",
 			check: func(t *testing.T, cfg Config) {
 				if !reflect.DeepEqual(cfg.Container.Mounts, []Mount{{Source: "/srv/work", Target: "/work", ReadOnly: true}}) {
 					t.Errorf("Mounts = %+v, want read-only mount", cfg.Container.Mounts)
@@ -179,7 +178,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "ssh host wildcards",
-			config: "version: 3\nssh:\n  - host: \"*.example.net\"\n    access: full\n  - host: \"*\"\n    access: full\n",
+			config: "ssh:\n  - host: \"*.example.net\"\n    access: full\n  - host: \"*\"\n    access: full\n",
 			check: func(t *testing.T, cfg Config) {
 				if cfg.SSH[0].Host != "*.example.net" || cfg.SSH[1].Host != "*" {
 					t.Errorf("SSH = %+v, want wildcard patterns", cfg.SSH)
@@ -188,7 +187,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "k8s namespace and verbs omitted",
-			config: "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        # namespace omitted: all namespaces\n        # verbs omitted: all verbs\n      - group: \"\"\n        resource: pods/log\n        # namespace and verbs omitted\n",
+			config: "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        # namespace omitted: all namespaces\n        # verbs omitted: all verbs\n      - group: \"\"\n        resource: pods/log\n        # namespace and verbs omitted\n",
 			check: func(t *testing.T, cfg Config) {
 				// An omitted namespace is all namespaces ("*") and an
 				// omitted verbs list every verb the resource supports:
@@ -208,7 +207,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "k8s mode shorthand",
-			config: "version: 3\nk8s:\n  - context: dev\n    mode: ro\n  - context: prod\n    mode: rw\n",
+			config: "k8s:\n  - context: dev\n    mode: ro\n  - context: prod\n    mode: rw\n",
 			check: func(t *testing.T, cfg Config) {
 				// The shorthand keeps the mode it was written in: the
 				// expansion happens where the proxy targets are built.
@@ -222,7 +221,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "k8s mode with null resources",
-			config: "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources:\n",
+			config: "k8s:\n  - context: dev\n    mode: rw\n    resources:\n",
 			check: func(t *testing.T, cfg Config) {
 				// A null resources is the same omission as an absent
 				// one: the mode form, no conflict.
@@ -233,7 +232,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "k8s context verbs",
-			config: "version: 3\nk8s:\n  - context: dev\n    verbs: [get, list, watch]\n",
+			config: "k8s:\n  - context: dev\n    verbs: [get, list, watch]\n",
 			check: func(t *testing.T, cfg Config) {
 				// The all-resources form: the context's verbs carried
 				// as written, no resources, no mode.
@@ -247,7 +246,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name:   "k8s bare context",
-			config: "version: 3\nk8s:\n  - context: dev\n",
+			config: "k8s:\n  - context: dev\n",
 			check: func(t *testing.T, cfg Config) {
 				// A context with nothing else: the all-resources form
 				// with every verb — the same grant as mode: rw.
@@ -359,7 +358,7 @@ var stableResources = []struct {
 func TestLoadScopeDecidedInEveryGroup(t *testing.T) {
 	for _, r := range stableResources {
 		t.Run(r.group+"/"+r.resource, func(t *testing.T) {
-			head := fmt.Sprintf("version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: %q\n        resource: %s\n", r.group, r.resource)
+			head := fmt.Sprintf("k8s:\n  - context: dev\n    resources:\n      - group: %q\n        resource: %s\n", r.group, r.resource)
 			clusterShape := "        scope: cluster\n"
 			namespaceShape := "        namespace: default\n"
 			verbs := "        verbs: [get]\n"
@@ -420,102 +419,100 @@ func TestLoadInvalid(t *testing.T) {
 		config string
 		wantIn string
 	}{
-		// v2 config: no version, old structure, or v2 values.
-		{"v2 missing version", "ssh:\n  - host: github.com\n", "version: 3 is required"},
+		// v2 config: old structure or v2 values are rejected as unknown fields.
 		{"v2 README config", "ssh:\n  - host: github.com\n    commands:\n      - cat\nk8s:\n  - context: dev\n    mode: rw\n    namespace: default\n", "field commands not found"},
-		{"v2 commands field", "version: 3\nssh:\n  - host: github.com\n    commands: [cat]\n", "field commands not found"},
-		{"k8s invalid mode value", "version: 3\nk8s:\n  - context: dev\n    mode: read\n    resources: []\n", `invalid mode "read" (want ro or rw)`},
-		{"k8s mode and resources", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "mode and resources are mutually exclusive"},
-		{"v2 proxy section", "version: 3\nproxy:\n  sshAgentEnv: ~/.cache/sb-agent.env\n", "field proxy not found"},
-		{"v2 container environments list", "version: 3\ncontainer:\n  environments:\n    - FOO=bar\n", "field environments not found"},
-		{"v2 aws mode r value", "version: 3\naws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: r\n", `invalid mode "r" (want ro or rw)`},
-		{"version 2", "version: 2\nssh:\n  - host: github.com\n    access: full\n", "unsupported version 2"},
-		{"version as string", "version: \"3\"\nssh:\n  - host: github.com\n    access: full\n", "cannot unmarshal !!str"},
-		{"unknown top field", "version: 3\nbogus: 1\n", "field bogus not found"},
-		{"unknown ssh field", "version: 3\nssh:\n  - host: github.com\n    access: full\n    bogus: 1\n", "field bogus not found"},
-		{"unknown container field", "version: 3\ncontainer:\n  bogus: 1\n", "field bogus not found"},
+		{"v2 commands field", "ssh:\n  - host: github.com\n    commands: [cat]\n", "field commands not found"},
+		{"k8s invalid mode value", "k8s:\n  - context: dev\n    mode: read\n    resources: []\n", `invalid mode "read" (want ro or rw)`},
+		{"k8s mode and resources", "k8s:\n  - context: dev\n    mode: rw\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "mode and resources are mutually exclusive"},
+		{"v2 proxy section", "proxy:\n  sshAgentEnv: ~/.cache/sb-agent.env\n", "field proxy not found"},
+		{"v2 container environments list", "container:\n  environments:\n    - FOO=bar\n", "field environments not found"},
+		{"v2 aws mode r value", "aws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: r\n", `invalid mode "r" (want ro or rw)`},
+		{"version 2", "version: 2\nssh:\n  - host: github.com\n    access: full\n", "field version not found"},
+		{"unknown top field", "bogus: 1\n", "field bogus not found"},
+		{"unknown ssh field", "ssh:\n  - host: github.com\n    access: full\n    bogus: 1\n", "field bogus not found"},
+		{"unknown container field", "container:\n  bogus: 1\n", "field bogus not found"},
 		// Required values must not be empty.
-		{"ssh empty host", "version: 3\nssh:\n  - host: \"\"\n    access: full\n", "host is required"},
-		{"ssh whitespace host", "version: 3\nssh:\n  - host: \"  \"\n    access: full\n", "host is required"},
-		{"ssh missing access", "version: 3\nssh:\n  - host: github.com\n", "access is required"},
-		{"ssh invalid access", "version: 3\nssh:\n  - host: github.com\n    access: limited\n", `unsupported access mode "limited"`},
-		{"ssh empty user", "version: 3\nssh:\n  - host: github.com\n    user: \"\"\n    access: full\n", "user must not be empty"},
-		{"ssh port zero", "version: 3\nssh:\n  - host: github.com\n    port: 0\n    access: full\n", "invalid port 0"},
-		{"ssh port out of range", "version: 3\nssh:\n  - host: github.com\n    port: 70000\n    access: full\n", "invalid port 70000"},
-		{"k8s empty context", "version: 3\nk8s:\n  - context: \"\"\n    resources: []\n", "context is required"},
-		{"k8s mode and empty resources", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources: []\n", "mode and resources are mutually exclusive"},
-		{"k8s mode and verbs", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    verbs: [get]\n", "mode and verbs are mutually exclusive"},
-		{"k8s verbs and resources", "version: 3\nk8s:\n  - context: dev\n    verbs: [get]\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "verbs and resources are mutually exclusive"},
-		{"k8s empty resources list", "version: 3\nk8s:\n  - context: dev\n    resources: []\n", "resources is empty"},
-		{"k8s empty resources list with verbs", "version: 3\nk8s:\n  - context: dev\n    verbs: [get]\n    resources: []\n", "verbs and resources are mutually exclusive"},
-		{"k8s context verbs unsupported", "version: 3\nk8s:\n  - context: dev\n    verbs: [get, list, watch, deletecollection]\n", `unsupported verb "deletecollection" for every resource`},
-		{"k8s context verbs duplicate", "version: 3\nk8s:\n  - context: dev\n    verbs: [get, get]\n", `duplicate verb "get"`},
-		{"k8s empty context verbs", "version: 3\nk8s:\n  - context: dev\n    verbs: []\n", "verbs is empty"},
-		{"k8s empty resource verbs", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: []\n", "verbs is empty"},
-		{"k8s empty resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"\"\n        namespace: default\n        verbs: [get]\n", "resource is required"},
-		{"k8s missing group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - resource: pods\n        namespace: default\n        verbs: [get]\n", `group is required (use group: "" for the core API group)`},
-		{"k8s whitespace group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \" \"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", `invalid group " "`},
-		{"k8s empty namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: \"\"\n        verbs: [get]\n", "namespace must not be empty"},
-		{"k8s namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        scope: cluster\n        verbs: [get]\n", "give a namespace, not scope: cluster"},
-		{"k8s cluster-scoped with a namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: nodes\n        namespace: default\n        verbs: [get]\n", "nodes is cluster-scoped: give scope: cluster, not a namespace"},
-		{"k8s cluster-scoped without scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: namespaces\n        verbs: [get]\n", "namespaces is cluster-scoped: give scope: cluster"},
+		{"ssh empty host", "ssh:\n  - host: \"\"\n    access: full\n", "host is required"},
+		{"ssh whitespace host", "ssh:\n  - host: \"  \"\n    access: full\n", "host is required"},
+		{"ssh missing access", "ssh:\n  - host: github.com\n", "access is required"},
+		{"ssh invalid access", "ssh:\n  - host: github.com\n    access: limited\n", `unsupported access mode "limited"`},
+		{"ssh empty user", "ssh:\n  - host: github.com\n    user: \"\"\n    access: full\n", "user must not be empty"},
+		{"ssh port zero", "ssh:\n  - host: github.com\n    port: 0\n    access: full\n", "invalid port 0"},
+		{"ssh port out of range", "ssh:\n  - host: github.com\n    port: 70000\n    access: full\n", "invalid port 70000"},
+		{"k8s empty context", "k8s:\n  - context: \"\"\n    resources: []\n", "context is required"},
+		{"k8s mode and empty resources", "k8s:\n  - context: dev\n    mode: rw\n    resources: []\n", "mode and resources are mutually exclusive"},
+		{"k8s mode and verbs", "k8s:\n  - context: dev\n    mode: rw\n    verbs: [get]\n", "mode and verbs are mutually exclusive"},
+		{"k8s verbs and resources", "k8s:\n  - context: dev\n    verbs: [get]\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "verbs and resources are mutually exclusive"},
+		{"k8s empty resources list", "k8s:\n  - context: dev\n    resources: []\n", "resources is empty"},
+		{"k8s empty resources list with verbs", "k8s:\n  - context: dev\n    verbs: [get]\n    resources: []\n", "verbs and resources are mutually exclusive"},
+		{"k8s context verbs unsupported", "k8s:\n  - context: dev\n    verbs: [get, list, watch, deletecollection]\n", `unsupported verb "deletecollection" for every resource`},
+		{"k8s context verbs duplicate", "k8s:\n  - context: dev\n    verbs: [get, get]\n", `duplicate verb "get"`},
+		{"k8s empty context verbs", "k8s:\n  - context: dev\n    verbs: []\n", "verbs is empty"},
+		{"k8s empty resource verbs", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: []\n", "verbs is empty"},
+		{"k8s empty resource", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"\"\n        namespace: default\n        verbs: [get]\n", "resource is required"},
+		{"k8s missing group", "k8s:\n  - context: dev\n    resources:\n      - resource: pods\n        namespace: default\n        verbs: [get]\n", `group is required (use group: "" for the core API group)`},
+		{"k8s whitespace group", "k8s:\n  - context: dev\n    resources:\n      - group: \" \"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", `invalid group " "`},
+		{"k8s empty namespace", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: \"\"\n        verbs: [get]\n", "namespace must not be empty"},
+		{"k8s namespace and scope", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        scope: cluster\n        verbs: [get]\n", "give a namespace, not scope: cluster"},
+		{"k8s cluster-scoped with a namespace", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: nodes\n        namespace: default\n        verbs: [get]\n", "nodes is cluster-scoped: give scope: cluster, not a namespace"},
+		{"k8s cluster-scoped without scope", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: namespaces\n        verbs: [get]\n", "namespaces is cluster-scoped: give scope: cluster"},
 		// The shape must match beyond the core group too: what sb
 		// decides in apps and rbac it decides the same way.
-		{"k8s apps namespaced with scope cluster", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: apps\n        resource: deployments\n        scope: cluster\n        verbs: [list]\n", "deployments is namespaced: give a namespace, not scope: cluster"},
-		{"k8s rbac cluster-scoped with a namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: rbac.authorization.k8s.io\n        resource: clusterroles\n        namespace: \"*\"\n        verbs: [list]\n", "clusterroles is cluster-scoped: give scope: cluster, not a namespace"},
+		{"k8s apps namespaced with scope cluster", "k8s:\n  - context: dev\n    resources:\n      - group: apps\n        resource: deployments\n        scope: cluster\n        verbs: [list]\n", "deployments is namespaced: give a namespace, not scope: cluster"},
+		{"k8s rbac cluster-scoped with a namespace", "k8s:\n  - context: dev\n    resources:\n      - group: rbac.authorization.k8s.io\n        resource: clusterroles\n        namespace: \"*\"\n        verbs: [list]\n", "clusterroles is cluster-scoped: give scope: cluster, not a namespace"},
 		// What sb does not decide the scope of is not loadable:
 		// the rule could not be checked against the resource's real
 		// scope, so the config would promise more than the
 		// authorization grants.
-		{"k8s undecided resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: example.com\n        resource: widgets\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
-		{"k8s undecided core resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: inventions\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
-		{"k8s invalid scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        scope: node\n        verbs: [get]\n", `invalid scope "node" (want cluster)`},
-		{"k8s unsupported verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, deletecollection]\n", `unsupported verb "deletecollection"`},
-		{"k8s unsupported verb full list", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, list, watch, create, update, patch, delete, impersonate]\n", `unsupported verb "impersonate"`},
-		{"k8s unsupported verb for pods/log", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods/log\n        namespace: default\n        verbs: [list]\n", `unsupported verb "list" for "pods/log"`},
-		{"k8s unsupported subresource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: deployments/scale\n        namespace: default\n        verbs: [get]\n", `unsupported subresource "deployments/scale"`},
-		{"k8s duplicate verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, get]\n", `duplicate verb "get"`},
-		{"aws empty profile", "version: 3\naws:\n  - profile: \"\"\n    services: []\n", "profile is required"},
-		{"aws invalid roleArn", "version: 3\naws:\n  - profile: dev\n    roleArn: arn:aws:iam::123456789012:role/\n    services: []\n", "invalid roleArn"},
-		{"aws empty region", "version: 3\naws:\n  - profile: dev\n    regions: [\"\"]\n    services: []\n", "must not be empty"},
-		{"aws missing services", "version: 3\naws:\n  - profile: dev\n", "services is required"},
-		{"aws empty service name", "version: 3\naws:\n  - profile: dev\n    services:\n      - name: \"\"\n        mode: ro\n", "service name is required"},
-		{"aws unsupported service", "version: 3\naws:\n  - profile: dev\n    services:\n      - name: route53\n        mode: rw\n", `unsupported service "route53"`},
-		{"aws unsupported service mode", "version: 3\naws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: read\n", `invalid mode "read" (want ro or rw)`},
-		{"aws duplicate service", "version: 3\naws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: ro\n      - name: dynamodb\n        mode: rw\n", `duplicate service "dynamodb"`},
-		{"container image required", "version: 3\ncontainer:\n  runtime: docker\n  mounts:\n    - source: /srv/work\n      target: /work\n", "image is required when the container section is set"},
-		{"container invalid runtime", "version: 3\ncontainer:\n  runtime: containerd\n  image: ghcr.io/hrntknr/sh:full\n", `invalid runtime "containerd"`},
-		{"mount missing source", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - target: /work\n", "source is required"},
-		{"mount relative source", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: work\n      target: /work\n", "source must be an absolute path"},
-		{"mount missing target", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n", "target is required"},
-		{"mount relative target", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n      target: work\n", "target must be an absolute path"},
-		{"env neither inherit nor value", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {}\n", "set either inherit or value"},
-		{"env both inherit and value", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {inherit: true, value: bar}\n", "not both"},
-		{"env empty value", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: \"\"}\n", "set either inherit or value"},
-		{"env key with whitespace", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    \"FOO BAR\": {value: bar}\n", "key must not contain whitespace"},
-		{"env yaml duplicate key", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: bar}\n    FOO: {value: baz}\n", "already defined at line"},
-		{"env key with equals", "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    A=B: {value: bar}\n", `key must not contain "="`},
-		{"ssh host with whitespace", "version: 3\nssh:\n  - host: bad host\n    access: full\n", "must not contain whitespace"},
-		{"k8s namespace with slash", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: bad/name\n        verbs: [get]\n", "invalid namespace"},
-		{"k8s namespace uppercase", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: Default\n        verbs: [get]\n", "invalid namespace"},
-		{"k8s namespace too long", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: " + strings.Repeat("a", 64) + "\n        verbs: [get]\n", "invalid namespace"},
-		{"k8s resource with whitespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: bad resource\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
-		{"k8s group with whitespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: bad group\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
-		{"aws profile with whitespace", "version: 3\naws:\n  - profile: bad profile\n    services: []\n", "must not contain whitespace"},
-		{"aws region with whitespace", "version: 3\naws:\n  - profile: dev\n    regions: [\"eu west\"]\n    services: []\n", "must not contain whitespace"},
-		{"container image whitespace only", "version: 3\ncontainer:\n  runtime: docker\n  image: \"   \"\n", "image must not be whitespace-only"},
-		{"second yaml document", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    access: full\n", "multiple yaml documents"},
-		{"second document v2 format", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    commands: [cat]\n", "field commands not found"},
-		{"trailing syntax error", "version: 3\nssh:\n  - host: a.example\n    access: full\n---\nssh: [unclosed\n", "parse config"},
+		{"k8s undecided resource", "k8s:\n  - context: dev\n    resources:\n      - group: example.com\n        resource: widgets\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
+		{"k8s undecided core resource", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: inventions\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
+		{"k8s invalid scope", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        scope: node\n        verbs: [get]\n", `invalid scope "node" (want cluster)`},
+		{"k8s unsupported verb", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, deletecollection]\n", `unsupported verb "deletecollection"`},
+		{"k8s unsupported verb full list", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, list, watch, create, update, patch, delete, impersonate]\n", `unsupported verb "impersonate"`},
+		{"k8s unsupported verb for pods/log", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods/log\n        namespace: default\n        verbs: [list]\n", `unsupported verb "list" for "pods/log"`},
+		{"k8s unsupported subresource", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: deployments/scale\n        namespace: default\n        verbs: [get]\n", `unsupported subresource "deployments/scale"`},
+		{"k8s duplicate verb", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, get]\n", `duplicate verb "get"`},
+		{"aws empty profile", "aws:\n  - profile: \"\"\n    services: []\n", "profile is required"},
+		{"aws invalid roleArn", "aws:\n  - profile: dev\n    roleArn: arn:aws:iam::123456789012:role/\n    services: []\n", "invalid roleArn"},
+		{"aws empty region", "aws:\n  - profile: dev\n    regions: [\"\"]\n    services: []\n", "must not be empty"},
+		{"aws missing services", "aws:\n  - profile: dev\n", "services is required"},
+		{"aws empty service name", "aws:\n  - profile: dev\n    services:\n      - name: \"\"\n        mode: ro\n", "service name is required"},
+		{"aws unsupported service", "aws:\n  - profile: dev\n    services:\n      - name: route53\n        mode: rw\n", `unsupported service "route53"`},
+		{"aws unsupported service mode", "aws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: read\n", `invalid mode "read" (want ro or rw)`},
+		{"aws duplicate service", "aws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: ro\n      - name: dynamodb\n        mode: rw\n", `duplicate service "dynamodb"`},
+		{"container image required", "container:\n  runtime: docker\n  mounts:\n    - source: /srv/work\n      target: /work\n", "image is required when the container section is set"},
+		{"container invalid runtime", "container:\n  runtime: containerd\n  image: ghcr.io/hrntknr/sh:full\n", `invalid runtime "containerd"`},
+		{"mount missing source", "container:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - target: /work\n", "source is required"},
+		{"mount relative source", "container:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: work\n      target: /work\n", "source must be an absolute path"},
+		{"mount missing target", "container:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n", "target is required"},
+		{"mount relative target", "container:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n      target: work\n", "target must be an absolute path"},
+		{"env neither inherit nor value", "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {}\n", "set either inherit or value"},
+		{"env both inherit and value", "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {inherit: true, value: bar}\n", "not both"},
+		{"env empty value", "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: \"\"}\n", "set either inherit or value"},
+		{"env key with whitespace", "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    \"FOO BAR\": {value: bar}\n", "key must not contain whitespace"},
+		{"env yaml duplicate key", "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: bar}\n    FOO: {value: baz}\n", "already defined at line"},
+		{"env key with equals", "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    A=B: {value: bar}\n", `key must not contain "="`},
+		{"ssh host with whitespace", "ssh:\n  - host: bad host\n    access: full\n", "must not contain whitespace"},
+		{"k8s namespace with slash", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: bad/name\n        verbs: [get]\n", "invalid namespace"},
+		{"k8s namespace uppercase", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: Default\n        verbs: [get]\n", "invalid namespace"},
+		{"k8s namespace too long", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: " + strings.Repeat("a", 64) + "\n        verbs: [get]\n", "invalid namespace"},
+		{"k8s resource with whitespace", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: bad resource\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"k8s group with whitespace", "k8s:\n  - context: dev\n    resources:\n      - group: bad group\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"aws profile with whitespace", "aws:\n  - profile: bad profile\n    services: []\n", "must not contain whitespace"},
+		{"aws region with whitespace", "aws:\n  - profile: dev\n    regions: [\"eu west\"]\n    services: []\n", "must not contain whitespace"},
+		{"container image whitespace only", "container:\n  runtime: docker\n  image: \"   \"\n", "image must not be whitespace-only"},
+		{"second yaml document", "ssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    access: full\n", "multiple yaml documents"},
+		{"second document v2 format", "ssh:\n  - host: a.example\n    access: full\n---\nssh:\n  - host: b.example\n    commands: [cat]\n", "field commands not found"},
+		{"trailing syntax error", "ssh:\n  - host: a.example\n    access: full\n---\nssh: [unclosed\n", "parse config"},
 		// unicode.IsSpace covers U+00A0, \v (U+000B) and \f (U+000C),
 		// which " \t\r\n" does not.
-		{"ssh host with nbsp", "version: 3\nssh:\n  - host: \"bad\\u00a0host\"\n    access: full\n", "must not contain whitespace"},
-		{"ssh host with vertical tab", "version: 3\nssh:\n  - host: \"bad\\vhost\"\n    access: full\n", "must not contain whitespace"},
-		{"ssh host with form feed", "version: 3\nssh:\n  - host: \"bad\\fhost\"\n    access: full\n", "must not contain whitespace"},
-		{"k8s group with nbsp", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"bad\\u00a0group\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
-		{"k8s resource with nbsp", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"pods\\u00a0\"\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
-		{"aws profile with nbsp", "version: 3\naws:\n  - profile: \"bad\\u00a0profile\"\n    services:\n      - name: dynamodb\n        mode: ro\n", "must not contain whitespace"},
-		{"aws region with nbsp", "version: 3\naws:\n  - profile: dev\n    regions: [\"eu\\u00a0west\"]\n    services:\n      - name: dynamodb\n        mode: ro\n", "must not contain whitespace"},
+		{"ssh host with nbsp", "ssh:\n  - host: \"bad\\u00a0host\"\n    access: full\n", "must not contain whitespace"},
+		{"ssh host with vertical tab", "ssh:\n  - host: \"bad\\vhost\"\n    access: full\n", "must not contain whitespace"},
+		{"ssh host with form feed", "ssh:\n  - host: \"bad\\fhost\"\n    access: full\n", "must not contain whitespace"},
+		{"k8s group with nbsp", "k8s:\n  - context: dev\n    resources:\n      - group: \"bad\\u00a0group\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"k8s resource with nbsp", "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"pods\\u00a0\"\n        namespace: default\n        verbs: [get]\n", "must not contain whitespace"},
+		{"aws profile with nbsp", "aws:\n  - profile: \"bad\\u00a0profile\"\n    services:\n      - name: dynamodb\n        mode: ro\n", "must not contain whitespace"},
+		{"aws region with nbsp", "aws:\n  - profile: dev\n    regions: [\"eu\\u00a0west\"]\n    services:\n      - name: dynamodb\n        mode: ro\n", "must not contain whitespace"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -539,54 +536,54 @@ func TestLoadDuplicates(t *testing.T) {
 	}{
 		{
 			name:   "same ssh host in two files",
-			main:   "version: 3\nssh:\n  - host: github.com\n    access: full\n",
+			main:   "ssh:\n  - host: github.com\n    access: full\n",
 			dropIn: "ssh:\n  - host: github.com\n    access: full\n",
 			wantIn: `host "github.com" is already defined in`,
 		},
 		{
 			name:   "same k8s context in two files",
-			main:   "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n",
+			main:   "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n",
 			dropIn: "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n",
 			wantIn: `context "dev" is already defined in`,
 		},
 		{
 			name:   "same aws profile in two files",
-			main:   "version: 3\naws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: ro\n",
+			main:   "aws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: ro\n",
 			dropIn: "aws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: rw\n",
 			wantIn: `profile "dev" is already defined in`,
 		},
 		{
 			name:   "same ssh host within one file",
-			main:   "version: 3\nssh:\n  - host: github.com\n    access: full\n  - host: github.com\n    access: full\n",
+			main:   "ssh:\n  - host: github.com\n    access: full\n  - host: github.com\n    access: full\n",
 			wantIn: `host "github.com" is already defined in`,
 		},
 		{
 			name:   "same mount target in two files",
-			main:   "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/a\n      target: /work\n",
+			main:   "container:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/a\n      target: /work\n",
 			dropIn: "container:\n  mounts:\n    - source: /srv/b\n      target: /work\n",
 			wantIn: `target "/work" is already defined in`,
 		},
 		{
 			name:   "same environment variable in two files",
-			main:   "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: main}\n",
+			main:   "container:\n  image: ghcr.io/hrntknr/sh:full\n  environment:\n    FOO: {value: main}\n",
 			dropIn: "container:\n  environment:\n    FOO: {value: dropin}\n",
 			wantIn: `environment "FOO" is already defined in`,
 		},
 		{
 			name:   "same image in two files",
-			main:   "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n",
+			main:   "container:\n  image: ghcr.io/hrntknr/sh:full\n",
 			dropIn: "container:\n  image: ghcr.io/hrntknr/sh:min\n",
 			wantIn: "image is already defined in",
 		},
 		{
 			name:   "same runtime in two files",
-			main:   "version: 3\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n",
+			main:   "container:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n",
 			dropIn: "container:\n  runtime: podman\n",
 			wantIn: "runtime is already defined in",
 		},
 		{
 			name:   "whitespace-only image in drop-in",
-			main:   "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n",
+			main:   "container:\n  image: ghcr.io/hrntknr/sh:full\n",
 			dropIn: "container:\n  image: \"   \"\n",
 			wantIn: "image must not be whitespace-only",
 		},
@@ -597,7 +594,7 @@ func TestLoadDuplicates(t *testing.T) {
 			path := filepath.Join(dir, "config.yaml")
 			writeFile(t, path, tt.main)
 			if tt.dropIn != "" {
-				writeFile(t, filepath.Join(dir, "conf.d", "10-work.yaml"), "version: 3\n"+tt.dropIn)
+				writeFile(t, filepath.Join(dir, "conf.d", "10-work.yaml"), ""+tt.dropIn)
 			}
 			_, err := Load(path)
 			if err == nil || !strings.Contains(err.Error(), tt.wantIn) {
@@ -610,9 +607,9 @@ func TestLoadDuplicates(t *testing.T) {
 func TestLoadConfD(t *testing.T) {
 	t.Run("appends entries in file order", func(t *testing.T) {
 		dir := t.TempDir()
-		writeFile(t, filepath.Join(dir, "config.yaml"), "version: 3\nssh:\n  - host: main.example\n    access: full\n")
-		writeFile(t, filepath.Join(dir, "conf.d", "20-b.yaml"), "version: 3\nssh:\n  - host: b.example\n    access: full\n")
-		writeFile(t, filepath.Join(dir, "conf.d", "10-a.yaml"), "version: 3\nssh:\n  - host: a.example\n    access: full\n")
+		writeFile(t, filepath.Join(dir, "config.yaml"), "ssh:\n  - host: main.example\n    access: full\n")
+		writeFile(t, filepath.Join(dir, "conf.d", "20-b.yaml"), "ssh:\n  - host: b.example\n    access: full\n")
+		writeFile(t, filepath.Join(dir, "conf.d", "10-a.yaml"), "ssh:\n  - host: a.example\n    access: full\n")
 		cfg, err := Load(filepath.Join(dir, "config.yaml"))
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
@@ -625,7 +622,7 @@ func TestLoadConfD(t *testing.T) {
 	t.Run("missing directory is fine", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
-		writeFile(t, path, "version: 3\nssh:\n  - host: github.com\n    access: full\n")
+		writeFile(t, path, "ssh:\n  - host: github.com\n    access: full\n")
 		if _, err := Load(path); err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
@@ -633,7 +630,7 @@ func TestLoadConfD(t *testing.T) {
 	t.Run("ignores non-yaml, hidden, and directories", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
-		writeFile(t, path, "version: 3\nssh:\n  - host: github.com\n    access: full\n")
+		writeFile(t, path, "ssh:\n  - host: github.com\n    access: full\n")
 		writeFile(t, filepath.Join(dir, "conf.d", "README.md"), "ignored")
 		writeFile(t, filepath.Join(dir, "conf.d", ".gitkeep"), "")
 		writeFile(t, filepath.Join(dir, "conf.d", "subdir"), "") // directory
@@ -645,30 +642,20 @@ func TestLoadConfD(t *testing.T) {
 			t.Fatalf("SSH len = %d, want 1", len(cfg.SSH))
 		}
 	})
-	t.Run("drop-in without version", func(t *testing.T) {
+	t.Run("drop-in with a v2 config", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
-		writeFile(t, path, "version: 3\nssh:\n  - host: github.com\n    access: full\n")
-		writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), "ssh:\n  - host: work.example\n    access: full\n")
+		writeFile(t, path, "ssh:\n  - host: github.com\n    access: full\n")
+		writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), "version: 2\nssh:\n  - host: work.example\n    access: full\n")
 		_, err := Load(path)
-		if err == nil || !strings.Contains(err.Error(), "version: 3 is required") || !strings.Contains(err.Error(), "conf.d/work.yaml") {
-			t.Fatalf("Load() error = %v, want version-required error mentioning conf.d/work.yaml", err)
-		}
-	})
-	t.Run("drop-in with wrong version", func(t *testing.T) {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "config.yaml")
-		writeFile(t, path, "version: 3\n")
-		writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), "version: 2\nssh: []\n")
-		_, err := Load(path)
-		if err == nil || !strings.Contains(err.Error(), "unsupported version 2") {
-			t.Fatalf("Load() error = %v, want unsupported version 2", err)
+		if err == nil || !strings.Contains(err.Error(), "field version not found") || !strings.Contains(err.Error(), "conf.d/work.yaml") {
+			t.Fatalf("Load() error = %v, want an error mentioning conf.d/work.yaml", err)
 		}
 	})
 	t.Run("invalid yaml in drop-in", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
-		writeFile(t, path, "version: 3\n")
+		writeFile(t, path, "")
 		writeFile(t, filepath.Join(dir, "conf.d", "bad.yaml"), "ssh: [unclosed\n")
 		_, err := Load(path)
 		if err == nil || !strings.Contains(err.Error(), "conf.d/bad.yaml") {
@@ -694,7 +681,7 @@ func TestLoadMountAmbiguity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "config.yaml")
-			writeFile(t, path, "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n"+tt.mounts)
+			writeFile(t, path, "container:\n  image: ghcr.io/hrntknr/sh:full\n"+tt.mounts)
 			_, err := Load(path)
 			if err == nil || !strings.Contains(err.Error(), tt.wantIn) {
 				t.Fatalf("Load() error = %v, want containing %q", err, tt.wantIn)
@@ -704,7 +691,7 @@ func TestLoadMountAmbiguity(t *testing.T) {
 	t.Run("sibling targets are fine", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.yaml")
-		writeFile(t, path, "version: 3\ncontainer:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /data\n")
+		writeFile(t, path, "container:\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/a\n      target: /work\n    - source: /srv/b\n      target: /data\n")
 		if _, err := Load(path); err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}

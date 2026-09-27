@@ -90,8 +90,7 @@ func TestConfigConnectsTheFormsToTheUpstream(t *testing.T) {
 	// The config, loaded as the loader reads it: the forms decide what
 	// the targets grant, and the proxy enforces the same connection.
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	writeConnectConfig(t, configPath, `version: 3
-k8s:
+	writeConnectConfig(t, configPath, `k8s:
   - context: dev
     mode: rw
   - context: ops

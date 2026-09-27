@@ -40,7 +40,7 @@ func setupRunTest(t *testing.T) string {
 func writeRunConfig(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	content := "version: 3\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
+	content := "container:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -777,7 +777,7 @@ func TestRunProxyStartFailureDropsTheSession(t *testing.T) {
 	// The run's config: a k8s rule (a proxy is started for it) whose
 	// upstream source is corrupt — the issuance fails at startup.
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	cfg := "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, list]\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
+	cfg := "k8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, list]\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -836,7 +836,7 @@ func TestRunProxiesReachBeyondLoopbackThroughTheRootCommand(t *testing.T) {
 	// generated ssh config points the container at it) and the container
 	// section the run needs.
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	cfg := "version: 3\nssh:\n  - host: github.com\n    access: full\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
+	cfg := "ssh:\n  - host: github.com\n    access: full\ncontainer:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
