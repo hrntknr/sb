@@ -21,6 +21,7 @@ type sshConfig struct {
 	IdentityFiles         []string
 	CertificateFiles      []string
 	ProxyCommand          string
+	ProxyJump             string
 	UserKnownHosts        []string
 	GlobalKnownHosts      []string
 	StrictHostKeyChecking string
@@ -71,7 +72,7 @@ func upstreamConfig(username, host, port string) (sshConfig, error) {
 	if port != "" && port != defaultPortMarker {
 		config.Port = port
 	}
-	slog.Debug("resolved ssh config", "user", config.User, "host", config.Host, "port", config.Port, "identity_files", len(config.IdentityFiles), "certificate_files", len(config.CertificateFiles), "proxy_command", config.ProxyCommand != "")
+	slog.Debug("resolved ssh config", "user", config.User, "host", config.Host, "port", config.Port, "identity_files", len(config.IdentityFiles), "certificate_files", len(config.CertificateFiles), "proxy_command", config.ProxyCommand != "", "proxy_jump", config.ProxyJump != "")
 	return config, nil
 }
 
@@ -100,6 +101,10 @@ func parseSSHConfig(output []byte) sshConfig {
 			}
 		case "proxycommand":
 			config.ProxyCommand = value
+		case "proxyjump":
+			if value != "" && !strings.EqualFold(value, "none") {
+				config.ProxyJump = value
+			}
 		case "userknownhostsfile":
 			config.UserKnownHosts = appendKnownHostsFiles(config.UserKnownHosts, value)
 		case "globalknownhostsfile":
@@ -135,9 +140,32 @@ func currentUsername(fallback string) string {
 	return fallback
 }
 
-// dialUpstream connects to the upstream host, honoring a ProxyCommand if the
-// user's ssh config requires one. agentSocketPath is resolved per call so
-// restarted agents are followed.
+// proxyJumpCommand converts a ProxyJump target into the equivalent
+// ProxyCommand, like ssh does: ssh -W '[%h]:%p' followed by the jump
+// target ([user@]host[:port]).
+func proxyJumpCommand(jump string) string {
+	if jump == "" || strings.EqualFold(jump, "none") {
+		return ""
+	}
+	return "ssh -W '[%h]:%p' " + jump
+}
+
+// proxyCommand resolves the effective proxy command for a target: an
+// explicit ProxyCommand (including "none" to disable proxying) wins;
+// otherwise a ProxyJump is expanded into the equivalent ssh -W command.
+func (c sshConfig) proxyCommand() string {
+	if c.ProxyCommand != "" {
+		if strings.EqualFold(c.ProxyCommand, "none") {
+			return ""
+		}
+		return c.ProxyCommand
+	}
+	return proxyJumpCommand(c.ProxyJump)
+}
+
+// dialUpstream connects to the upstream host, honoring a ProxyCommand
+// (or ProxyJump) if the user's ssh config requires one. agentSocketPath
+// is resolved per call so restarted agents are followed.
 func dialUpstream(config sshConfig, agentSocketPath string) (*cryptossh.Client, error) {
 	auth, agentConn, err := upstreamAuthMethods(config, agentSocketPath)
 	if err != nil {
@@ -155,8 +183,8 @@ func dialUpstream(config sshConfig, agentSocketPath string) (*cryptossh.Client, 
 	if err := configureHostKey(config, clientConfig); err != nil {
 		return nil, config.wrapError(err)
 	}
-	if config.ProxyCommand != "" && !strings.EqualFold(config.ProxyCommand, "none") {
-		return config.wrapClient(dialUpstreamProxyCommand(expandProxyCommand(config.ProxyCommand, config), config.matchAddr(), clientConfig))
+	if command := config.proxyCommand(); command != "" {
+		return config.wrapClient(dialUpstreamProxyCommand(expandProxyCommand(command, config), config.matchAddr(), clientConfig))
 	}
 	return config.wrapClient(cryptossh.Dial("tcp", config.Addr(), clientConfig))
 }

@@ -218,7 +218,7 @@ func TestCurrentUsernameReplacesDefaultMarker(t *testing.T) {
 }
 
 func TestParseSSHConfig(t *testing.T) {
-	config := parseSSHConfig([]byte("user alice\nhostname bastion.example\nport 2222\nidentityfile ~/.ssh/id_ed25519\nidentityfile none\ncertificatefile ~/.ssh/id_ed25519-cert.pub\ncertificatefile none\nproxycommand /usr/bin/nc bastion.example 22\nuserknownhostsfile ~/.ssh/known_hosts /etc/ssh/ssh_known_hosts\nglobalknownhostsfile none\nstricthostkeychecking accept-new\nhostkeyalias bastion-alias\nknownhostscommand /usr/bin/fetch-keys %H\n"))
+	config := parseSSHConfig([]byte("user alice\nhostname bastion.example\nport 2222\nidentityfile ~/.ssh/id_ed25519\nidentityfile none\ncertificatefile ~/.ssh/id_ed25519-cert.pub\ncertificatefile none\nproxycommand /usr/bin/nc bastion.example 22\nproxyjump user@jump.example:2222\nuserknownhostsfile ~/.ssh/known_hosts /etc/ssh/ssh_known_hosts\nglobalknownhostsfile none\nstricthostkeychecking accept-new\nhostkeyalias bastion-alias\nknownhostscommand /usr/bin/fetch-keys %H\n"))
 	if config.User != "alice" || config.Host != "bastion.example" || config.Port != "2222" {
 		t.Fatalf("parseSSHConfig() = %#v", config)
 	}
@@ -230,6 +230,9 @@ func TestParseSSHConfig(t *testing.T) {
 	}
 	if config.ProxyCommand != "/usr/bin/nc bastion.example 22" {
 		t.Fatalf("proxy command = %q", config.ProxyCommand)
+	}
+	if config.ProxyJump != "user@jump.example:2222" {
+		t.Fatalf("proxy jump = %q", config.ProxyJump)
 	}
 	if len(config.UserKnownHosts) != 2 || config.UserKnownHosts[0] != "~/.ssh/known_hosts" || config.UserKnownHosts[1] != "/etc/ssh/ssh_known_hosts" {
 		t.Fatalf("user known hosts = %#v", config.UserKnownHosts)
@@ -245,6 +248,40 @@ func TestParseSSHConfig(t *testing.T) {
 	}
 	if config.KnownHostsCommand != "/usr/bin/fetch-keys %H" {
 		t.Fatalf("known hosts command = %q", config.KnownHostsCommand)
+	}
+}
+
+// ProxyJump expands into the equivalent ssh -W ProxyCommand, like ssh
+// does: an explicit ProxyCommand (including "none" to disable proxying)
+// wins, and the jump tokens expand to the resolved target host and port.
+func TestProxyJumpCommand(t *testing.T) {
+	tests := []struct {
+		name   string
+		config sshConfig
+		want   string
+	}{
+		{"unset", sshConfig{}, ""},
+		{"proxy command wins", sshConfig{ProxyCommand: "/usr/bin/nc target.example 22", ProxyJump: "jump.example"}, "/usr/bin/nc target.example 22"},
+		{"explicit none disables proxying", sshConfig{ProxyCommand: "none", ProxyJump: "jump.example"}, ""},
+		{"proxy jump none", sshConfig{ProxyJump: "none"}, ""},
+		{"proxy jump expands", sshConfig{ProxyJump: "user@jump.example:2222"}, "ssh -W '[%h]:%p' user@jump.example:2222"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.proxyCommand(); got != tt.want {
+				t.Fatalf("proxyCommand() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The generated ProxyJump command expands with the resolved target values,
+// so the jump connects through to the real destination.
+func TestProxyJumpCommandExpansion(t *testing.T) {
+	config := sshConfig{Host: "target.example", Port: "2222", User: "testuser", ProxyJump: "user@jump.example:2222"}
+	got := expandProxyCommand(config.proxyCommand(), config)
+	if want := "ssh -W '[target.example]:2222' user@jump.example:2222"; got != want {
+		t.Fatalf("expanded proxy jump command = %q, want %q", got, want)
 	}
 }
 
