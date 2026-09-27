@@ -143,7 +143,7 @@ func startProxy(ctx context.Context, cfg v3.Config, opts options, host, dir stri
 	server.k8sDone, server.awsDone = k8sDone, awsDone
 	// The k8s and AWS issuances signal the initial write's own result
 	// (nil: the initial issuance succeeded) through their ready channel —
-	// the watcher setup's failure included; the goroutine's return (a
+	// the setup's own failure included; the goroutine's return (a
 	// component's exit before its issuance was ready) is not that result.
 	// The ports are taken here, before the goroutines start: a failure
 	// path closes the listeners, and a closed listener's address is gone.

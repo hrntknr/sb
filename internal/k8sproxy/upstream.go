@@ -12,14 +12,14 @@ import (
 )
 
 // upstream is the resolved upstream connection for one context: the
-// transport with its auth settings, the target URL, and the static
-// bearer token from the kubeconfig (empty when the auth settings are a
-// provider that returns one per round trip). It is resolved once per
-// session; requests reuse it without reloading the kubeconfig.
+// transport with its auth settings, and the target URL. It is resolved
+// once per session; requests reuse it without reloading the
+// kubeconfig, and the transport keeps updating its own auth settings
+// per request (a token file's refresh, an OIDC provider's expiry) as
+// it would without sb.
 type upstream struct {
-	transport   http.RoundTripper
-	target      *url.URL
-	bearerToken string
+	transport http.RoundTripper
+	target    *url.URL
 }
 
 // resolveUpstreams resolves the upstream connection for every context
@@ -62,7 +62,18 @@ func resolveUpstream(raw *api.Config, loadingRules *clientcmd.ClientConfigLoadin
 	if err != nil {
 		return nil, err
 	}
-	return &upstream{transport: transport, target: target, bearerToken: config.BearerToken}, nil
+	return &upstream{transport: transport, target: target}, nil
+}
+
+// joinBasePath joins the server URL's base path onto the API path: the
+// upstream request goes to the fixed server, its path prefix included
+// (a server under https://gateway.example/k8s gets /k8s/api/v1/...),
+// and an empty base leaves the API path alone.
+func joinBasePath(base, api string) string {
+	if base == "" {
+		return api
+	}
+	return strings.TrimSuffix(base, "/") + api
 }
 
 // upstreamRequestPath splits the context prefix off the downstream URL

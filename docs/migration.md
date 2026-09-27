@@ -141,6 +141,10 @@ Rules:
 - `verbs` are enumerated. The initial v3 version supports `get`, `list`, `watch` for regular resources and `get` for `pods/log` (`kubectl logs` including `-f`).
 - Unknown verbs, unknown subresources, and anything beyond that set are rejected at load.
 
+## k8s: the issued kubeconfig is read-only
+
+The kubeconfig sb issues is read-only by design: `kubectl config use-context` cannot write to it (and a written context would change what the grants were issued for). Pass `--context` or `-n` per command instead, or copy the kubeconfig somewhere writable and edit the copy — the `context` key stays the switch. Changes to the source kubeconfig or the copy apply at the next session, not while sb runs.
+
 ## AWS: rename `mode: r` to `mode: ro`
 
 AWS is the mechanical conversion:

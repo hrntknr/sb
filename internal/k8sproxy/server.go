@@ -198,6 +198,11 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request path", http.StatusBadRequest)
 		return
 	}
+	if !validAPIPath(decodedPath, rawPath) {
+		slog.Warn("rejected k8s request with malformed path", "context", context, "method", r.Method, "path", decodedPath)
+		http.Error(w, "bad request path", http.StatusBadRequest)
+		return
+	}
 	if !p.allows(context, info) {
 		slog.Warn("rejected k8s request by policy", "context", context, "method", r.Method, "path", decodedPath)
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -219,13 +224,17 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.Out.URL.Scheme = conn.target.Scheme
 			req.Out.URL.Host = conn.target.Host
-			req.Out.URL.Path = decodedPath
-			req.Out.URL.RawPath = rawPath
+			// The fixed server is kept, base path included: a server
+			// under https://gateway.example/k8s receives /k8s/api/v1/...,
+			// not /api/v1/....
+			req.Out.URL.Path = joinBasePath(conn.target.Path, decodedPath)
+			req.Out.URL.RawPath = joinBasePath(conn.target.EscapedPath(), rawPath)
 			req.Out.Host = conn.target.Host
+			// The downstream Authorization does not pass upstream: the
+			// connection's transport sets the upstream one per request,
+			// so a token file auth setting refreshes from the file as
+			// it would without sb.
 			req.Out.Header.Del("Authorization")
-			if conn.bearerToken != "" {
-				req.Out.Header.Set("Authorization", "Bearer "+conn.bearerToken)
-			}
 		},
 	}
 	// The upstream request carries the stop context: cancelled when the

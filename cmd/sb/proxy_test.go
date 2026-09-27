@@ -148,14 +148,14 @@ func waitForPathGone(t *testing.T, path string, deadline time.Duration) {
 	}
 }
 
-// TestStartProxyK8sWatcherSetupFailureIsReported covers the k8s side's
-// watcher setup failing: the kubeconfig path's parent exists as a file, so
-// the MkdirAll that prepares the watched dir fails. The setup's own
+// TestStartProxyK8sSourceReadFailureIsReported covers the k8s side's
+// source read failing: the kubeconfig path's parent exists as a file, so
+// the load the initial issuance performs fails on it. The read's own
 // failure must be the start's result: a start that waits for a ready
 // that never comes would hang instead.
-func TestStartProxyK8sWatcherSetupFailureIsReported(t *testing.T) {
+func TestStartProxyK8sSourceReadFailureIsReported(t *testing.T) {
 	_, kubeconfigPath := startProxyTestEnv(t)
-	// The kubeconfig's parent is a file: the watcher setup's MkdirAll
+	// The kubeconfig's parent is a file: the source read's Load
 	// fails on it. The aws source keeps its side's setup working.
 	writeK8sSource(t, kubeconfigPath)
 	blocker := t.TempDir()
@@ -170,10 +170,10 @@ func TestStartProxyK8sWatcherSetupFailureIsReported(t *testing.T) {
 	issueDir := t.TempDir()
 	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err == nil {
-		t.Fatal("startProxy() with a failing watcher setup; want a failure")
+		t.Fatal("startProxy() with a failing source read; want a failure")
 	}
 	if !strings.Contains(err.Error(), "not a directory") {
-		t.Fatalf("startProxy() = %v; want the watcher setup's own failure", err)
+		t.Fatalf("startProxy() = %v; want the source read's own failure", err)
 	}
 	// Nothing the failed start issued stays behind it.
 	for _, name := range []string{".ssh", ".kube", ".aws"} {
@@ -360,16 +360,14 @@ func TestStartProxyReportsTheUnfinishedReclamation(t *testing.T) {
 	waitForPathExists(t, filepath.Join(issueDir, ".kube", "config"))
 }
 
-// TestStopJoinsTheIssuanceTasks covers the normal stop's join: an update
-// write in flight when the stop begins is waited for — the deletion of
-// what the issuing task wrote happens only after it exited, so what it is
-// still writing does not come back after the deletion. Without the join,
-// the stop returns while the write is in flight: the deletion lands under
-// it, and the write brings the issued files back.
+// TestStopJoinsTheIssuanceTasks covers the normal stop's join: the fixed
+// session issues nothing after the start, so the stop joins the issuing
+// tasks at the deadline or before, and the deletion of what they issued
+// happens only after they exited.
 func TestStopJoinsTheIssuanceTasks(t *testing.T) {
 	_, kubeconfigPath := startProxyTestEnv(t)
 	// Both sides start cleanly: the issuances succeed, the start
-	// returns a server both sides' loops follow.
+	// returns a server both sides follow.
 	writeK8sSource(t, kubeconfigPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -380,84 +378,33 @@ func TestStopJoinsTheIssuanceTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The kubeconfig becomes a fifo: the change event the watcher
-	// delivers for it puts the k8s side's sync in the middle of the
-	// source read — the update write in flight, held there.
-	if err := os.Remove(kubeconfigPath); err != nil {
+	// The source changes while the session runs. The fixed session does
+	// not follow it: a change would land next session, so nothing puts
+	// an issuance in flight here.
+	if err := os.WriteFile(kubeconfigPath, []byte("apiVersion: v1\nkind: Config\ncontexts: [\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(kubeconfigPath, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Remove(kubeconfigPath) })
 
-	// Wait for the update to be in flight: the sync is in the source
-	// read by now.
-	time.Sleep(300 * time.Millisecond)
-
-	// The stop joins the issuing task within the deadline: with the
-	// write in flight, the join is what waits out the release below.
+	// The stop joins the issuing tasks within the deadline: after the
+	// initial issuance they wait for the stop, so they exit here.
 	stopped := make(chan bool, 1)
 	go func() { stopped <- server.Stop(shutdownCtx()) }()
-
-	// The release: the fifo gets the source's next content — in
-	// parts, the last one late: the read completes at the end of
-	// them, so the update write lands after it. The join waits that
-	// out; without it, the deletion below races the write.
-	first, rest := kubeconfigFifoParts()
-	releaseFifo(t, kubeconfigPath, first, rest)
-	// The replace's second event may start another sync while the
-	// first is in flight: its reader is blocked at the fifo's open,
-	// waiting for a writer. Pair it: the reader proceeds with the
-	// data, the sync completes, the task exits within the join's
-	// deadline.
-	pairFifo(t, kubeconfigPath, first, rest)
-
 	joined := <-stopped
 	if !joined {
-		t.Fatal("Stop() did not join the issuing task within the deadline")
+		t.Fatal("Stop() did not join the issuing tasks within the deadline")
 	}
-	// The deletion: what the issuing task wrote is gone after it.
+	// The deletion: what the issuing tasks wrote is gone after them.
 	removeIssued(issueDir)
 
-	// The join means the exit: nothing writes anymore. What the
-	// update would have written after the deletion does not come
-	// back.
+	// The join means the exit: nothing writes anymore. What the source
+	// would have reissued after the deletion does not come back.
+	writeK8sSource(t, kubeconfigPath)
 	waitForPathGone(t, filepath.Join(issueDir, ".kube"), 5*time.Second)
 	if _, err := os.Stat(filepath.Join(issueDir, ".ssh")); !os.IsNotExist(err) {
 		t.Fatalf(".ssh exists after the removal: %v", err)
 	}
 }
 
-// pairFifo opens the fifo for writing and waits for a reader: the open
-// pairs with a reader blocked at its own open — both proceed, the data
-// flows, the reader completes at the close's EOF. No reader coming
-// within the limit means no reader waits at the fifo.
-func pairFifo(t *testing.T, path, first, rest string) bool {
-	t.Helper()
-	paired := make(chan error, 1)
-	go func() {
-		writer, err := os.OpenFile(path, os.O_WRONLY, 0o600)
-		if err != nil {
-			paired <- err
-			return
-		}
-		if _, err = writer.WriteString(first); err == nil {
-			time.Sleep(200 * time.Millisecond)
-			_, err = writer.WriteString(rest)
-		}
-		if cerr := writer.Close(); err == nil {
-			err = cerr
-		}
-		paired <- err
-	}()
-	select {
-	case <-paired:
-		return true
-	case <-time.After(3 * time.Second):
-		return false
-	}
-}
 func releaseFifo(t *testing.T, path, first, rest string) {
 	t.Helper()
 	writer, err := os.OpenFile(path, os.O_WRONLY, 0o600)

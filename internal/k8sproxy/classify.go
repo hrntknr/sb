@@ -29,6 +29,71 @@ func classifyRequest(method, path, query string) (*apirequest.RequestInfo, error
 	})
 }
 
+// validAPIPath reports whether a Kubernetes API path, in decoded and
+// escaped form, is well formed: the escapes keep the raw form's
+// segmentation, no segment is empty or a dot segment, the group
+// prefixes are recognized with a valid version, and the resource path
+// carries at most a name and a subresource after the namespaces
+// prefix. The classification still decides what the path means; this
+// rejects what it would read past the end of the resource the path
+// names (RequestInfoFactory is not a validator).
+func validAPIPath(decoded, raw string) bool {
+	// An escape that decodes to a separator would change the
+	// segmentation: the path forwarded upstream would not be the one
+	// classified (pods/nginx%2Flog would read as pods/nginx/log there).
+	if strings.Count(decoded, "/") != strings.Count(raw, "/") {
+		return false
+	}
+	seg := strings.Split(strings.Trim(decoded, "/"), "/")
+	for _, s := range seg {
+		if s == "" || s == "." || s == ".." {
+			return false
+		}
+	}
+	if len(seg) < 3 {
+		// Too short for a resource path: a non-resource path. The
+		// policy's fixed discovery set decides it.
+		return true
+	}
+	var rest []string
+	switch seg[0] {
+	case "api":
+		if seg[1] != "v1" {
+			// The core group is v1; nothing else is a route upstream.
+			return false
+		}
+		rest = seg[2:]
+	case "apis":
+		// /apis/{group}/{version}/...: any group and version — the
+		// policy's rules match the group.
+		rest = seg[3:]
+	default:
+		// Not a group prefix: a non-resource path.
+		return true
+	}
+	// The watch special verb precedes the resource path.
+	if len(rest) > 0 && rest[0] == "watch" {
+		rest = rest[1:]
+	}
+	// The namespaces prefix selects the namespace of the resource path;
+	// the namespaces resource keeps its own.
+	return len(stripNamespacesPrefix(rest)) <= 3
+}
+
+// stripNamespacesPrefix strips the namespaces/{namespace} prefix off the
+// resource path: the resource path is namespaced. The namespaces
+// resource keeps its own — the collection, a named namespace, or a
+// subresource of it (status, finalize).
+func stripNamespacesPrefix(rest []string) []string {
+	if len(rest) < 3 || rest[0] != "namespaces" {
+		return rest
+	}
+	if rest[2] == "status" || rest[2] == "finalize" {
+		return rest
+	}
+	return rest[2:]
+}
+
 // allowedDiscoveryPath reports whether a non-resource path is one of
 // the fixed discovery paths a downstream client may GET: /api, /apis,
 // the core /api/v1, the discovery of a group (/apis/<group>/<version>),

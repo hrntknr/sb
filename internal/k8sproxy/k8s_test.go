@@ -1,6 +1,7 @@
 package k8sproxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"gopkg.in/yaml.v3"
+	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
 const testProxyPort = 16443
@@ -74,7 +76,7 @@ func TestTargetsAllowsClassifiedRequests(t *testing.T) {
 
 	tests := []struct {
 		name, context, method, path, query string
-		want bool
+		want                               bool
 	}{
 		// dev: the enumerated verbs on the granted resource
 		{"dev get pod", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", "", true},
@@ -150,7 +152,7 @@ func TestTargetsAllNamespacesAndClusterScope(t *testing.T) {
 
 	tests := []struct {
 		name, context, method, path string
-		want bool
+		want                        bool
 	}{
 		// dev: "*" covers every namespace and the all-namespaces list
 		{"dev pods in default", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", true},
@@ -190,7 +192,7 @@ func TestTargetsIsolateSameClusterDifferentContexts(t *testing.T) {
 
 	tests := []struct {
 		name, context, path string
-		want bool
+		want                bool
 	}{
 		{"dev list pods", "dev", "/api/v1/namespaces/default/pods", true},
 		{"dev get pod log (no inheritance from prod)", "dev", "/api/v1/namespaces/default/pods/nginx/log", false},
@@ -255,9 +257,9 @@ func mustClassify(t *testing.T, method, path, query string) *apirequest.RequestI
 // what the API server would authorize for the same request.
 func TestClassifyRequest(t *testing.T) {
 	tests := []struct {
-		name, method, path, query string
+		name, method, path, query                                        string
 		wantVerb, wantResource, wantSubresource, wantNamespace, wantName string
-		wantResourceRequest bool
+		wantResourceRequest                                              bool
 	}{
 		// Regular resources: get on a named object, list and watch on
 		// collections (name empty turns get into list, watch comes
@@ -350,9 +352,9 @@ func TestRejectedRequest(t *testing.T) {
 
 func TestUpstreamRequestPath(t *testing.T) {
 	tests := []struct {
-		path, context string
+		path, context        string
 		wantDecoded, wantRaw string
-		wantWrong, wantOK bool
+		wantWrong, wantOK    bool
 	}{
 		// The prefix names the context: the token's context.
 		{"/dev/api/v1/namespaces/default/pods", "dev", "/api/v1/namespaces/default/pods", "/api/v1/namespaces/default/pods", false, true},
@@ -455,28 +457,6 @@ func TestRenderKubeconfigWithoutContexts(t *testing.T) {
 	}
 }
 
-func TestSyncConfigWritesEmptyKubeconfigWithoutContexts(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(t.TempDir(), "config")
-	t.Setenv("KUBECONFIG", sourcePath)
-	writeSourceKubeconfig(t, sourcePath, "dev")
-
-	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), dir)
-	defer cancel()
-
-	path := filepath.Join(dir, ".kube", "config")
-	waitFor(t, func() bool {
-		content, err := os.ReadFile(path)
-		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/dev")
-	})
-
-	writeSourceKubeconfig(t, sourcePath)
-	waitFor(t, func() bool {
-		content, err := os.ReadFile(path)
-		return err == nil && strings.Contains(string(content), "contexts: []")
-	})
-}
-
 func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(t.TempDir(), "config")
@@ -492,10 +472,12 @@ func TestSyncConfigReadsContextsFromUpstreamKubeconfig(t *testing.T) {
 		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/dev")
 	})
 
-	// prod enters through a policy reload: the re-render the source
-	// change triggers then carries it.
-	proxy.SetTargets(testPolicy("dev", "prod"))
-	writeSourceKubeconfig(t, sourcePath, "prod")
+	// prod enters the next session: a fresh proxy and its initial
+	// issuance read the changed source there.
+	writeSourceKubeconfig(t, sourcePath, "dev", "prod")
+	proxy2 := New(testPolicy("dev", "prod"), "proxy.local")
+	cancel2 := runSyncConfig(t, proxy2, dir)
+	defer cancel2()
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
 		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/prod")
@@ -522,6 +504,9 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfig(t, sourcePath, "prod", "dev")
+
+	// Session 1: the initial issuance renders with the source's current
+	// context (prod).
 	proxy := New(testPolicy("prod", "dev"), "proxy.local")
 	cancel := runSyncConfig(t, proxy, dir)
 	defer cancel()
@@ -532,6 +517,8 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 		return err == nil && strings.Contains(string(content), "current-context: prod")
 	})
 
+	// The user switches the current context inside the generated
+	// kubeconfig.
 	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
@@ -541,15 +528,14 @@ func TestSyncConfigKeepsInnerCurrentContext(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	// stage enters through a policy reload: the re-render the source
-	// change triggers then carries it.
-	proxy.SetTargets(testPolicy("prod", "dev", "stage"))
-	writeSourceKubeconfig(t, sourcePath, "prod", "dev", "stage")
+	// The next session: its initial issuance reads the inner override
+	// and keeps it.
+	proxy2 := New(testPolicy("prod", "dev"), "proxy.local")
+	cancel2 := runSyncConfig(t, proxy2, dir)
+	defer cancel2()
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
-		return err == nil &&
-			strings.Contains(string(content), "server: https://proxy.local:16443/stage") &&
-			strings.Contains(string(content), "current-context: dev")
+		return err == nil && strings.Contains(string(content), "current-context: dev")
 	})
 }
 
@@ -573,7 +559,11 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "apps"}, "dev")
-	cancel := runSyncConfig(t, New(testPolicy("dev"), "proxy.local"), dir)
+
+	// Session 1: the initial issuance renders with the source's
+	// namespace (apps).
+	proxy := New(testPolicy("dev"), "proxy.local")
+	cancel := runSyncConfig(t, proxy, dir)
 	defer cancel()
 
 	path := filepath.Join(dir, ".kube", "config")
@@ -582,6 +572,7 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 		return err == nil && strings.Contains(string(content), "namespace: apps")
 	})
 
+	// The user overrides the namespace inside the generated kubeconfig.
 	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
@@ -591,12 +582,14 @@ func TestSyncConfigKeepsInnerNamespace(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 
-	writeSourceKubeconfigWithNamespaces(t, sourcePath, map[string]string{"dev": "ops"}, "dev")
+	// The next session: its initial issuance reads the inner override
+	// and keeps it, even against the source's namespace.
+	proxy2 := New(testPolicy("dev"), "proxy.local")
+	cancel2 := runSyncConfig(t, proxy2, dir)
+	defer cancel2()
 	waitFor(t, func() bool {
 		content, err := os.ReadFile(path)
-		return err == nil &&
-			strings.Contains(string(content), "namespace: local") &&
-			!strings.Contains(string(content), "namespace: ops")
+		return err == nil && strings.Contains(string(content), "namespace: local")
 	})
 }
 
@@ -638,6 +631,71 @@ func TestServeRejectsPathWithoutUpstreamAPIPath(t *testing.T) {
 	proxy.serveHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// Regression: a path the API server's classification reads past the end
+// of the resource it names — a further segment after the subresource, an
+// escape that decodes to a separator, a version the core group does not
+// have — must not reach the upstream. With pods/log granted, all three
+// pass as pods/log get or pods list and are forwarded.
+func TestServeRejectsMalformedAPIPath(t *testing.T) {
+	hits := int32(0)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
+
+	proxy := New(Targets{testTarget("dev",
+		testResource("pods/log", "default", "get"),
+		testResource("pods", "default", "get", "list", "watch"),
+	)}, "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	for _, path := range []string{
+		// a further segment past the subresource: the API server would
+		// read past the end of the log path
+		"/dev/api/v1/namespaces/default/pods/nginx/log/extra",
+		// an escape that decodes to a separator: the raw path would be
+		// read as the log path upstream
+		"/dev/api/v1/namespaces/default/pods/nginx%2Flog",
+		// a version the core group does not have: it classifies as a
+		// pods list
+		"/dev/api/unknown/namespaces/default/pods",
+	} {
+		req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest() error = %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer downstream-token")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("malformed path %q status = %d, want %d (rejected before the upstream)", path, resp.StatusCode, http.StatusBadRequest)
+		}
+	}
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Fatalf("malformed paths reached the upstream %d times", hits)
 	}
 }
 
@@ -699,6 +757,68 @@ func TestServeProxiesToUpstreamContext(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// Regression: the resolved API server URL's base path is kept when
+// forwarding. A server under https://gateway.example/k8s receives
+// /k8s/api/..., not /api/...: without the base path the request would
+// go to another route on the gateway host, credentials included.
+func TestServeProxiesToUpstreamBasePath(t *testing.T) {
+	hits := make(chan string, 2)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits <- r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL+"/k8s")
+
+	proxy := New(Targets{testTarget("dev",
+		testResource("pods", "default", "get", "list", "watch"),
+		testResource("pods/log", "default", "get"),
+	)}, "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	for _, path := range []string{
+		// discovery under the base path
+		"/dev/api",
+		// a resource path under it
+		"/dev/api/v1/namespaces/default/pods/nginx/log",
+	} {
+		req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest() error = %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer downstream-token")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("%s: status = %d, want %d", path, resp.StatusCode, http.StatusNoContent)
+		}
+	}
+	if got := <-hits; got != "/k8s/api" {
+		t.Fatalf("discovery path = %q, want /k8s/api", got)
+	}
+	if got := <-hits; got != "/k8s/api/v1/namespaces/default/pods/nginx/log" {
+		t.Fatalf("resource path = %q, want /k8s/api/v1/namespaces/default/pods/nginx/log", got)
 	}
 }
 
@@ -768,13 +888,23 @@ func TestServeIsolatesSameClusterDifferentContexts(t *testing.T) {
 
 // TestServeProxiesKubectlLogs covers the kubectl logs flow at the protocol
 // level: an explicitly granted pods/log get passes (logs and logs -f),
-// without the explicit grant the same request is denied, and a token of
-// another context on the URL is rejected before the upstream.
+// the stream stays open with further lines arriving before it ends,
+// without the explicit grant the same request is denied — follow=true
+// included — and a token of another context on the URL is rejected
+// before the upstream.
 func TestServeProxiesKubectlLogs(t *testing.T) {
 	seen := make(chan string, 4)
+	// gates release the open streams: the upstream waits for the
+	// downstream to have read the first line before it sends the
+	// second — the stream is still open, not ended, while the
+	// downstream already received.
+	gates := make(chan struct{}, 2)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen <- r.URL.Path + "?" + r.URL.RawQuery
-		fmt.Fprint(w, "log line")
+		fmt.Fprint(w, "first line\n")
+		w.(http.Flusher).Flush()
+		<-gates
+		fmt.Fprint(w, "second line\n")
 	}))
 	defer upstream.Close()
 
@@ -817,20 +947,47 @@ func TestServeProxiesKubectlLogs(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	// granted: kubectl logs and kubectl logs -f both reach the upstream
+	// granted: kubectl logs and kubectl logs -f both reach the upstream,
+	// the stream relaying as it arrives: the first line is received
+	// while the stream is open (the second has not been sent yet), the
+	// second before the stream ends.
 	for _, query := range []string{"", "?follow=true"} {
-		if got := logsStatus("dev", "downstream-token", query); got != http.StatusOK {
-			t.Fatalf("logs %q status = %d, want %d", query, got, http.StatusOK)
+		req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+"/dev/api/v1/namespaces/default/pods/nginx/log"+query, nil)
+		if err != nil {
+			t.Fatalf("NewRequest() error = %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer downstream-token")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do() error = %v", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("logs %q status = %d, want %d", query, resp.StatusCode, http.StatusOK)
+		}
+		body := bufio.NewReader(resp.Body)
+		line, err := body.ReadString('\n')
+		if err != nil || line != "first line\n" {
+			t.Fatalf("first line was not received from the open stream: %q, %v", line, err)
+		}
+		// The downstream read the first line: release the stream.
+		gates <- struct{}{}
+		line, err = body.ReadString('\n')
+		if line != "second line\n" || (err != nil && err != io.EOF) {
+			t.Fatalf("second line was not received before the stream ended: %q, %v", line, err)
 		}
 		if got := <-seen; got != "/api/v1/namespaces/default/pods/nginx/log?"+strings.TrimPrefix(query, "?") {
 			t.Fatalf("upstream request = %q, want the log path with %q", got, query)
 		}
+		resp.Body.Close()
 	}
 
-	// denied by policy: without the explicit pods/log rule
+	// denied by policy: without the explicit pods/log rule both the
+	// plain request and follow=true are denied
 	proxy.SetTargets(Targets{testTarget("dev", testResource("pods", "default", "get"))})
-	if got := logsStatus("dev", "downstream-token", ""); got != http.StatusForbidden {
-		t.Fatalf("logs status = %d, want %d (denied without pods/log)", got, http.StatusForbidden)
+	for _, query := range []string{"", "?follow=true"} {
+		if got := logsStatus("dev", "downstream-token", query); got != http.StatusForbidden {
+			t.Fatalf("logs %q status = %d, want %d (denied without pods/log)", query, got, http.StatusForbidden)
+		}
 	}
 
 	// a token of another context on the URL is rejected before the upstream
@@ -880,6 +1037,71 @@ func TestServeProxiesWithOIDCAuthProvider(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+}
+
+// Regression: the proxy must not set the upstream Authorization itself —
+// the transport's auth settings then refresh per request. With a token
+// file, the new token is observed upstream after the file changes: the
+// transport re-reads it (client-go's cached file source, a minute minus
+// leeway after the first read).
+func TestServeObservesTokenFileUpdates(t *testing.T) {
+	seen := make(chan string, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("old-upstream-token"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	sourcePath := filepath.Join(t.TempDir(), "config")
+	t.Setenv("KUBECONFIG", sourcePath)
+	writeTokenFileSourceKubeconfig(t, sourcePath, upstream.URL, tokenPath)
+
+	proxy := New(testPolicy("dev"), "localhost")
+	if err := proxy.resolveConnections(); err != nil {
+		t.Fatal(err)
+	}
+	proxy.tokens = map[string]string{"downstream-token": "dev"}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = proxy.Serve(listener)
+	}()
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	request := func() {
+		t.Helper()
+		requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+	}
+
+	request()
+	if got := <-seen; got != "Bearer old-upstream-token" {
+		t.Fatalf("upstream Authorization = %q, want the file's initial token", got)
+	}
+
+	if err := os.WriteFile(tokenPath, []byte("new-upstream-token"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	// The transport re-reads the file: within its cache period (a
+	// minute minus leeway) the new token is observed upstream.
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		request()
+		if got := <-seen; got == "Bearer new-upstream-token" {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("the new token was not observed upstream")
+		}
 	}
 }
 
@@ -1027,18 +1249,29 @@ func TestServeUsesUpdatedOIDCAuthProviderConfig(t *testing.T) {
 	}
 
 	// The session's connection is fixed: the rewritten source does not
-	// change the auth settings already resolved, the next session
-	// resolves them anew.
+	// change the auth settings already resolved.
 	writeOIDCSourceKubeconfig(t, sourcePath, upstream.URL, newToken)
 	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
 	if got := <-seen; got != "Bearer "+oldToken {
 		t.Fatalf("second upstream Authorization = %q, want the token fixed for the session", got)
 	}
 
-	if err := proxy.resolveConnections(); err != nil {
+	// The next session resolves the auth settings anew: a fresh proxy
+	// resolves the rewritten source through its initial issuance.
+	proxy2 := New(testPolicy("dev"), "localhost")
+	if err := proxy2.resolveConnections(); err != nil {
 		t.Fatal(err)
 	}
-	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
+	proxy2.tokens = map[string]string{"downstream-token": "dev"}
+	listener2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener2.Close()
+	go func() {
+		_ = proxy2.Serve(listener2)
+	}()
+	requestKubeAPI(t, client, listener2.Addr().String(), "dev", "downstream-token")
 	if got := <-seen; got != "Bearer "+newToken {
 		t.Fatalf("third upstream Authorization = %q, want new token", got)
 	}
@@ -1100,40 +1333,6 @@ func TestCertificateCoversConfiguredHost(t *testing.T) {
 	}
 }
 
-// Regression: when writing the generated kubeconfig fails (e.g. a
-// downstream process replaced the output directory with a symlink), the
-// proxy's tokens must stay consistent with what is on disk and nothing may
-// be written through the symlink.
-func TestSyncConfigOnceKeepsTokensWhenWriteFails(t *testing.T) {
-	sourcePath := filepath.Join(t.TempDir(), "config")
-	t.Setenv("KUBECONFIG", sourcePath)
-	writeSourceKubeconfig(t, sourcePath, "dev")
-
-	proxy := New(nil, "proxy.local")
-	proxy.mu.Lock()
-	proxy.tokens = map[string]string{"old-token": "dev"}
-	proxy.mu.Unlock()
-
-	dir := t.TempDir()
-	real := t.TempDir()
-	if err := os.Symlink(real, filepath.Join(dir, ".kube")); err != nil {
-		t.Fatalf("Symlink() error = %v", err)
-	}
-
-	if _, err := proxy.syncConfigOnce(testProxyPort, dir, ^uint32(0)); err == nil {
-		t.Fatal("syncConfigOnce() through symlinked .kube should fail")
-	}
-	proxy.mu.RLock()
-	_, ok := proxy.tokens["old-token"]
-	proxy.mu.RUnlock()
-	if !ok {
-		t.Fatal("tokens were replaced despite write failure")
-	}
-	if _, err := os.Stat(filepath.Join(real, "config")); !os.IsNotExist(err) {
-		t.Fatal("write escaped through symlinked .kube dir")
-	}
-}
-
 // The generated kubeconfig embeds the proxy CA; a client verifying against
 // it (instead of skipping verification) must succeed.
 func TestServeTLSVerifiedAgainstEmbeddedCA(t *testing.T) {
@@ -1181,17 +1380,17 @@ func TestServeTLSVerifiedAgainstEmbeddedCA(t *testing.T) {
 	requestKubeAPI(t, client, listener.Addr().String(), "dev", "downstream-token")
 }
 
-// Regression: existing contexts keep their tokens across syncs so clients
-// reading the old kubeconfig are not rejected, while new contexts get fresh
-// tokens. The prod context enters through a policy reload: the session's
-// connections stay fixed, only the generated kubeconfig follows.
-func TestSyncConfigReusesTokensForExistingContexts(t *testing.T) {
+// Regression: the session's issuance stays fixed. Source changes — a
+// context removed, the source corrupted, the context swapped back in —
+// must not change the issued tokens or the generated kubeconfig while
+// the session runs; a change lands next session.
+func TestSyncConfigKeepsIssuedTokensWhenSourceChanges(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
-	writeSourceKubeconfig(t, sourcePath, "dev")
+	writeSourceKubeconfig(t, sourcePath, "dev", "prod")
 
-	proxy := New(testPolicy("dev"), "proxy.local")
+	proxy := New(testPolicy("dev", "prod"), "proxy.local")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ready := make(chan error, 1)
@@ -1208,22 +1407,48 @@ func TestSyncConfigReusesTokensForExistingContexts(t *testing.T) {
 		content, err := os.ReadFile(path)
 		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/dev")
 	})
+	issued, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
 	devToken := contextToken(t, path, "dev")
 
-	// The policy gains prod before the source does: the re-render the
-	// source change triggers then carries both contexts.
-	proxy.SetTargets(testPolicy("dev", "prod"))
+	// assertFixed: whatever the source change, the issuance stays
+	// fixed — the tokens and the file on disk do not change while the
+	// session runs. The window lets a re-render land if one runs.
+	assertFixed := func() {
+		t.Helper()
+		time.Sleep(500 * time.Millisecond)
+		if got := contextToken(t, path, "dev"); got != devToken {
+			t.Fatalf("the dev token changed: %q, want %q", got, devToken)
+		}
+		now, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile() error = %v", err)
+		}
+		if string(now) != string(issued) {
+			t.Fatal("the generated kubeconfig was rewritten")
+		}
+		select {
+		case err := <-errc:
+			t.Fatalf("SyncConfig() ended: %v", err)
+		default:
+		}
+	}
+
+	// a permitted context disappears from the source: its token stays
+	writeSourceKubeconfig(t, sourcePath, "prod")
+	assertFixed()
+
+	// the source becomes invalid YAML mid-save
+	if err := os.WriteFile(sourcePath, []byte("apiVersion: v1\nkind: Config\ncontexts: ["), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	assertFixed()
+
+	// the context returns: a re-issue would replace the token
 	writeSourceKubeconfig(t, sourcePath, "dev", "prod")
-	waitFor(t, func() bool {
-		content, err := os.ReadFile(path)
-		return err == nil && strings.Contains(string(content), "server: https://proxy.local:16443/prod")
-	})
-	if got := contextToken(t, path, "dev"); got != devToken {
-		t.Fatalf("dev token was re-issued: %q, want %q", got, devToken)
-	}
-	if got := contextToken(t, path, "prod"); got == "" || got == devToken {
-		t.Fatalf("prod token = %q, want a fresh token", got)
-	}
+	assertFixed()
 
 	cancel()
 	select {
@@ -1406,6 +1631,27 @@ func writeOIDCSourceKubeconfig(t *testing.T, path, server, idToken string) {
 	}
 }
 
+// writeTokenFileSourceKubeconfig writes a source kubeconfig whose user
+// authenticates by a token file: the connection's transport reads it per
+// request (a client-go cached file source).
+func writeTokenFileSourceKubeconfig(t *testing.T, path, server, tokenPath string) {
+	t.Helper()
+	content := "apiVersion: v1\nkind: Config\nclusters:\n" +
+		"- name: dev\n  cluster:\n    server: " + server + "\n" +
+		"    insecure-skip-tls-verify: true\n" +
+		"users:\n" +
+		"- name: dev\n  user:\n    tokenFile: " + tokenPath + "\n" +
+		"contexts:\n" +
+		"- name: dev\n  context:\n    cluster: dev\n    user: dev\n" +
+		"current-context: dev\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+}
+
 func writeOIDCRefreshSourceKubeconfig(t *testing.T, path, server, issuer, issuerCA, idToken string) {
 	t.Helper()
 	content := "apiVersion: v1\nkind: Config\nclusters:\n" +
@@ -1490,62 +1736,88 @@ func testIDTokenWithSubject(t *testing.T, expiry time.Time, subject string) stri
 }
 
 // TestShutdownCutsLingeringRequestAtDeadline covers the deadline of the stop
-// flow: a watch the upstream never completes is cut at the deadline, not
-// waited for. The stop start (BeginStop) is what cuts the upstream request
-// itself; the lingering downstream connection is closed at the deadline.
+// flow: a logs stream whose body has started being sent — the first line
+// was received while the stream stayed open — is cut at the stop start
+// (BeginStop), not waited for. The lingering downstream connection is
+// closed at the deadline.
 func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 	aborted := make(chan struct{})
-	release := make(chan struct{})
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		go func() {
-			// The upstream request the proxy opened carries the stop
-			// context: BeginStop cancels it here.
-			<-r.Context().Done()
-			close(aborted)
-		}()
-		<-release // the watch never completes while this is held open
+		// A logs stream: the body starts being sent, then the stream
+		// stays open until the stop cancels it.
+		fmt.Fprint(w, "first line\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(aborted)
 	}))
 	defer upstream.Close()
-	// Release the hanging handler before upstream.Close() waits on it.
-	defer close(release)
 	sourcePath := filepath.Join(t.TempDir(), "config")
 	t.Setenv("KUBECONFIG", sourcePath)
 	writeUsableSourceKubeconfig(t, sourcePath, upstream.URL)
 
-	proxy := New(testPolicy("dev"), "localhost")
+	proxy := New(Targets{testTarget("dev",
+		testResource("pods/log", "default", "get"),
+		testResource("pods", "default", "get", "list", "watch"),
+	)}, "localhost")
 	if err := proxy.resolveConnections(); err != nil {
 		t.Fatal(err)
 	}
 	proxy.tokens = map[string]string{"downstream-token": "dev"}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Listen() error = %v", err)
 	}
 	defer listener.Close()
 	go func() { _ = proxy.Serve(listener) }()
 
-	req, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/dev/api", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://"+listener.Addr().String()+"/dev/api/v1/namespaces/default/pods/nginx/log", nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("NewRequest() error = %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer downstream-token")
-	req.URL.Scheme = "https"
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	done := make(chan error, 1)
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
 	go func() {
-		_, err := client.Do(req)
-		done <- err
+		resp, err := client.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
 	}()
 
-	// Let the request reach the hanging upstream.
-	time.Sleep(100 * time.Millisecond)
-	// The stop start: the upstream request is cancelled here — before
-	// anything waits on it.
+	var resp *http.Response
+	select {
+	case err := <-errCh:
+		t.Fatalf("Do() error = %v", err)
+	case resp = <-respCh:
+	}
+	body := bufio.NewReader(resp.Body)
+	if line, err := body.ReadString('\n'); err != nil || line != "first line\n" {
+		t.Fatalf("the first line was not received from the open stream: %q, %v", line, err)
+	}
+	// Body sending has begun: the stream is open, the upstream handler
+	// still runs. The stop start: the upstream request is cancelled
+	// here — before anything waits on it.
 	proxy.BeginStop()
 	select {
 	case <-aborted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the upstream request was not cancelled by the stop start")
+	}
+
+	// The stream does not linger past the stop: it ended here — the
+	// aborted upstream gives the downstream a closed stream.
+	ended := make(chan error, 1)
+	go func() {
+		_, err := body.ReadString('\n')
+		ended <- err
+	}()
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream lingered past the stop")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
@@ -1554,15 +1826,6 @@ func TestShutdownCutsLingeringRequestAtDeadline(t *testing.T) {
 	proxy.Shutdown(ctx)
 	if waited := time.Since(start); waited > 2*time.Second {
 		t.Fatalf("Shutdown waited %v; want it bounded by the deadline", waited)
-	}
-
-	// The request does not linger past the stop: it ended here — the
-	// aborted upstream gives the downstream an error (upstream
-	// unavailable) or a closed connection, whichever came first.
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the request lingered past the stop")
 	}
 }
 

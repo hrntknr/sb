@@ -8,7 +8,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,7 +19,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/yaml.v3"
 	"k8s.io/client-go/tools/clientcmd"
@@ -106,14 +104,15 @@ type kubeconfigState struct {
 	CurrentContext string
 }
 
-// SyncConfig keeps the proxy kubeconfig under dir in sync with the source
-// kubeconfig. It resolves the session's upstream connections (startSession)
-// from the source the initial read loads, signals the setup's own result
-// through ready (nil: the initial issuance succeeded), and then follows source
-// changes. current-context and namespace overrides made inside the generated
-// config are preserved across syncs.
+// SyncConfig issues the session's k8s credentials under dir once: it
+// resolves the upstream connections from the source kubeconfig the
+// initial read loads, renders the generated kubeconfig, and issues the
+// downstream tokens — all fixed for the session. It signals the
+// issuance's own result through ready (nil: the issuance succeeded),
+// and then holds the session open until the run ends or the stop
+// begins: a source change lands next session.
 func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- error) error {
-	// result reports the setup's own outcome through ready, so the
+	// result reports the issuance's own outcome through ready, so the
 	// start waiting on it learns about a failed setup: without it the
 	// caller would wait forever for an issuance that never began.
 	result := func(err error) error {
@@ -128,119 +127,44 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 	if strings.TrimSpace(dir) == "" {
 		dir = "."
 	}
-	sourcePaths := clientcmd.NewDefaultClientConfigLoadingRules().GetLoadingPrecedence()
-	if len(sourcePaths) == 0 {
-		return result(fmt.Errorf("k8s: no kubeconfig paths"))
+	if err := p.startSession(port, dir); err != nil {
+		return result(err)
 	}
-	// Register the watcher before the initial sync so a change landing
-	// between them is still picked up.
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return result(fmt.Errorf("watch kubeconfig: %w", err))
-	}
-	defer watcher.Close()
-	for _, sourcePath := range sourcePaths {
-		dir := filepath.Dir(sourcePath)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return result(fmt.Errorf("watch kubeconfig dir: %w", err))
-		}
-		if err := watcher.Add(dir); err != nil {
-			return result(fmt.Errorf("watch kubeconfig dir: %w", err))
-		}
-	}
-
-	lastKey, err := p.startSession(port, dir)
 	if ready != nil {
 		// The initial issuance's own result, not just its completion.
-		ready <- err
+		ready <- nil
 	}
-	if err != nil {
-		return err
-	}
-
-	// The loop's stop: the proxy's own stop state (BeginStop), or the
-	// run ending, whichever comes first.
-	stop := p.stopContext(ctx)
-	for {
-		select {
-		case <-stop.Done():
-			return nil
-		case event := <-watcher.Events:
-			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
-				continue
-			}
-			matched := false
-			for _, sourcePath := range sourcePaths {
-				if filepath.Clean(event.Name) == filepath.Clean(sourcePath) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				continue
-			}
-			var nextKey uint32
-			nextKey, err = p.syncConfigOnce(port, dir, lastKey)
-			if err != nil {
-				return err
-			}
-			lastKey = nextKey
-		case err := <-watcher.Errors:
-			return err
-		}
-	}
+	// The session is fixed: nothing follows the source, and nothing
+	// reissues. Wait for the end — the run's (ctx) or the stop's,
+	// whichever comes first.
+	<-p.stopContext(ctx).Done()
+	return nil
 }
 
-// startSession performs the session's initial source read: it resolves the
-// upstream connection for every context the policy names — fixing it for the
-// session, the URL, TLS verification, and auth settings the context entry
-// resolves to — and renders the initial generated kubeconfig from the same
-// read. A context the policy names that does not resolve — one missing from
-// the source kubeconfig — is a startup error.
-func (p *Proxy) startSession(port int, dir string) (uint32, error) {
+// startSession performs the session's initial issuance: it resolves the
+// upstream connection for every context the policy names — fixing it
+// for the session, the URL, TLS verification, and auth settings the
+// context entry resolves to — and renders the initial generated
+// kubeconfig from the same read. A context the policy names that does
+// not resolve — one missing from the source kubeconfig — is a startup
+// error.
+func (p *Proxy) startSession(port int, dir string) error {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	raw, err := loadingRules.Load()
 	if err != nil {
-		return 0, fmt.Errorf("load upstream kubeconfig: %w", err)
+		return fmt.Errorf("load upstream kubeconfig: %w", err)
 	}
 	if err := p.resolveConnectionsFrom(raw, loadingRules); err != nil {
-		return 0, err
+		return err
 	}
-	key, err := p.renderAndWrite(port, dir, stateFromConfig(raw))
-	if err != nil {
-		return 0, err
-	}
-	return key, nil
+	return p.renderAndWrite(port, dir, stateFromConfig(raw))
 }
 
-// syncConfigOnce re-renders the generated kubeconfig from a fresh read of the
-// source: it is the watch loop's step, triggered by source changes. The
-// session's upstream connections stay fixed; only the generated kubeconfig
-// follows the source, and a change applies next session.
-func (p *Proxy) syncConfigOnce(port int, dir string, lastKey uint32) (uint32, error) {
-	source, err := readSourceKubeconfig()
-	if err != nil {
-		return lastKey, err
-	}
-	key := source.key()
-	if key == lastKey {
-		return lastKey, nil
-	}
-
-	nextKey, err := p.renderAndWrite(port, dir, source)
-	if err != nil {
-		return lastKey, err
-	}
-	return nextKey, nil
-}
-
-// renderAndWrite renders the generated kubeconfig for the state's contexts
-// as far as the policy names them — only the permitted ones go into it —
-// preserving the current-context and namespace overrides made inside it,
-// writes it, and updates the tokens. It returns the state's key so a
-// following source read can tell its changes.
-func (p *Proxy) renderAndWrite(port int, dir string, state kubeconfigState) (uint32, error) {
-	key := state.key()
+// renderAndWrite renders the generated kubeconfig for the state's
+// contexts as far as the policy names them — only the permitted ones go
+// into it — preserving the current-context and namespace overrides made
+// inside it, writes it, and updates the tokens.
+func (p *Proxy) renderAndWrite(port int, dir string, state kubeconfigState) error {
 	p.mu.RLock()
 	targets := p.Targets
 	p.mu.RUnlock()
@@ -266,7 +190,7 @@ func (p *Proxy) renderAndWrite(port int, dir string, state kubeconfigState) (uin
 
 	inner, err := readInnerKubeconfig(filepath.Join(dir, ".kube", "config"))
 	if err != nil {
-		return key, err
+		return err
 	}
 	if currentContext := inner.CurrentContext; currentContext != "" && allowed[currentContext] {
 		state.CurrentContext = currentContext
@@ -286,26 +210,24 @@ func (p *Proxy) renderAndWrite(port int, dir string, state kubeconfigState) (uin
 
 	content, tokens, err := p.renderKubeconfig(port, contexts, state.CurrentContext)
 	if err != nil {
-		return key, err
+		return err
 	}
 	// Write the new file first; on failure the state stays consistent with
 	// the file still on disk.
 	if err := util.WriteFileAtomic(filepath.Join(dir, ".kube", "config"), 0o600, content); err != nil {
-		return key, fmt.Errorf("write kubeconfig: %w", err)
+		return fmt.Errorf("write kubeconfig: %w", err)
 	}
 	p.mu.Lock()
 	p.tokens = tokens
 	p.mu.Unlock()
 
 	slog.Info("synced k8s config", "path", filepath.Join(dir, ".kube", "config"), "contexts", len(contexts), "current_context", state.CurrentContext)
-	return key, nil
+	return nil
 }
 
 // renderKubeconfig builds the proxy-only kubeconfig with one downstream
-// token per context. Tokens of contexts that already exist are reused, so a
-// source rewrite does not invalidate credentials clients are still using.
-// The proxy's TLS certificate is embedded as the cluster trust anchor so
-// downstream clients verify the connection.
+// token per context. The proxy's TLS certificate is embedded as the
+// cluster trust anchor so downstream clients verify the connection.
 func (p *Proxy) renderKubeconfig(port int, contexts []kubeconfigContext, currentContext string) ([]byte, map[string]string, error) {
 	certificate, err := p.certificate()
 	if err != nil {
@@ -316,14 +238,6 @@ func (p *Proxy) renderKubeconfig(port int, contexts []kubeconfigContext, current
 		Bytes: certificate.Certificate[0],
 	}))
 
-	p.mu.RLock()
-	oldTokens := p.tokens // token -> context
-	p.mu.RUnlock()
-	// Invert to context -> token so existing contexts keep their token.
-	existing := make(map[string]string, len(oldTokens))
-	for token, context := range oldTokens {
-		existing[context] = token
-	}
 	tokens := make(map[string]string, len(contexts)) // token -> context
 
 	config := kubeconfigFile{
@@ -335,13 +249,9 @@ func (p *Proxy) renderKubeconfig(port int, contexts []kubeconfigContext, current
 	}
 	config.CurrentContext = currentContext
 	for _, context := range contexts {
-		token, ok := existing[context.Name]
-		if !ok {
-			var err error
-			token, err = randomToken()
-			if err != nil {
-				return nil, nil, fmt.Errorf("k8s: issue token for %q: %w", context.Name, err)
-			}
+		token, err := randomToken()
+		if err != nil {
+			return nil, nil, fmt.Errorf("k8s: issue token for %q: %w", context.Name, err)
 		}
 		tokens[token] = context.Name
 		config.Clusters = append(config.Clusters, namedCluster{
@@ -369,31 +279,6 @@ func (p *Proxy) renderKubeconfig(port int, contexts []kubeconfigContext, current
 		return nil, nil, fmt.Errorf("k8s: marshal kubeconfig: %w", err)
 	}
 	return content, tokens, nil
-}
-
-func (s kubeconfigState) key() uint32 {
-	hash := crc32.NewIEEE()
-	for _, context := range s.Contexts {
-		_, _ = hash.Write([]byte(context.Name))
-		_, _ = hash.Write([]byte{0})
-		_, _ = hash.Write([]byte(context.Namespace))
-		_, _ = hash.Write([]byte{0})
-	}
-	_, _ = hash.Write([]byte(s.CurrentContext))
-	return hash.Sum32()
-}
-
-// readSourceKubeconfig loads context names, namespaces, and the current
-// context from the user's kubeconfig.
-func readSourceKubeconfig() (kubeconfigState, error) {
-	config, err := clientcmd.NewDefaultClientConfigLoadingRules().Load()
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return kubeconfigState{}, nil
-		}
-		return kubeconfigState{}, err
-	}
-	return stateFromConfig(config), nil
 }
 
 // stateFromConfig derives the source state — context names with their

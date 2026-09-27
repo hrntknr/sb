@@ -33,8 +33,8 @@ func (c Config) K8sTargets() k8sproxy.Targets {
 				Group:     resource.Group,
 				Resource:  resource.Resource,
 				Namespace: resource.Namespace,
-				Scope:      resource.Scope,
-				Verbs:      resource.Verbs,
+				Scope:     resource.Scope,
+				Verbs:     resource.Verbs,
 			})
 		}
 		targets = append(targets, k8sproxy.Target{
