@@ -135,6 +135,99 @@ func querySuffix(query string) string {
 	return "?" + query
 }
 
+// TestTargetsAllowWriteRequests covers the write verbs: a granted
+// create, update, patch, and delete passes the policy as the read verbs
+// do — what the API server derives from the method (POST is a create,
+// PUT an update, PATCH a patch, DELETE a delete) is what the rules are
+// matched against. A delete on a collection is deletecollection — a
+// verb no supported list carries, not among the seven — and stays
+// rejected; so does a write on pods/log, where no write exists.
+func TestTargetsAllowWriteRequests(t *testing.T) {
+	targets := Targets{
+		testTarget("dev", testResource("pods", "default", "create", "update", "patch", "delete")),
+		testTarget("log", testResource("pods/log", "default", "get")),
+	}
+	tests := []struct {
+		name, context, method, path string
+		want                        bool
+	}{
+		{"dev create pods", "dev", http.MethodPost, "/api/v1/namespaces/default/pods", true},
+		{"dev update pod", "dev", http.MethodPut, "/api/v1/namespaces/default/pods/nginx", true},
+		{"dev patch pod", "dev", http.MethodPatch, "/api/v1/namespaces/default/pods/nginx", true},
+		{"dev delete pod", "dev", http.MethodDelete, "/api/v1/namespaces/default/pods/nginx", true},
+		// A delete on the collection is deletecollection, not among the
+		// seven: no rule carries it, so it stays rejected.
+		{"dev delete the collection", "dev", http.MethodDelete, "/api/v1/namespaces/default/pods", false},
+		// The read verbs are not in the grant: what they cover stays
+		// rejected.
+		{"dev get pod", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx", false},
+		{"dev list pods", "dev", http.MethodGet, "/api/v1/namespaces/default/pods", false},
+		// A write on pods/log: get is all a log supports, create does
+		// not exist there.
+		{"log write pod log", "log", http.MethodPost, "/api/v1/namespaces/default/pods/nginx/log", false},
+		{"log patch pod log", "log", http.MethodPatch, "/api/v1/namespaces/default/pods/nginx/log", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowsClassified(t, targets, tt.context, tt.method, tt.path, ""); got != tt.want {
+				t.Fatalf("Allows(%s %s) = %v, want %v", tt.method, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTargetsAllowWhatOmittedFieldsResolveTo covers what the omitted
+// fields of a config resolve to: an omitted namespace is every
+// namespace ("*") and an omitted verbs list every verb the resource
+// supports — the same rules writing them out would give, granting every
+// request the resource's requests cover: any namespace, any of the
+// seven verbs, a cluster-scoped grant at the cluster's root. What the
+// omission does not cover — a subresource is a grant of its own —
+// stays rejected.
+func TestTargetsAllowWhatOmittedFieldsResolveTo(t *testing.T) {
+	// What an omitted namespace and omitted verbs resolve to: the
+	// all-namespaces grant with the full verb list, and the same verbs
+	// on a cluster-scoped rule.
+	targets := Targets{
+		testTarget("dev",
+			testResource("pods", "*", "get", "list", "watch", "create", "update", "patch", "delete"),
+		),
+		testTarget("cluster",
+			Resource{
+				Group:    "storage.k8s.io",
+				Resource: "storageclasses",
+				Scope:    "cluster",
+				Verbs:    []string{"get", "list", "watch", "create", "update", "patch", "delete"},
+			},
+		),
+	}
+	tests := []struct {
+		name, context, method, path, query string
+		want                               bool
+	}{
+		// Any namespace: the grant is every namespace at once, not one.
+		{"create in default", "dev", http.MethodPost, "/api/v1/namespaces/default/pods", "", true},
+		{"create in another namespace", "dev", http.MethodPost, "/api/v1/namespaces/other/pods", "", true},
+		{"update in another namespace", "dev", http.MethodPut, "/api/v1/namespaces/other/pods/nginx", "", true},
+		{"delete in another namespace", "dev", http.MethodDelete, "/api/v1/namespaces/other/pods/nginx", "", true},
+		{"watch in any namespace", "dev", http.MethodGet, "/api/v1/namespaces/other/pods", "watch=true", true},
+		{"list across every namespace", "dev", http.MethodGet, "/api/v1/pods", "", true},
+		// The cluster-scoped shape: the same verbs at the cluster's root.
+		{"read a cluster-scoped resource", "cluster", http.MethodGet, "/apis/storage.k8s.io/v1/storageclasses", "", true},
+		{"write a cluster-scoped resource", "cluster", http.MethodPost, "/apis/storage.k8s.io/v1/storageclasses", "", true},
+		// A subresource is a grant of its own: pods does not cover
+		// pods/log, and the omission does not add it.
+		{"pods/log is not pods", "dev", http.MethodGet, "/api/v1/namespaces/default/pods/nginx/log", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := allowsClassified(t, targets, tt.context, tt.method, tt.path, tt.query); got != tt.want {
+				t.Fatalf("Allows(%s %s%s) = %v, want %v", tt.method, tt.path, querySuffix(tt.query), got, tt.want)
+			}
+		})
+	}
+}
+
 // TestTargetsAllNamespacesAndClusterScope covers the namespace forms: a
 // namespaced rule covers one namespace, "*" covers every namespace and the
 // all-namespaces list, and scope: cluster covers the cluster-scoped

@@ -113,16 +113,18 @@ Review each host: a v2 `commands` rule that felt limited now becomes an explicit
 
 `user` and `port` are optional additional restrictions on the upstream connection (`user: git`, `port: 22`); when omitted, the values resolved from the upstream ssh config are used. `ssh.host` is still a pattern matched against the hostname resolved on the host running sb (`*.example.net`, `*`).
 
-## k8s: `mode` → enumerated `resources`
+## k8s: `mode` → `mode`, or enumerated `resources`
 
-v2 granted `r`/`rw` on a context. With `namespace: default` set, the grants applied to namespaced requests in `default` only; with `namespace` omitted, they applied to namespaced requests in *every* namespace *and* to cluster-scoped requests. v3 enumerates every grant explicitly, so the conversion is manual:
+v2 granted `r`/`rw` on a context. v3 keeps the form as `mode: ro` (read) and `mode: rw` (every verb) — granted on every resource of the stable API, in every namespace and at the cluster\'s root alike — and adds the explicit form: `resources` enumerates the verbs on each resource you name. `mode` and `resources` are mutually exclusive in one context.
+
+With `namespace: default` set, v2 granted only the namespaced requests in `default`; with `namespace` omitted, it granted namespaced requests in *every* namespace *and* cluster-scoped requests — exactly what the v3 modes grant. The conversion is manual because the narrower grant is per resource:
 
 | v2 | v3 |
 | --- | --- |
-| `mode: r`, `namespace: default` | `resources` with the verbs you want in `default` (below) |
-| `mode: rw` | **no v3 equivalent in the initial version** — no write verbs exist; drop the entry or keep only the read you intended |
-| `namespace` omitted | v2 granted both every-namespace namespaced operations *and* cluster-scoped operations. In v3 these are separate grants: pick per resource — `namespace: "*"` for namespaced resources, `scope: cluster` for cluster-scoped resources (like `namespaces` or `nodes`). Converting only to `scope: cluster` silently drops every namespaced grant. |
-| read of `pods` | does *not* inherit to `pods/log`; add a separate `pods/log` rule if you use `kubectl logs` |
+| `mode: r`, `namespace: default` | `resources` with the verbs you want in `default` (below) — or `mode: ro`, which also grants read on every other resource: check that is what you mean |
+| `mode: rw` | `mode: rw`: every resource of the stable API, every verb. v2 granted read-write on the resources in the namespace; check that read-write everywhere is what you mean |
+| `namespace` omitted | v2 granted both every-namespace namespaced operations *and* cluster-scoped operations — the v3 modes grant exactly that. The `resources` form picks per resource — `namespace: "*"` for namespaced resources, `scope: cluster` for cluster-scoped resources (like `namespaces` or `nodes`) — and converting only to `scope: cluster` silently drops every namespaced grant. |
+| read of `pods` | does *not* inherit to `pods/log`; add a separate `pods/log` rule if you use `kubectl logs`. No mode covers `pods/log` — a `pods/log` rule in `resources` is the only way to grant it |
 
 `mode: r` granted all resources read access in the namespace; v3 requires listing each resource you actually use:
 
@@ -178,11 +180,32 @@ k8s:
         verbs: [get, list, watch]
 ```
 
+`mode: rw` keeps its form; the grant widens from the resources in the namespace to every resource of the stable API:
+
+v2:
+
+```yaml
+k8s:
+  - context: dev
+    mode: rw
+    namespace: default
+```
+
+becomes:
+
+v3:
+
+```yaml
+k8s:
+  - context: dev
+    mode: rw
+```
+
 Rules:
 
 - `group` is required; `group: ""` is the core API group and is written explicitly.
-- `namespace` is required per rule, or the rule is cluster-scoped with `scope: cluster`. `namespace: "*"` is an explicit all-namespaces grant (distinct from omission).
-- `verbs` are enumerated. The initial v3 version supports `get`, `list`, `watch` for regular resources and `get` for `pods/log` (`kubectl logs` including `-f`).
+- `namespace` or `scope: cluster` (cluster-scoped resources): `namespace: "*"` and an omitted `namespace` are the same all-namespaces grant. An omitted `verbs` is every verb the resource supports — `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` for regular resources, `get` for `pods/log` (`kubectl logs` including `-f`).
+- `mode: ro` reads and `mode: rw` grants every verb on every resource of the stable API; `mode` and `resources` are mutually exclusive in one context.
 - Unknown verbs, unknown subresources, and anything beyond that set are rejected at load.
 
 ## k8s: the issued kubeconfig is read-only

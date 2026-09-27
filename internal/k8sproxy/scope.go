@@ -1,6 +1,10 @@
 package k8sproxy
 
-import "strings"
+import (
+	"maps"
+	"slices"
+	"strings"
+)
 
 // resourceScopes maps the resources sb decides the scope of — the
 // Kubernetes stable API at v1.36 (k8s.io/api v0.36.1 registers the
@@ -135,4 +139,36 @@ func ResourceScope(group, resource string) (clusterScoped, decided bool) {
 	}
 	clusterScoped, decided = resources[base]
 	return clusterScoped, decided
+}
+
+// ScopedResource is one resource of the stable API sb decides the scope
+// of: the resource name within its group ("" is the core API group) and
+// whether its objects live at the cluster's root (cluster-scoped) or
+// inside a namespace.
+type ScopedResource struct {
+	Group         string
+	Resource      string
+	ClusterScoped bool
+}
+
+// AllResources lists every resource of the stable API sb decides the
+// scope of, sorted by group then resource. The k8s mode shorthand
+// expands into a grant on each of them, at the scope shape the map
+// gives it.
+func AllResources() []ScopedResource {
+	total := 0
+	for _, resources := range resourceScopes {
+		total += len(resources)
+	}
+	all := make([]ScopedResource, 0, total)
+	for _, group := range slices.Sorted(maps.Keys(resourceScopes)) {
+		for _, resource := range slices.Sorted(maps.Keys(resourceScopes[group])) {
+			all = append(all, ScopedResource{
+				Group:         group,
+				Resource:      resource,
+				ClusterScoped: resourceScopes[group][resource],
+			})
+		}
+	}
+	return all
 }

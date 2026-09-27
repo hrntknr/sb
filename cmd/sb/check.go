@@ -85,6 +85,17 @@ func renderK8s(b *strings.Builder, rules []v3.K8sRule) {
 	b.WriteString("\nk8s:\n")
 	for _, r := range rules {
 		fmt.Fprintf(b, "  - context: %s\n", r.Context)
+		if r.Mode != "" {
+			// The shorthand says what it grants: the mode's verbs on
+			// every resource, the same summary the lines below give
+			// the enumerated form.
+			if r.Mode == "ro" {
+				b.WriteString("    mode: ro (every resource of the stable API: get, list, watch)\n")
+			} else {
+				b.WriteString("    mode: rw (every resource of the stable API: every verb)\n")
+			}
+			continue
+		}
 		for _, res := range r.Resources {
 			fmt.Fprintf(b, "    - %s: %s\n", renderResource(res), strings.Join(res.Verbs, ", "))
 		}

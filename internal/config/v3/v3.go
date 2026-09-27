@@ -44,15 +44,23 @@ type SSHRule struct {
 	Access string
 }
 
-// K8sRule is the policy for one kubeconfig context.
+// K8sRule is the policy for one kubeconfig context: either the
+// Resources enumerated on it, or the Mode shorthand — "ro"/"rw"
+// covering every resource of the stable API (reads, or everything).
+// Mode and Resources are mutually exclusive: a rule is one or the
+// other, never both.
 type K8sRule struct {
 	Context   string
+	Mode      string
 	Resources []ResourceRule
 }
 
 // ResourceRule grants Verbs on one resource. Group "" is the core API
 // group. Namespace is a namespace name or "*" (all namespaces); Scope
-// "cluster" marks a cluster-scoped rule instead of a namespace.
+// "cluster" marks a cluster-scoped rule instead of a namespace. An
+// omitted Namespace is all namespaces ("*"); an omitted Verbs is all
+// of them — every verb the resource supports, the same list the
+// explicit form validates against.
 type ResourceRule struct {
 	Group     string
 	Resource  string
@@ -110,6 +118,7 @@ type sshRule struct {
 
 type k8sRule struct {
 	Context   string        `yaml:"context"`
+	Mode      string        `yaml:"mode"`
 	Resources []k8sResource `yaml:"resources"`
 }
 
@@ -141,10 +150,13 @@ type mountEntry struct {
 	ReadOnly bool   `yaml:"readOnly"`
 }
 
-// The k8s verbs sb supports in the initial v3 version: get/list/watch for
-// regular resources and get for pods/log.
+// The k8s verbs sb supports in the initial v3 version: regular resources
+// take get, list, watch, create, update, patch, delete; pods/log takes
+// get only (no writes exist on a log). The mode shorthand's rw grants
+// the same seven on every resource, ro the read verbs.
 var (
-	regularResourceVerbs = []string{"get", "list", "watch"}
+	regularResourceVerbs = []string{"get", "list", "watch", "create", "update", "patch", "delete"}
+	readResourceVerbs    = []string{"get", "list", "watch"}
 	logResourceVerbs     = []string{"get"}
 )
 
@@ -305,8 +317,17 @@ func buildK8s(d k8sRule) (K8sRule, error) {
 	if strings.TrimSpace(d.Context) == "" {
 		return K8sRule{}, errors.New("context is required")
 	}
-	if len(d.Resources) == 0 {
-		return K8sRule{}, errors.New("resources is required (empty permission)")
+	if d.Mode != "" && d.Mode != "ro" && d.Mode != "rw" {
+		return K8sRule{}, fmt.Errorf("invalid mode %q (want ro or rw)", d.Mode)
+	}
+	// The mode shorthand and the resources form are mutually exclusive:
+	// the shorthand's grant is every resource at once, a resource form
+	// next to it would promise the same thing twice.
+	if d.Mode != "" && len(d.Resources) > 0 {
+		return K8sRule{}, errors.New("mode and resources are mutually exclusive")
+	}
+	if d.Mode == "" && len(d.Resources) == 0 {
+		return K8sRule{}, errors.New("resources is required (or set mode: ro or mode: rw)")
 	}
 	resources := make([]ResourceRule, 0, len(d.Resources))
 	for i, r := range d.Resources {
@@ -316,7 +337,7 @@ func buildK8s(d k8sRule) (K8sRule, error) {
 		}
 		resources = append(resources, rule)
 	}
-	return K8sRule{Context: d.Context, Resources: resources}, nil
+	return K8sRule{Context: d.Context, Mode: d.Mode, Resources: resources}, nil
 }
 
 func buildResource(d k8sResource) (ResourceRule, error) {
@@ -358,12 +379,6 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 	} else if d.Scope != nil {
 		return ResourceRule{}, fmt.Errorf("%s is namespaced: give a namespace, not scope: cluster", d.Resource)
 	}
-	if d.Namespace == nil && d.Scope == nil {
-		return ResourceRule{}, errors.New("namespace is required (or set scope: cluster for cluster-scoped resources)")
-	}
-	if d.Namespace != nil && d.Scope != nil {
-		return ResourceRule{}, errors.New("namespace and scope are mutually exclusive")
-	}
 	if d.Namespace != nil && strings.TrimSpace(*d.Namespace) == "" {
 		return ResourceRule{}, errors.New("namespace must not be empty")
 	}
@@ -372,15 +387,18 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 			return ResourceRule{}, fmt.Errorf("invalid namespace %q (%s)", *d.Namespace, strings.Join(errs, ", "))
 		}
 	}
-	if len(d.Verbs) == 0 {
-		return ResourceRule{}, errors.New("verbs is required (empty permission)")
-	}
+	// The verbs: omitted is all of them — every verb the resource
+	// supports, the same list the explicit form validates against.
 	supported := regularResourceVerbs
 	if d.Resource == "pods/log" {
 		supported = logResourceVerbs
 	}
-	seen := make(map[string]bool, len(d.Verbs))
-	for _, verb := range d.Verbs {
+	verbs := d.Verbs
+	if len(verbs) == 0 {
+		verbs = supported
+	}
+	seen := make(map[string]bool, len(verbs))
+	for _, verb := range verbs {
 		if !slices.Contains(supported, verb) {
 			return ResourceRule{}, fmt.Errorf("unsupported verb %q for %q (supported: %s)", verb, d.Resource, strings.Join(supported, ", "))
 		}
@@ -389,9 +407,11 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 		}
 		seen[verb] = true
 	}
-	rule := ResourceRule{Group: *d.Group, Resource: d.Resource, Verbs: d.Verbs}
+	rule := ResourceRule{Group: *d.Group, Resource: d.Resource, Verbs: verbs}
 	if d.Namespace != nil {
 		rule.Namespace = *d.Namespace
+	} else if !clusterScoped {
+		rule.Namespace = "*" // an omitted namespace is all of them
 	}
 	if d.Scope != nil {
 		rule.Scope = *d.Scope

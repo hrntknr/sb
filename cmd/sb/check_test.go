@@ -42,6 +42,8 @@ k8s:
         resource: namespaces
         scope: cluster
         verbs: [get]
+  - context: ops
+    mode: rw
 aws:
   - profile: dev
     roleArn: arn:aws:iam::123456789012:role/sb-dev
@@ -64,6 +66,8 @@ aws:
 		"k8s:\n  - context: dev\n",
 		"    - core pods in default: get, list, watch\n",
 		"    - core namespaces (cluster-scoped): get\n",
+		"  - context: ops\n",
+		"    mode: rw (every resource of the stable API: every verb)\n",
 		"aws:\n  - profile: dev\n    roleArn: arn:aws:iam::123456789012:role/sb-dev\n    regions: eu-west-1\n",
 		"    dynamodb: ro\n    sts: rw\n",
 		"container:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n",

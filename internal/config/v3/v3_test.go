@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hrntknr/sb/internal/awsproxy"
+	"github.com/hrntknr/sb/internal/k8sproxy"
 )
 
 // designExample is the config example from V3_DESIGN.md.
@@ -157,6 +158,15 @@ func TestLoadValid(t *testing.T) {
 			},
 		},
 		{
+			name:   "aws profile and region patterns",
+			config: "version: 3\naws:\n  - profile: \"dev-*\"\n    regions: [\"eu-*\"]\n    services:\n      - name: dynamodb\n        mode: ro\n",
+			check: func(t *testing.T, cfg Config) {
+				if cfg.AWS[0].Profile != "dev-*" || len(cfg.AWS[0].Regions) != 1 || cfg.AWS[0].Regions[0] != "eu-*" {
+					t.Errorf("AWS = %+v, want pattern profile and region", cfg.AWS)
+				}
+			},
+		},
+		{
 			name:   "container runtime auto and readOnly mount",
 			config: "version: 3\ncontainer:\n  runtime: auto\n  image: ghcr.io/hrntknr/sh:full\n  mounts:\n    - source: /srv/work\n      target: /work\n      readOnly: true\n",
 			check: func(t *testing.T, cfg Config) {
@@ -178,11 +188,36 @@ func TestLoadValid(t *testing.T) {
 			},
 		},
 		{
-			name:   "aws profile and region patterns",
-			config: "version: 3\naws:\n  - profile: \"dev-*\"\n    regions: [\"eu-*\"]\n    services:\n      - name: dynamodb\n        mode: ro\n",
+			name:   "k8s namespace and verbs omitted",
+			config: "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        # namespace omitted: all namespaces\n        # verbs omitted: all verbs\n      - group: \"\"\n        resource: pods/log\n        # namespace and verbs omitted\n",
 			check: func(t *testing.T, cfg Config) {
-				if cfg.AWS[0].Profile != "dev-*" || len(cfg.AWS[0].Regions) != 1 || cfg.AWS[0].Regions[0] != "eu-*" {
-					t.Errorf("AWS = %+v, want pattern profile and region", cfg.AWS)
+				// An omitted namespace is all namespaces ("*") and an
+				// omitted verbs list every verb the resource supports:
+				// the seven for a regular resource, get only for a log.
+				pods := cfg.K8s[0].Resources[0]
+				if pods.Namespace != "*" {
+					t.Errorf("pods = %+v, want namespace \"*\"", pods)
+				}
+				if !reflect.DeepEqual(pods.Verbs, regularResourceVerbs) {
+					t.Errorf("pods.Verbs = %v, want %v (all verbs)", pods.Verbs, regularResourceVerbs)
+				}
+				log := cfg.K8s[0].Resources[1]
+				if log.Namespace != "*" || !reflect.DeepEqual(log.Verbs, logResourceVerbs) {
+					t.Errorf("pods/log = %+v, want all namespaces and %v", log, logResourceVerbs)
+				}
+			},
+		},
+		{
+			name:   "k8s mode shorthand",
+			config: "version: 3\nk8s:\n  - context: dev\n    mode: ro\n  - context: prod\n    mode: rw\n",
+			check: func(t *testing.T, cfg Config) {
+				// The shorthand keeps the mode it was written in: the
+				// expansion happens where the proxy targets are built.
+				if cfg.K8s[0].Mode != "ro" || len(cfg.K8s[0].Resources) != 0 {
+					t.Errorf("K8s[0] = %+v, want mode ro and no resources", cfg.K8s[0])
+				}
+				if cfg.K8s[1].Mode != "rw" || len(cfg.K8s[1].Resources) != 0 {
+					t.Errorf("K8s[1] = %+v, want mode rw and no resources", cfg.K8s[1])
 				}
 			},
 		},
@@ -354,7 +389,8 @@ func TestLoadInvalid(t *testing.T) {
 		{"v2 missing version", "ssh:\n  - host: github.com\n", "version is required"},
 		{"v2 README config", "ssh:\n  - host: github.com\n    commands:\n      - cat\nk8s:\n  - context: dev\n    mode: rw\n    namespace: default\n", "v2 config is not accepted"},
 		{"v2 commands field", "version: 3\nssh:\n  - host: github.com\n    commands: [cat]\n", "field commands not found"},
-		{"v2 k8s mode field", "version: 3\nk8s:\n  - context: dev\n    mode: r\n    resources: []\n", "field mode not found"},
+		{"k8s invalid mode value", "version: 3\nk8s:\n  - context: dev\n    mode: read\n    resources: []\n", `invalid mode "read" (want ro or rw)`},
+		{"k8s mode and resources", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "mode and resources are mutually exclusive"},
 		{"v2 proxy section", "version: 3\nproxy:\n  sshAgentEnv: ~/.cache/sb-agent.env\n", "field proxy not found"},
 		{"v2 container environments list", "version: 3\ncontainer:\n  environments:\n    - FOO=bar\n", "field environments not found"},
 		{"v2 aws mode r value", "version: 3\naws:\n  - profile: dev\n    services:\n      - name: dynamodb\n        mode: r\n", `invalid mode "r" (want ro or rw)`},
@@ -376,7 +412,6 @@ func TestLoadInvalid(t *testing.T) {
 		{"k8s empty resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"\"\n        namespace: default\n        verbs: [get]\n", "resource is required"},
 		{"k8s missing group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - resource: pods\n        namespace: default\n        verbs: [get]\n", `group is required (use group: "" for the core API group)`},
 		{"k8s whitespace group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \" \"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", `invalid group " "`},
-		{"k8s missing namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        verbs: [get]\n", "namespace is required (or set scope: cluster"},
 		{"k8s empty namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: \"\"\n        verbs: [get]\n", "namespace must not be empty"},
 		{"k8s namespace and scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        scope: cluster\n        verbs: [get]\n", "give a namespace, not scope: cluster"},
 		{"k8s cluster-scoped with a namespace", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: nodes\n        namespace: default\n        verbs: [get]\n", "nodes is cluster-scoped: give scope: cluster, not a namespace"},
@@ -392,8 +427,8 @@ func TestLoadInvalid(t *testing.T) {
 		{"k8s undecided resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: example.com\n        resource: widgets\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
 		{"k8s undecided core resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: inventions\n        namespace: default\n        verbs: [get]\n", "not one sb decides the scope of"},
 		{"k8s invalid scope", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        scope: node\n        verbs: [get]\n", `invalid scope "node" (want cluster)`},
-		{"k8s missing verbs", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n", "verbs is required"},
-		{"k8s unsupported verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, create]\n", `unsupported verb "create"`},
+		{"k8s unsupported verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, deletecollection]\n", `unsupported verb "deletecollection"`},
+		{"k8s unsupported verb full list", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, list, watch, create, update, patch, delete, impersonate]\n", `unsupported verb "impersonate"`},
 		{"k8s unsupported verb for pods/log", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods/log\n        namespace: default\n        verbs: [list]\n", `unsupported verb "list" for "pods/log"`},
 		{"k8s unsupported subresource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: deployments/scale\n        namespace: default\n        verbs: [get]\n", `unsupported subresource "deployments/scale"`},
 		{"k8s duplicate verb", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get, get]\n", `duplicate verb "get"`},
@@ -641,6 +676,45 @@ var (
 	examplePairRe = regexp.MustCompile("(?s)v2:\n\n```yaml\n(.*?)\n```\n\nbecomes:\n\nv3:\n\n```yaml\n(.*?)\n```")
 )
 
+// TestK8sTargetsModeExpansion covers the shorthand's conversion: a mode
+// rule becomes a grant on every resource of the stable API, at the scope
+// shape the resource's own scope table entry gives it — "*" for a
+// namespaced one, "cluster" for a cluster-scoped one — with the mode's
+// verbs: ro reads, rw everything. The list the expansion runs on keeps
+// its order, and nothing the scope table decides is left out.
+func TestK8sTargetsModeExpansion(t *testing.T) {
+	ro := Config{K8s: []K8sRule{{Context: "dev", Mode: "ro"}}}
+	rw := Config{K8s: []K8sRule{{Context: "dev", Mode: "rw"}}}
+	roResources := ro.K8sTargets()[0].Resources
+	rwResources := rw.K8sTargets()[0].Resources
+	all := k8sproxy.AllResources()
+	if len(roResources) != len(all) {
+		t.Fatalf("mode: ro expands to %d resources, want %d (every resource of the stable API)", len(roResources), len(all))
+	}
+	if len(rwResources) != len(all) {
+		t.Fatalf("mode: rw expands to %d resources, want %d", len(rwResources), len(all))
+	}
+	for i, r := range all {
+		roRule, rwRule := roResources[i], rwResources[i]
+		if roRule.Group != r.Group || roRule.Resource != r.Resource {
+			t.Fatalf("resource %d = %s/%s, want %s/%s (the expansion keeps the list's order)", i, roRule.Group, roRule.Resource, r.Group, r.Resource)
+		}
+		if r.ClusterScoped {
+			if roRule.Scope != "cluster" || roRule.Namespace != "" {
+				t.Errorf("%s/%s = %+v, want scope cluster", r.Group, r.Resource, roRule)
+			}
+		} else if roRule.Namespace != "*" || roRule.Scope != "" {
+			t.Errorf("%s/%s = %+v, want namespace \"*\"", r.Group, r.Resource, roRule)
+		}
+		if !reflect.DeepEqual(roRule.Verbs, readResourceVerbs) {
+			t.Errorf("%s/%s ro verbs = %v, want %v", r.Group, r.Resource, roRule.Verbs, readResourceVerbs)
+		}
+		if !reflect.DeepEqual(rwRule.Verbs, regularResourceVerbs) {
+			t.Errorf("%s/%s rw verbs = %v, want %v", r.Group, r.Resource, rwRule.Verbs, regularResourceVerbs)
+		}
+	}
+}
+
 // The conversion examples in docs/migration.md: the v3 sides must load
 // through the config loader exactly as the doc shows them, and the v2
 // sides must be rejected — the same rejection the doc tells the reader
@@ -667,8 +741,8 @@ func TestMigrationDocExamples(t *testing.T) {
 	// section; the version header the complete example carries is
 	// added for it), and the v2 side is rejected.
 	pairs := examplePairRe.FindAllStringSubmatch(content, -1)
-	if len(pairs) != 5 {
-		t.Fatalf("found %d conversion examples in docs/migration.md; want 5 — update this count when the doc changes", len(pairs))
+	if len(pairs) != 6 {
+		t.Fatalf("found %d conversion examples in docs/migration.md; want 6 — update this count when the doc changes", len(pairs))
 	}
 	for i, pair := range pairs {
 		if _, err := loadDocYAML(t, pair[1], "version: 3\n"); err == nil {

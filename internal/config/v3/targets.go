@@ -22,20 +22,47 @@ func (c Config) SSHTargets() sshproxy.Targets {
 	return targets
 }
 
-// K8sTargets converts the k8s rules to proxy targets: the context with the
-// resources granted on it, each as one proxy resource.
+// K8sTargets converts the k8s rules to proxy targets: the context with
+// the resources granted on it, each as one proxy resource. A rule in
+// the mode shorthand converts to a grant on every resource of the
+// stable API — at the scope shape the resource's own scope table entry
+// gives it, "*" for a namespaced one, "cluster" for a cluster-scoped
+// one — with the mode's verbs: ro reads, rw everything.
 func (c Config) K8sTargets() k8sproxy.Targets {
 	targets := make(k8sproxy.Targets, 0, len(c.K8s))
 	for _, rule := range c.K8s {
-		resources := make([]k8sproxy.Resource, 0, len(rule.Resources))
-		for _, resource := range rule.Resources {
-			resources = append(resources, k8sproxy.Resource{
-				Group:     resource.Group,
-				Resource:  resource.Resource,
-				Namespace: resource.Namespace,
-				Scope:     resource.Scope,
-				Verbs:     resource.Verbs,
-			})
+		var resources []k8sproxy.Resource
+		if rule.Mode == "ro" || rule.Mode == "rw" {
+			// The mode shorthand: every resource of the stable API, at
+			// the scope shape the map gives it, with the mode's verbs.
+			verbs := regularResourceVerbs
+			if rule.Mode == "ro" {
+				verbs = readResourceVerbs
+			}
+			for _, r := range k8sproxy.AllResources() {
+				res := k8sproxy.Resource{
+					Group:    r.Group,
+					Resource: r.Resource,
+					Verbs:    verbs,
+				}
+				if r.ClusterScoped {
+					res.Scope = "cluster"
+				} else {
+					res.Namespace = "*"
+				}
+				resources = append(resources, res)
+			}
+		} else {
+			resources = make([]k8sproxy.Resource, 0, len(rule.Resources))
+			for _, resource := range rule.Resources {
+				resources = append(resources, k8sproxy.Resource{
+					Group:     resource.Group,
+					Resource:  resource.Resource,
+					Namespace: resource.Namespace,
+					Scope:     resource.Scope,
+					Verbs:     resource.Verbs,
+				})
+			}
 		}
 		targets = append(targets, k8sproxy.Target{
 			Context:   rule.Context,

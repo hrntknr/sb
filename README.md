@@ -107,6 +107,8 @@ k8s:
         resource: pods/log
         namespace: default
         verbs: [get]          # kubectl logs, including -f
+  - context: ops              # or the mode shorthand instead of resources
+    mode: rw                  # every resource of the stable API, every verb
 aws:
   - profile: dev
     roleArn: arn:aws:iam::123456789012:role/sb-dev    # optional
@@ -143,7 +145,9 @@ k8s policy is keyed by **kubeconfig context name**. The context is both the sele
 
 What a context resolves to — the server URL, TLS verification, and auth settings — is fixed for the session: requests reuse it without reloading the kubeconfig, and a downstream token works only on its own context's URL. The issued kubeconfig is read-only by design: `kubectl config use-context` cannot write to it. Pass `--context` or `-n` per command, or copy the kubeconfig somewhere writable and edit the copy — the `context` key stays the switch.
 
-`resources` enumerate every grant: `group` (required; `""` is the core API group), `resource`, `namespace` (required; `*` is an explicit all-namespaces grant, distinct from a single name) or `scope: cluster` for cluster-scoped resources, and `verbs`. The initial version supports `get`, `list`, `watch` for regular resources and `get` for `pods/log` (`kubectl logs`, including `-f` as a `follow=true` GET). A `pods` grant does not inherit to `pods/log`. The shape must match the scope the Kubernetes API gives the resource — a cluster-scoped one (`namespaces`, `nodes`, rbac's `clusterroles`) takes `scope: cluster`, a namespaced one a `namespace` — and sb decides that only for the stable API's resources; anything else is rejected when the config loads.
+`resources` enumerate every grant: `group` (required; `""` is the core API group), `resource`, `namespace` (all namespaces with `*`; omitted is the same as `*`) or `scope: cluster` for cluster-scoped resources, and `verbs` (omitted is every verb the resource supports). The supported verbs are `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` for regular resources and `get` for `pods/log` (`kubectl logs`, including `-f` as a `follow=true` GET). A `pods` grant does not inherit to `pods/log`. The shape must match the scope the Kubernetes API gives the resource — a cluster-scoped one (`namespaces`, `nodes`, rbac's `clusterroles`) takes `scope: cluster`, a namespaced one a `namespace` — and sb decides that only for the stable API's resources; anything else is rejected when the config loads.
+
+A context takes `mode` instead of `resources`: `mode: ro` grants read — `get`, `list`, `watch` — on every resource of the stable API, `mode: rw` every verb on each of them; both cover every namespace and the cluster's root alike. `mode` and `resources` are mutually exclusive in one context. No mode covers a subresource — `pods/log` needs its own `resources` rule.
 
 Requests are classified as the Kubernetes API server classifies them: the group, resource, subresource, verb, and namespace are matched against the rules, and what no rule covers — unknown paths, other subresources, impersonation headers, upgrade — is rejected before the upstream. Non-resource requests are limited to the fixed discovery paths (`/api`, `/apis`, core `/api/v1`, group discovery, openapi, and the version endpoint) as GET.
 
