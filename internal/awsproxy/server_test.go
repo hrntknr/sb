@@ -33,13 +33,19 @@ func awsTestProxy(t *testing.T) (*Proxy, string) {
 	if err := os.WriteFile(filepath.Join(home, "source-config"), []byte("[profile dev]\nregion = eu-west-1\n[profile prod]\nregion = us-east-1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The startup resolves each issued profile's upstream: the source
+	// credentials the role's STS call signs with.
+	if err := os.WriteFile(filepath.Join(home, "source-credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n[prod]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testSTS(t)
 	targets := []Target{
 		{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}},
 		{Profile: "prod", RoleARN: "arn:aws:iam::123456789012:role/prod", Services: []Service{{Name: "dynamodb", Mode: "rw"}}},
 	}
 	p := New(targets, "localhost")
 	dir := t.TempDir()
-	if err := p.syncOnce(12345, dir); err != nil {
+	if err := p.syncOnce(context.Background(), 12345, dir); err != nil {
 		t.Fatal(err)
 	}
 	return p, dir
@@ -85,7 +91,7 @@ func TestGeneratedProfiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := p.keys["dev"]
-	if err := p.syncOnce(12345, dir); err != nil || p.keys["dev"] != key {
+	if err := p.syncOnce(context.Background(), 12345, dir); err != nil || p.keys["dev"] != key {
 		t.Fatalf("key changed across sync: %v", err)
 	}
 }
@@ -284,10 +290,10 @@ func TestAssumeRoleFromDefaultEnvironment(t *testing.T) {
 	t.Setenv("AWS_REGION", "us-east-1")
 	testSTS(t)
 	p := New([]Target{{Profile: "default", RoleARN: "arn:aws:iam::123456789012:role/default", Services: []Service{{Name: "sts", Mode: "ro"}}}}, "localhost")
-	if err := p.syncOnce(12345, t.TempDir()); err != nil {
+	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	creds, err := p.upstreamCredentials(context.Background(), "default", p.targets)
+	creds, err := p.upstreamCredentials(context.Background(), "default")
 	if err != nil || creds.AccessKeyID != "ASSUMED" {
 		t.Fatalf("default environment AssumeRole = %q, %v", creds.AccessKeyID, err)
 	}
@@ -321,10 +327,10 @@ func TestAssumeRoleFromDefaultContainerCredentials(t *testing.T) {
 	defer stsServer.Close()
 	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
 	p := New([]Target{{Profile: "default", RoleARN: "arn:aws:iam::123456789012:role/default", Services: []Service{{Name: "sts", Mode: "ro"}}}}, "localhost")
-	if err := p.syncOnce(12345, t.TempDir()); err != nil {
+	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	creds, err := p.upstreamCredentials(context.Background(), "default", p.targets)
+	creds, err := p.upstreamCredentials(context.Background(), "default")
 	if err != nil || creds.AccessKeyID != "ASSUMED" {
 		t.Fatalf("default container credentials AssumeRole = %q, %v", creds.AccessKeyID, err)
 	}
@@ -347,10 +353,10 @@ func TestAssumeRoleWithoutSourceRegion(t *testing.T) {
 		t.Fatalf("upstream STS region = %q, %v; want us-east-1", source.Region, err)
 	}
 	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "sts", Mode: "ro"}}}}, "localhost")
-	if err := p.syncOnce(12345, t.TempDir()); err != nil {
+	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	creds, err := p.upstreamCredentials(context.Background(), "dev", p.targets)
+	creds, err := p.upstreamCredentials(context.Background(), "dev")
 	if err != nil || creds.AccessKeyID != "ASSUMED" {
 		t.Fatalf("regionless profile AssumeRole = %q, %v", creds.AccessKeyID, err)
 	}
@@ -359,9 +365,28 @@ func TestAssumeRoleWithoutSourceRegion(t *testing.T) {
 // TestSyncConfigIssuesOncePerSession covers the fixed session: the source
 // changes while it runs, and nothing follows it — no key changes, nothing
 // reissues — until the next session, whose fresh issuance reads the
-// changed source.
+// changed source. Both sessions run the same wildcard policy, so the
+// added profile's absence from the first session is the session, not a
+// narrower policy.
 func TestSyncConfigIssuesOncePerSession(t *testing.T) {
-	p, dir := awsTestProxy(t)
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n[profile prod]\nregion = us-east-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n[prod]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The wildcard resolves every existing profile, the default chain
+	// included: the environment provides its credentials, and the STS
+	// calls sign against the local STS.
+	t.Setenv("AWS_ACCESS_KEY_ID", "SOURCE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "source-secret")
+	testSTS(t)
+	targets := []Target{{Profile: "*", RoleARN: "arn:aws:iam::123456789012:role/test", Services: []Service{{Name: "sts", Mode: "ro"}}}}
+	p := New(targets, "localhost")
+	dir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ready := make(chan error, 1)
@@ -374,11 +399,13 @@ func TestSyncConfigIssuesOncePerSession(t *testing.T) {
 	previous := p.keys["dev"]
 	p.mu.RUnlock()
 
-	// The source changes while the session runs: the fixed session does
-	// not follow it, so the issued keys stay and the added profile gets
-	// no key.
-	path := os.Getenv("AWS_CONFIG_FILE")
-	if err := os.WriteFile(path, []byte("[profile dev]\n[profile prod]\n[profile new]\n"), 0o600); err != nil {
+	// The source changes while the session runs: a new profile appears
+	// in it — the fixed session does not follow, so the issued keys stay
+	// and the added profile gets no key.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\n[profile prod]\n[profile new]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n[prod]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n[new]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	followed := func() bool {
@@ -396,8 +423,8 @@ func TestSyncConfigIssuesOncePerSession(t *testing.T) {
 
 	// The next session: a fresh proxy and its initial issuance read the
 	// changed source, so the added profile gets its key there.
-	p2 := New([]Target{{Profile: "*", RoleARN: "arn:aws:iam::123456789012:role/test", Services: []Service{{Name: "sts", Mode: "ro"}}}}, "localhost")
-	if err := p2.syncOnce(12345, dir); err != nil {
+	p2 := New(targets, "localhost")
+	if err := p2.syncOnce(context.Background(), 12345, dir); err != nil {
 		t.Fatal(err)
 	}
 	p2.mu.RLock()
@@ -419,6 +446,10 @@ func TestConcurrentConfigSyncKeepsFileAndIssuedKeyConsistent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testSTS(t) // the concurrent issuances resolve the role upstream
 	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "sts", Mode: "ro"}}}}, "localhost")
 	dir := t.TempDir()
 	for round := 0; round < 8; round++ {
@@ -432,7 +463,7 @@ func TestConcurrentConfigSyncKeepsFileAndIssuedKeyConsistent(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				<-start
-				if err := p.syncOnce(12345, dir); err != nil {
+				if err := p.syncOnce(context.Background(), 12345, dir); err != nil {
 					t.Errorf("syncOnce: %v", err)
 				}
 			}()
@@ -487,62 +518,121 @@ func TestSyncConfigErrorsOnMissingProfile(t *testing.T) {
 	}
 }
 
-func TestConcurrentSyncDoesNotRecacheOldSourceCredentials(t *testing.T) {
-	p, dir := awsTestProxy(t)
-	requests := make(chan string, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- r.Header.Get("Authorization")
+// TestSyncConfigErrorsOnCredentialFetchFailure covers the source
+// credentials fetch failing at the startup: the source cannot provide
+// the profile's credentials, so the chain falls to the metadata
+// service — pointed at a refused endpoint here — and the fetch's own
+// failure is the start's result, not the first request's.
+func TestSyncConfigErrorsOnCredentialFetchFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The metadata service endpoint: a refused connection. The chain
+	// falls to it for the profile's credentials, so the fetch fails here.
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:1")
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}}}, "localhost")
+	err := p.SyncConfig(context.Background(), 12345, t.TempDir(), nil)
+	if err == nil {
+		t.Fatal("SyncConfig with an unresolvable source; want a failure")
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("SyncConfig() = %v; want the credentials fetch's own failure", err)
+	}
+}
+
+// TestSyncConfigErrorsOnDeniedAssumeRole covers the role's AssumeRole
+// failing at the startup: the STS denies the assumption, so the fetch's
+// own failure is the start's result, not the first request's.
+func TestSyncConfigErrorsOnDeniedAssumeRole(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The STS denies every AssumeRole it receives.
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/xml")
-		_, _ = io.WriteString(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>denied</Message></Error></ErrorResponse>`)
 	}))
-	defer server.Close()
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var loads atomic.Int32
-	p.loadSource = func(context.Context, string) (aws.Config, error) {
-		key := "NEW"
-		if loads.Add(1) == 1 {
-			key = "OLD"
-			close(entered)
-			<-release
+	defer stsServer.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}}}, "localhost")
+	err := p.SyncConfig(context.Background(), 12345, t.TempDir(), nil)
+	if err == nil {
+		t.Fatal("SyncConfig with a denied AssumeRole; want a failure")
+	}
+	if !strings.Contains(err.Error(), "AccessDenied") {
+		t.Fatalf("SyncConfig() = %v; want the denied AssumeRole", err)
+	}
+}
+
+// TestSessionResolutionDoesNotFollowTheSourceAfterReady covers the fixed
+// session's resolution: the source credentials change after the ready,
+// before any request — and what the request signs with stays the
+// startup's own: the changed source never moves it.
+func TestSessionResolutionDoesNotFollowTheSourceAfterReady(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	if err := p.syncOnce(context.Background(), 12345, dir); err != nil {
+		t.Fatal(err)
+	}
+	// The source changes after the ready, before any request: the
+	// downstream request still signs with the startup's own.
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = NEWACCESS\naws_secret_access_key = other-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	forwarded := make(chan string, 1)
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		forwarded <- r.Header.Get("Authorization")
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString("ok"))}, nil
+	})
+	r := signedRequest(t, p.keys["dev"], "eu-west-1", "GetItem", `{"TableName":"test","Key":{"id":{"S":"1"}}}`)
+	w := httptest.NewRecorder()
+	p.serveHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	select {
+	case authorization := <-forwarded:
+		// The final upstream signature carries the startup's own
+		// credentials: the changed source never moved it.
+		if !strings.Contains(authorization, "Credential=SOURCE/") || strings.Contains(authorization, "Credential=NEWACCESS/") {
+			t.Fatalf("upstream signature = %q; want the startup's own source credentials", authorization)
 		}
-		return aws.Config{Region: "us-east-1", BaseEndpoint: aws.String(server.URL), Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
-			return aws.Credentials{AccessKeyID: key, SecretAccessKey: "secret"}, nil
-		})}, nil
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := p.upstreamCredentials(context.Background(), "dev", p.targets)
-		done <- err
-	}()
-	<-entered
-	if err := p.syncOnce(12345, dir); err != nil {
-		t.Fatal(err)
-	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if _, err := p.upstreamCredentials(context.Background(), "dev", p.targets); err != nil {
-		t.Fatal(err)
-	}
-	if got := loads.Load(); got != 2 {
-		t.Fatalf("source loads = %d, want 2 after the concurrent sync", got)
-	}
-	if first, second := <-requests, <-requests; !strings.Contains(first, "Credential=OLD/") || !strings.Contains(second, "Credential=NEW/") {
-		t.Errorf("STS used stale source after the concurrent sync: %s, %s", first, second)
+	default:
+		t.Fatal("the request was not forwarded")
 	}
 }
 
 func TestUpstreamCredentialsWithoutRole(t *testing.T) {
-	p, _ := awsTestProxy(t)
+	p, dir := awsTestProxy(t)
 	// With no roleArn the proxy must use the source profile's own
 	// credentials directly, without calling sts:AssumeRole.
 	p.SetTargets([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}}})
-	if err := os.WriteFile(os.Getenv("AWS_SHARED_CREDENTIALS_FILE"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+	if err := p.syncOnce(context.Background(), 12345, dir); err != nil {
 		t.Fatal(err)
 	}
-	creds, err := p.upstreamCredentials(context.Background(), "dev", p.targets)
+	creds, err := p.upstreamCredentials(context.Background(), "dev")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,22 +642,29 @@ func TestUpstreamCredentialsWithoutRole(t *testing.T) {
 }
 
 func TestAssumeRoleWithoutSessionPolicy(t *testing.T) {
-	p, _ := awsTestProxy(t)
+	p, dir := awsTestProxy(t)
 	var requested url.Values
 	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			t.Error(err)
 		}
-		requested = r.Form
+		// Only the dev profile's form is recorded: the prod resolution
+		// uses the same server, and the assertions below are the dev
+		// session's own.
+		if r.Form.Get("RoleArn") == "arn:aws:iam::123456789012:role/dev" {
+			requested = r.Form
+		}
 		w.Header().Set("Content-Type", "text/xml")
 		_, _ = io.WriteString(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
 	}))
 	defer stsServer.Close()
 	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
-	if err := os.WriteFile(os.Getenv("AWS_SHARED_CREDENTIALS_FILE"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+	// The startup resolution against this STS: what it sends is the
+	// session's own.
+	if err := p.syncOnce(context.Background(), 12345, dir); err != nil {
 		t.Fatal(err)
 	}
-	creds, err := p.upstreamCredentials(context.Background(), "dev", p.targets)
+	creds, err := p.upstreamCredentials(context.Background(), "dev")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,8 +677,83 @@ func TestAssumeRoleWithoutSessionPolicy(t *testing.T) {
 		t.Errorf("AssumeRole must not send a session policy, got %q", got)
 	}
 	// The provider caches the temporary role credentials for subsequent calls.
-	if _, err := p.upstreamCredentials(context.Background(), "dev", p.targets); err != nil {
+	if _, err := p.upstreamCredentials(context.Background(), "dev"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestPerProfileRoleAndUpstreamCredentials covers the per-profile
+// resolution: two profiles with different roles — each one's requests
+// carry their own role's upstream, the access key the final upstream
+// signature signs with — so a regression that swaps the profiles'
+// sessions or credentials cannot pass unnoticed.
+func TestPerProfileRoleAndUpstreamCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n[profile prod]\nregion = us-east-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n[prod]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The STS response carries the role's own access key: the key the
+	// final upstream signature uses identifies the role that assumed it.
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+			return
+		}
+		var key string
+		switch r.Form.Get("RoleArn") {
+		case "arn:aws:iam::123456789012:role/a":
+			key = "AASSUMED"
+		case "arn:aws:iam::123456789012:role/b":
+			key = "BASSUMED"
+		default:
+			t.Errorf("unexpected RoleArn %q", r.Form.Get("RoleArn"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = io.WriteString(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>`+key+`</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
+	}))
+	defer stsServer.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	p := New([]Target{
+		{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/a", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}},
+		{Profile: "prod", RoleARN: "arn:aws:iam::123456789012:role/b", Services: []Service{{Name: "dynamodb", Mode: "rw"}}, Regions: []string{"us-*"}},
+	}, "localhost")
+	dir := t.TempDir()
+	if err := p.syncOnce(context.Background(), 12345, dir); err != nil {
+		t.Fatal(err)
+	}
+	forwarded := make(chan string, 2)
+	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		forwarded <- r.Header.Get("Authorization")
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString("ok"))}, nil
+	})
+	// A valid signed request per profile: each one's upstream carries its
+	// own role's assumed key, never the other's.
+	for _, tt := range []struct {
+		profile, region, wantCredential string
+	}{
+		{"dev", "eu-west-1", "Credential=AASSUMED/"},
+		{"prod", "us-east-1", "Credential=BASSUMED/"},
+	} {
+		r := signedRequest(t, p.keys[tt.profile], tt.region, "GetItem", `{"TableName":"test","Key":{"id":{"S":"1"}}}`)
+		w := httptest.NewRecorder()
+		p.serveHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatalf("%s: status = %d: %s", tt.profile, w.Code, w.Body.String())
+		}
+		select {
+		case authorization := <-forwarded:
+			if !strings.Contains(authorization, tt.wantCredential) {
+				t.Fatalf("%s: upstream signature = %q; want it to carry %q", tt.profile, authorization, tt.wantCredential)
+			}
+		default:
+			t.Fatal(tt.profile + ": the request was not forwarded")
+		}
 	}
 }
 
@@ -697,7 +869,7 @@ func TestGeneratedCAAuthenticatesProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if err := p.syncOnce(listener.Addr().(*net.TCPAddr).Port, dir); err != nil {
+	if err := p.syncOnce(context.Background(), listener.Addr().(*net.TCPAddr).Port, dir); err != nil {
 		t.Fatal(err)
 	}
 	go func() { _ = p.Serve(listener) }()
@@ -884,14 +1056,17 @@ func TestRequestsStoppedMidCredentialsNeverReachUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	// No session: the credentials load runs per request. It waits for its
-	// context — cut by the stop, never completed by a source.
-	p.loadSource = func(ctx context.Context, profile string) (aws.Config, error) {
+	// The session exists: its credentials hang on the context the
+	// request would load them under — cut by the stop, never completed
+	// by a source.
+	p.mu.Lock()
+	p.sessions["dev"] = session{role: "arn:aws:iam::123456789012:role/dev", credentials: aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
 		select {
 		case <-ctx.Done():
-			return aws.Config{}, ctx.Err()
+			return aws.Credentials{}, ctx.Err()
 		}
-	}
+	})}
+	p.mu.Unlock()
 	hits := int32(0)
 	p.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		atomic.AddInt32(&hits, 1)

@@ -42,7 +42,6 @@ type Proxy struct {
 	targets    []Target
 	keys       map[string]issuedKey
 	sessions   map[string]session
-	generation uint64
 	loadSource func(context.Context, string) (aws.Config, error)
 	certOnce   sync.Once
 	cert       tls.Certificate
@@ -75,8 +74,6 @@ func (p *Proxy) SetTargets(targets []Target) {
 	defer p.syncMu.Unlock()
 	p.mu.Lock()
 	p.targets = targets
-	p.sessions = map[string]session{}
-	p.generation++
 	p.mu.Unlock()
 }
 
@@ -202,7 +199,7 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// The stop context: the credentials load and the upstream request it
 	// leads to are cancelled when the stop starts (BeginStop).
-	credentials, err := p.upstreamCredentials(p.stopContext(r.Context()), profile, targets)
+	credentials, err := p.upstreamCredentials(p.stopContext(r.Context()), profile)
 	if err != nil {
 		slog.Error("aws upstream credentials failed", "profile", profile, "error", err)
 		http.Error(w, "upstream credentials unavailable", http.StatusBadGateway)
@@ -314,32 +311,47 @@ func verify(r *http.Request, key issuedKey, match []string, payloadHash string) 
 	return subtle.ConstantTimeCompare([]byte(cloned.Header.Get("Authorization")), []byte(r.Header.Get("Authorization"))) == 1
 }
 
-func (p *Proxy) upstreamCredentials(ctx context.Context, profile string, targets []Target) (aws.Credentials, error) {
-	role, err := assumedRole(targets, profile)
-	if err != nil {
-		return aws.Credentials{}, fmt.Errorf("aws profile %s: %w", profile, err)
-	}
+// upstreamCredentials returns the session's credentials: the provider the
+// startup resolved, its refresh left to the SDK's cache. The session is
+// fixed for the run — the startup resolves every issued profile — so a
+// profile without a session is an invariant violation, not a load to
+// perform here.
+func (p *Proxy) upstreamCredentials(ctx context.Context, profile string) (aws.Credentials, error) {
 	p.mu.RLock()
 	current, ok := p.sessions[profile]
-	generation := p.generation
 	p.mu.RUnlock()
-	if !ok || current.role != role {
-		source, err := p.loadSource(ctx, profile)
-		if err != nil {
-			return aws.Credentials{}, err
-		}
-		var provider aws.CredentialsProvider = source.Credentials
-		if role != "" {
-			provider = stscreds.NewAssumeRoleProvider(sts.NewFromConfig(source), role, func(options *stscreds.AssumeRoleOptions) {
-				options.RoleSessionName = "sb"
-			})
-		}
-		current = session{role: role, credentials: aws.NewCredentialsCache(provider)}
-		p.mu.Lock()
-		if p.generation == generation {
-			p.sessions[profile] = current
-		}
-		p.mu.Unlock()
+	if !ok {
+		return aws.Credentials{}, fmt.Errorf("aws profile %s: session not resolved", profile)
 	}
 	return current.credentials.Retrieve(ctx)
+}
+
+// resolveSession builds the session's upstream for profile: the role the
+// matching targets select, the source config it is assumed in, and the
+// credentials the role provides — all resolved before anything is
+// issued, so a source that cannot provide them, or an AssumeRole it
+// denies, fails the startup instead of the first request. The returned
+// session reuses the provider: the SDK's cache refreshes the short-lived
+// credentials within it.
+func (p *Proxy) resolveSession(ctx context.Context, profile string, targets []Target) (session, error) {
+	ctx = p.stopContext(ctx)
+	role, err := assumedRole(targets, profile)
+	if err != nil {
+		return session{}, fmt.Errorf("aws profile %s: %w", profile, err)
+	}
+	source, err := p.loadSource(ctx, profile)
+	if err != nil {
+		return session{}, fmt.Errorf("aws profile %s: %w", profile, err)
+	}
+	var provider aws.CredentialsProvider = source.Credentials
+	if role != "" {
+		provider = stscreds.NewAssumeRoleProvider(sts.NewFromConfig(source), role, func(options *stscreds.AssumeRoleOptions) {
+			options.RoleSessionName = "sb"
+		})
+	}
+	credentials := aws.NewCredentialsCache(provider)
+	if _, err := credentials.Retrieve(ctx); err != nil {
+		return session{}, fmt.Errorf("aws profile %s: %w", profile, err)
+	}
+	return session{role: role, credentials: credentials}, nil
 }

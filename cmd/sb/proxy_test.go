@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -283,26 +284,33 @@ func waitForPathExists(t *testing.T, path string) {
 func TestStartProxyAWSCancelledDuringReadyWait(t *testing.T) {
 	_, kubeconfigPath := startProxyTestEnv(t)
 	writeK8sSource(t, kubeconfigPath) // the k8s side starts cleanly
-	// One aws rule: the aws side's sync reads the source profiles.
+	// One aws rule: the aws side's startup resolves the role's upstream —
+	// an STS call — before the ready; connections hang in it, so the
+	// ready never comes and the start waits for it.
 	cfg := v3.Config{AWS: []v3.AWSRule{{
 		Profile:  "dev",
 		RoleARN:  "arn:aws:iam::123456789012:role/dev",
 		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
 	}}}
-	sourcePath := os.Getenv("AWS_CONFIG_FILE")
-	if err := os.Remove(sourcePath); err != nil {
+	// The source provides the profile's credentials: the STS call signs
+	// with them.
+	if err := os.WriteFile(os.Getenv("AWS_SHARED_CREDENTIALS_FILE"), []byte("[dev]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Mkfifo(sourcePath, 0o600); err != nil {
+	// Connections hang in this endpoint: the STS call the resolution
+	// makes never completes.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Remove(sourcePath) })
+	defer blocker.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", "http://"+blocker.Addr().String())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
 	go func() {
-		time.Sleep(200 * time.Millisecond) // the initial sync is in the source read
+		time.Sleep(200 * time.Millisecond) // the startup resolution is in the STS call
 		cancel()
 	}()
 	server, err := startProxyBounded(t, ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
@@ -310,14 +318,13 @@ func TestStartProxyAWSCancelledDuringReadyWait(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("startProxy() = %v; want context.Canceled", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(issueDir, ".ssh")); os.IsNotExist(statErr) {
-		t.Fatal(".ssh was removed while the issuing task is still writing")
+	// The issuance's STS call was cut by the cancellation, so its task
+	// exits and nothing it issued stays behind the failed start.
+	for _, name := range []string{".ssh", ".kube", ".aws"} {
+		if _, statErr := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("%s still exists after the failed start: %v", name, statErr)
+		}
 	}
-	// The read completes: the task's last write lands, then it exits on
-	// the next select. Waiting for the write keeps this test's cleanup
-	// from removing the issue dir while the write is still landing.
-	releaseFifo(t, sourcePath, "[profile dev]\n", "region = eu-west-1\n")
-	waitForPathExists(t, filepath.Join(issueDir, ".aws", "config"))
 }
 
 // TestStartProxyReportsTheUnfinishedReclamation covers the failed start's

@@ -87,7 +87,7 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 		}
 		return err
 	}
-	if err := p.syncOnce(port, dir); err != nil {
+	if err := p.syncOnce(ctx, port, dir); err != nil {
 		return result(err)
 	}
 	if ready != nil {
@@ -101,7 +101,7 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 	return nil
 }
 
-func (p *Proxy) syncOnce(port int, dir string) error {
+func (p *Proxy) syncOnce(ctx context.Context, port int, dir string) error {
 	p.syncMu.Lock()
 	defer p.syncMu.Unlock()
 	p.mu.RLock()
@@ -158,6 +158,18 @@ func (p *Proxy) syncOnce(port int, dir string) error {
 	if err != nil {
 		return err
 	}
+	// The sessions for every issued profile: the startup resolves the
+	// upstream — the role the matching targets select, the source load,
+	// and the credentials — before anything is written or signaled, so a
+	// source that cannot provide them fails the start here.
+	sessions := map[string]session{}
+	for name := range keys {
+		resolved, err := p.resolveSession(ctx, name, targets)
+		if err != nil {
+			return err
+		}
+		sessions[name] = resolved
+	}
 	awsDir := filepath.Join(dir, ".aws")
 	if err := util.WriteFileAtomic(filepath.Join(awsDir, "ca.pem"), 0o600, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})); err != nil {
 		return err
@@ -170,8 +182,7 @@ func (p *Proxy) syncOnce(port int, dir string) error {
 	}
 	p.mu.Lock()
 	p.keys = keys
-	p.sessions = map[string]session{}
-	p.generation++
+	p.sessions = sessions
 	p.mu.Unlock()
 	return nil
 }
