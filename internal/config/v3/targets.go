@@ -58,7 +58,7 @@ func (c Config) K8sTargets() k8sproxy.Targets {
 				verbs = regularResourceVerbs
 			default:
 				verbs = rule.Verbs
-				if len(verbs) == 0 {
+				if verbs == nil {
 					verbs = regularResourceVerbs // omitted is all of them
 				}
 			}

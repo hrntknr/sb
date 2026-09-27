@@ -205,7 +205,7 @@ Rules:
 
 - `group` is required; `group: ""` is the core API group and is written explicitly.
 - `namespace` or `scope: cluster` (cluster-scoped resources): `namespace: "*"` and an omitted `namespace` are the same all-namespaces grant. An omitted `verbs` is every verb the resource supports — `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` for regular resources, `get` for `pods/log` (`kubectl logs` including `-f`).
-- `mode: ro` reads and `mode: rw` grants every verb on every resource of the stable API; `verbs` at the context level — with `resources` omitted, or omitted entirely: the `mode: rw` grant — grants those verbs on each of them. `mode`, `verbs`, and `resources` never mix in one context; a null or absent key is the same omission, and an empty `resources: []` list is rejected.
+- `mode: ro` reads and `mode: rw` grants every verb on every resource of the stable API; `verbs` at the context level — with `resources` omitted, or omitted entirely: the `mode: rw` grant — grants those verbs on each of them. `mode`, `verbs`, and `resources` never mix in one context; a null or absent key is the same omission, and an explicit empty list — `resources: []` or `verbs: []` — is a load error, not the omission.
 - Unknown verbs, unknown subresources, and anything beyond that set are rejected at load.
 
 ## k8s: the issued kubeconfig is read-only

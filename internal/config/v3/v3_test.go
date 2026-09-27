@@ -451,6 +451,8 @@ func TestLoadInvalid(t *testing.T) {
 		{"k8s empty resources list with verbs", "version: 3\nk8s:\n  - context: dev\n    verbs: [get]\n    resources: []\n", "verbs and resources are mutually exclusive"},
 		{"k8s context verbs unsupported", "version: 3\nk8s:\n  - context: dev\n    verbs: [get, list, watch, deletecollection]\n", `unsupported verb "deletecollection" for every resource`},
 		{"k8s context verbs duplicate", "version: 3\nk8s:\n  - context: dev\n    verbs: [get, get]\n", `duplicate verb "get"`},
+		{"k8s empty context verbs", "version: 3\nk8s:\n  - context: dev\n    verbs: []\n", "verbs is empty"},
+		{"k8s empty resource verbs", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: []\n", "verbs is empty"},
 		{"k8s empty resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"\"\n        namespace: default\n        verbs: [get]\n", "resource is required"},
 		{"k8s missing group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - resource: pods\n        namespace: default\n        verbs: [get]\n", `group is required (use group: "" for the core API group)`},
 		{"k8s whitespace group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \" \"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", `invalid group " "`},

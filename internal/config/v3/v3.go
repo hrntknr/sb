@@ -366,8 +366,13 @@ func buildK8s(d k8sRule) (K8sRule, error) {
 // validateContextVerbs checks the verbs of the all-resources form: what
 // they grant is every resource of the stable API — each of them a
 // regular one, no subresource among them — so the verbs are the seven,
-// none other, without duplicates.
+// none other, without duplicates. An explicit empty list is not the
+// omission: writing one grants nothing at all, so it is a config error,
+// not every verb.
 func validateContextVerbs(verbs []string) error {
+	if len(verbs) == 0 {
+		return errors.New("verbs is empty: list the verbs, or omit verbs to grant all of them")
+	}
 	seen := make(map[string]bool, len(verbs))
 	for _, verb := range verbs {
 		if !slices.Contains(regularResourceVerbs, verb) {
@@ -430,13 +435,17 @@ func buildResource(d k8sResource) (ResourceRule, error) {
 	}
 	// The verbs: omitted is all of them — every verb the resource
 	// supports, the same list the explicit form validates against.
+	// An explicit empty list is not the omission: writing one grants
+	// nothing at all, so it is a config error, not every verb.
 	supported := regularResourceVerbs
 	if d.Resource == "pods/log" {
 		supported = logResourceVerbs
 	}
 	verbs := d.Verbs
-	if len(verbs) == 0 {
+	if verbs == nil {
 		verbs = supported
+	} else if len(verbs) == 0 {
+		return ResourceRule{}, errors.New("verbs is empty: list the verbs, or omit verbs to grant all of them")
 	}
 	seen := make(map[string]bool, len(verbs))
 	for _, verb := range verbs {
