@@ -28,6 +28,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/credentials/ssocreds"
 	"gopkg.in/ini.v1"
 )
 
@@ -807,6 +808,262 @@ func TestStopCutsTheContainerCredentialsUpstream(t *testing.T) {
 	}
 }
 
+// TestStopCutsTheSharedConfigAssumeRoleUpstream covers the stop cutting
+// the chain's own STS call: the profile's role assumption — held open
+// by the server — is refused or cut once the stop begins, so what it
+// would send after the stop never goes out and the server sees the
+// connection go.
+func TestStopCutsTheSharedConfigAssumeRoleUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	// The profile assumes a role: its source is a second profile with
+	// static credentials, and the chain's own STS client fetches the
+	// role's credentials over the endpoint the environment names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile src]\nregion = eu-west-1\n\n[profile dev]\nregion = eu-west-1\nrole_arn = arn:aws:iam::123456789012:role/dev\nsource_profile = src\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[src]\naws_access_key_id = SOURCE\naws_secret_access_key = source-secret\n\n[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The STS endpoint: it holds the assumption open and reports the
+	// connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	release := make(chan struct{})
+	var cutOnce sync.Once
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real service consumes the request body: the call it
+		// carries is what the endpoint reads. Consumed here, the
+		// endpoint watches the connection from then on — until then
+		// it could not see the client go.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			cutOnce.Do(func() { close(cut) })
+		case <-release:
+			// The cleanup freed the handler: what the stop did
+			// not cut, the cleanup did — not a success signal.
+		}
+	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
+	defer stsServer.Close()
+	defer close(release)
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: the chain's own fetch hangs
+	// in the held request. The start is bounded: nothing returning is
+	// a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The chain's fetch reached the endpoint: the arrival is what the
+	// stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the role assumption did not reach the endpoint")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The endpoint saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight role assumption")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut role assumption; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
+	}
+}
+
+// TestStopCutsTheWebIdentityUpstream covers the stop cutting the chain's
+// own STS call for the web identity flow: the role's assumption from
+// the token the file carries — held open by the server — is refused or
+// cut once the stop begins, so what it would send after the stop never
+// goes out and the server sees the connection go.
+func TestStopCutsTheWebIdentityUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	// The profile assumes a role from a web identity token: the token
+	// comes from a file, and the chain's own STS client fetches the
+	// role's credentials over the endpoint the environment names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\nrole_arn = arn:aws:iam::123456789012:role/dev\nweb_identity_token_file = "+filepath.Join(home, "web-identity-token")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "web-identity-token"), []byte("web-identity-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The STS endpoint: it holds the assumption open and reports the
+	// connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	release := make(chan struct{})
+	var cutOnce sync.Once
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real service consumes the request body: the call it
+		// carries is what the endpoint reads. Consumed here, the
+		// endpoint watches the connection from then on — until then
+		// it could not see the client go.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			cutOnce.Do(func() { close(cut) })
+		case <-release:
+			// The cleanup freed the handler: what the stop did
+			// not cut, the cleanup did — not a success signal.
+		}
+	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
+	defer stsServer.Close()
+	defer close(release)
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: the chain's own fetch hangs
+	// in the held request. The start is bounded: nothing returning is
+	// a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The chain's fetch reached the endpoint: the arrival is what the
+	// stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the role assumption did not reach the endpoint")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The endpoint saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight role assumption")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut role assumption; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
+	}
+}
+
+// TestStopCutsTheSSOTokenUpstream covers the stop cutting the chain's
+// own OIDC call: the token the SSO session refreshes over — held open
+// by the server — is refused or cut once the stop begins, so what it
+// would send after the stop never goes out and the server sees the
+// connection go.
+func TestStopCutsTheSSOTokenUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	t.Setenv("HOME", home)
+	// The profile's credentials come from an SSO session: the token
+	// refresh goes over the chain's own OIDC client — the endpoint the
+	// environment names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[sso-session sess]\nsso_start_url = https://example.awsapps.com/start\nsso_region = eu-west-1\n\n[profile dev]\nsso_session = sess\nsso_account_id = 123456789012\nsso_role_name = Role\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The cached token the refresh renews: expired, with what the
+	// renewal sends — the refresh token and the client it goes as.
+	cached, err := ssocreds.StandardCachedTokenFilepath("sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cached), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cached, []byte(`{"accessToken":"expired","expiresAt":"2020-01-01T00:00:00Z","refreshToken":"refresh","clientId":"client","clientSecret":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The SSO OIDC endpoint: it holds the renewal open and reports the
+	// connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	release := make(chan struct{})
+	var cutOnce sync.Once
+	oidcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real service consumes the request body: the call it
+		// carries is what the endpoint reads. Consumed here, the
+		// endpoint watches the connection from then on — until then
+		// it could not see the client go.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			cutOnce.Do(func() { close(cut) })
+		case <-release:
+			// The cleanup freed the handler: what the stop did
+			// not cut, the cleanup did — not a success signal.
+		}
+	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
+	defer oidcServer.Close()
+	defer close(release)
+	t.Setenv("AWS_ENDPOINT_URL_SSO_OIDC", oidcServer.URL)
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: the chain's own fetch hangs
+	// in the held request. The start is bounded: nothing returning is
+	// a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The chain's renewal reached the endpoint: the arrival is what
+	// the stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the token renewal did not reach the endpoint")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The endpoint saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight token renewal")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut token renewal; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
+	}
+}
+
 // TestSyncConfigWithCABundle covers the load with a custom CA bundle:
 // the bundle's certificate authority must resolve into the session's
 // transport — the STS endpoint's certificate it authenticates — or
@@ -881,6 +1138,342 @@ func TestSyncConfigWithCABundle(t *testing.T) {
 	// resolve into the transport, and the load must not fail setting it.
 	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
 		t.Fatalf("SyncConfig with a CA bundle: %v", err)
+	}
+}
+
+// TestSyncConfigUsesTheSharedConfigIMDSEndpoint covers the IMDS client
+// the chain builds resolving its endpoint from the shared config: its
+// requests go where the profile names — not the default address — and
+// the startup that resolves the session with the credentials the chain
+// retrieves there succeeds.
+func TestSyncConfigUsesTheSharedConfigIMDSEndpoint(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	// The IMDS endpoint: it serves the token, the credentials list,
+	// and the credentials themselves, and reports the chain's arrival.
+	reached := make(chan struct{}, 1)
+	imdsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		switch {
+		case r.URL.Path == "/latest/api/token":
+			// The token the chain's client carries from here: the
+			// TTL names how long it holds.
+			w.Header().Set("X-Aws-Ec2-Metadata-Token-Ttl-Seconds", "21600")
+			_, _ = io.WriteString(w, "test-token")
+		case r.URL.Path == "/latest/meta-data/iam/security-credentials/":
+			// The names of the profile's credentials: the first is
+			// the one the chain resolves.
+			_, _ = io.WriteString(w, "cred-name")
+		case r.URL.Path == "/latest/meta-data/iam/security-credentials/cred-name":
+			// The credentials the chain retrieves: what the session
+			// signs with.
+			_, _ = io.WriteString(w, `{"AccessKeyId":"SOURCE","SecretAccessKey":"source-secret","Token":"session","Expiration":"2099-01-01T00:00:00Z","Code":"Success"}`)
+		default:
+			t.Errorf("unexpected IMDS request: %s", r.URL.Path)
+		}
+	}))
+	defer imdsServer.Close()
+	// The STS endpoint: the session's own assumption succeeds there.
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = io.WriteString(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
+	}))
+	defer stsServer.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	// The profile's own credentials fall to the IMDS the chain's
+	// client fetches them from — at the endpoint the profile names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\nec2_metadata_service_endpoint = "+imdsServer.URL+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	// The chain's requests reached the endpoint: the endpoint the
+	// profile names is where they went.
+	select {
+	case <-reached:
+	default:
+		t.Fatal("the chain's requests did not reach the IMDS endpoint")
+	}
+}
+
+// TestSyncConfigKeepsSharedConfigIMDSv1Disabled covers the shared
+// config's v1 disablement holding: the chain's IMDS client does not
+// fall back to v1 — the failed token fetch fails the chain, no
+// request without the token follows it.
+func TestSyncConfigKeepsSharedConfigIMDSv1Disabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	// The IMDS endpoint: it fails the token fetch — the v1 fallback
+	// would send what follows without the token — and counts what
+	// arrives.
+	var requests atomic.Int32
+	imdsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if n := requests.Add(1); n == 1 {
+			// The token fetch fails: no token for what follows.
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		// The v1 fallback: the request goes without the token —
+		// the disablement the profile set forbids it.
+		_, _ = io.WriteString(w, "cred-name")
+	}))
+	defer imdsServer.Close()
+	// The profile's own credentials fall to the IMDS the chain's
+	// client fetches them from — with the v1 client disabled.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\nec2_metadata_service_endpoint = "+imdsServer.URL+"\nec2_metadata_v1_disabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	err := p.syncOnce(context.Background(), 12345, t.TempDir())
+	if err == nil {
+		t.Fatal("syncOnce with a v1-disabled token failure; want a failure")
+	}
+	// What arrived at the endpoint: the token fetch alone — no v1
+	// request follows it.
+	if n := requests.Load(); n != 1 {
+		t.Fatalf("the endpoint saw %d requests; want the token fetch alone", n)
+	}
+}
+
+// TestSyncConfigKeepsTheSharedConfigIMDSMode covers the shared config's
+// endpoint mode holding: with the IPv6 mode set, the chain's IMDS client
+// resolves at the endpoint the profile names — the mode does not break
+// the resolution the config carries.
+func TestSyncConfigKeepsTheSharedConfigIMDSMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The IMDS endpoint: it serves the token, the credentials list, and
+	// the credentials themselves, and reports the chain's arrival.
+	reached := make(chan struct{}, 1)
+	imdsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		switch {
+		case r.URL.Path == "/latest/api/token":
+			w.Header().Set("X-Aws-Ec2-Metadata-Token-Ttl-Seconds", "21600")
+			_, _ = io.WriteString(w, "test-token")
+		case r.URL.Path == "/latest/meta-data/iam/security-credentials/":
+			_, _ = io.WriteString(w, "cred-name")
+		case r.URL.Path == "/latest/meta-data/iam/security-credentials/cred-name":
+			_, _ = io.WriteString(w, `{"AccessKeyId":"SOURCE","SecretAccessKey":"source-secret","Token":"session","Expiration":"2099-01-01T00:00:00Z","Code":"Success"}`)
+		default:
+			t.Errorf("unexpected IMDS request: %s", r.URL.Path)
+		}
+	}))
+	defer imdsServer.Close()
+	// The STS endpoint: the session's own assumption succeeds there.
+	stsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		_, _ = io.WriteString(w, `<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASSUMED</AccessKeyId><SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`)
+	}))
+	defer stsServer.Close()
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	// The profile's own credentials fall to the IMDS the chain's client
+	// fetches them from — with the IPv6 mode set at the endpoint the
+	// profile names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\nec2_metadata_service_endpoint = "+imdsServer.URL+"\nec2_metadata_service_endpoint_mode = IPv6\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	if err := p.syncOnce(context.Background(), 12345, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	// The chain's requests reached the endpoint: the mode set did not
+	// break the resolution.
+	select {
+	case <-reached:
+	default:
+		t.Fatal("the chain's requests did not reach the IMDS endpoint")
+	}
+}
+
+// TestStopCutsTheIMDSTokenUpstream covers the stop cutting the IMDS
+// token fetch: the token the chain's client requests — held open by
+// the server — is refused or cut once the stop begins, so what it
+// would send after the stop never goes out and the server sees the
+// connection go.
+func TestStopCutsTheIMDSTokenUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	// The IMDS endpoint: it holds the token fetch open and reports
+	// the connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	release := make(chan struct{})
+	var cutOnce sync.Once
+	imdsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The real service consumes the request body: the call it
+		// carries is what the endpoint reads. Consumed here, the
+		// endpoint watches the connection from then on — until then
+		// it could not see the client go.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case reached <- struct{}{}:
+		default:
+		}
+		select {
+		case <-r.Context().Done():
+			cutOnce.Do(func() { close(cut) })
+		case <-release:
+			// The cleanup freed the handler: what the stop did
+			// not cut, the cleanup did — not a success signal.
+		}
+	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
+	defer imdsServer.Close()
+	defer close(release)
+	// The profile's own credentials fall to the IMDS the chain's
+	// client fetches them from — at the endpoint the profile names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\nec2_metadata_service_endpoint = "+imdsServer.URL+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: the chain's own fetch hangs
+	// in the held request. The start is bounded: nothing returning is
+	// a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The chain's fetch reached the endpoint: the arrival is what
+	// the stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the token fetch did not reach the endpoint")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The endpoint saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight token fetch")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut token fetch; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
+	}
+}
+
+// TestStopCutsTheIMDSMetadataUpstream covers the stop cutting the IMDS
+// metadata fetch: the credentials list the chain's client requests —
+// held open by the server — is refused or cut once the stop begins,
+// so what it would send after the stop never goes out and the server
+// sees the connection go.
+func TestStopCutsTheIMDSMetadataUpstream(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(home, "config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(home, "credentials"))
+	// The IMDS endpoint: it serves the token and holds the metadata
+	// fetch open, reporting the connection going when the stop cuts it.
+	reached := make(chan struct{}, 1)
+	cut := make(chan struct{})
+	release := make(chan struct{})
+	var cutOnce sync.Once
+	imdsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/latest/api/token":
+			// The token the chain's client carries from here: the
+			// TTL names how long it holds.
+			w.Header().Set("X-Aws-Ec2-Metadata-Token-Ttl-Seconds", "21600")
+			_, _ = io.WriteString(w, "test-token")
+		default:
+			// The real service consumes the request body: the call it
+			// carries is what the endpoint reads. Consumed here, the
+			// endpoint watches the connection from then on — until
+			// then it could not see the client go.
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case reached <- struct{}{}:
+			default:
+			}
+			select {
+			case <-r.Context().Done():
+				cutOnce.Do(func() { close(cut) })
+			case <-release:
+				// The cleanup freed the handler: what the stop
+				// did not cut, the cleanup did — not a success
+				// signal.
+			}
+		}
+	}))
+	// The cleanup frees the handler whatever the stop cut: without
+	// it the close would wait for it to go.
+	defer imdsServer.Close()
+	defer close(release)
+	// The profile's own credentials fall to the IMDS the chain's
+	// client fetches them from — at the endpoint the profile names.
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("[profile dev]\nregion = eu-west-1\nec2_metadata_service_endpoint = "+imdsServer.URL+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "credentials"), []byte("[dev]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New([]Target{{Profile: "dev", Services: []Service{{Name: "dynamodb", Mode: "ro"}}, Regions: []string{"eu-*"}}}, "localhost")
+	dir := t.TempDir()
+	// The startup resolves the session: the chain's own fetch hangs
+	// in the held request. The start is bounded: nothing returning is
+	// a hang.
+	started := make(chan error, 1)
+	go func() { started <- p.SyncConfig(context.Background(), 12345, dir, nil) }()
+	// The chain's fetch reached the endpoint: the arrival is what
+	// the stop cuts from.
+	select {
+	case <-reached:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the metadata fetch did not reach the endpoint")
+	}
+	// The stop begins: what is in flight is cut.
+	p.BeginStop()
+	select {
+	case <-cut:
+		// The endpoint saw the connection go: the transport cut it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stop did not cut the in-flight metadata fetch")
+	}
+	// The startup fails with its own result.
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Fatal("SyncConfig with a cut metadata fetch; want a failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup did not return")
 	}
 }
 
