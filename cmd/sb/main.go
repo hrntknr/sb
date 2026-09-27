@@ -96,7 +96,7 @@ func newRootCommand() *cobra.Command {
 		Short:         "Issue scoped ssh, k8s, and AWS credentials to containers",
 		SilenceErrors: true,
 	}
-	root.PersistentFlags().StringVar(&opts.configPath, "config", defaultConfigPath(), "config yaml path")
+	root.PersistentFlags().StringVar(&opts.configPath, "config", defaultConfigPath(), "config yaml path (v3 form only: version: 3)")
 	root.PersistentFlags().StringVar(&opts.logLevel, "log-level", "silent", "log level: silent, debug, info, warn, error")
 	root.AddCommand(newProxyCommand(opts), newRunCommand(opts), newExecCommand(opts), newConfigCommand(opts))
 	return root

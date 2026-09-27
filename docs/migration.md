@@ -65,7 +65,7 @@ Because sb refuses to guess, the conversion is manual: convert each entry below,
 | v2 | v3 |
 | --- | --- |
 | `version` absent | `version: 3` required |
-| `proxy:` section (`sshAgentEnv`) | not part of the v3 config; the agent socket comes from the session environment |
+| `proxy:` section (`sshAgentEnv`) | not part of the v3 config; the agent socket is read from the sb process's `SSH_AUTH_SOCK` on every upstream dial |
 | `container.mounts`: `"source:target"` strings | `mounts`: entries with `source`, `target`, `readOnly` |
 | `container.environments`: `KEY=VALUE` list, bare `KEY` inherits | `container.environment`: a map of `KEY: {inherit: true}` or `KEY: {value: bar}` |
 | `ssh`: `host` + `commands` | `host`, `user`, `port`, `access` |
@@ -88,6 +88,15 @@ To convert, decide per host:
 | `- host: github.com` with `commands: [cat]` | `- host: github.com` + `access: full`, if you accept the broader grant |
 | `- host: github.com` with `commands` omitted (shell + forward + any exec) | `- host: github.com` + `access: full` (same meaning) |
 | any rule you do not want to grant in full | drop the entry |
+
+```yaml
+# v2                        # v3
+ssh:                        ssh:
+  - host: github.com          - host: github.com
+    commands:                     access: full
+      - cat
+      - ls
+```
 
 Review each host: a v2 `commands` rule that felt limited now becomes an explicit full grant. If that is not what you want, remove the host from the config and reach it directly instead.
 
@@ -206,3 +215,5 @@ $ sb config check [--config path]
 ```
 
 It validates the form, names, supported ranges, and conflicts statically, then lists every issuance target (ssh hosts, k8s contexts, aws profiles) and the permissions granted to each. It reads no credentials and contacts no cluster; connecting to the upstreams is done by running sb itself.
+
+What the config grants is what the proxies enforce: a request outside it is never sent upstream, so the listing is the whole permission set the session runs with.
