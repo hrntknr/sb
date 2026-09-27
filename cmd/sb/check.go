@@ -58,7 +58,7 @@ func renderConfig(cfg v3.Config) string {
 		renderSSH(&b, cfg.SSH)
 	}
 	if len(cfg.K8s) > 0 {
-		renderK8s(&b, cfg.K8s)
+		renderK8s(&b, cfg)
 	}
 	if len(cfg.AWS) > 0 {
 		renderAWS(&b, cfg.AWS)
@@ -81,39 +81,44 @@ func renderSSH(b *strings.Builder, rules []v3.SSHRule) {
 	}
 }
 
-func renderK8s(b *strings.Builder, rules []v3.K8sRule) {
+func renderK8s(b *strings.Builder, cfg v3.Config) {
+	// The display shows the actual permission set K8sTargets generates
+	// for the config — the same grant the proxy will enforce — with the
+	// form's own line for the mode and all-resources rules: what the
+	// form grants (its verbs, every namespace and the cluster's root
+	// alike, no subresource) is what the lines below list, one resource
+	// at a time.
 	b.WriteString("\nk8s:\n")
-	for _, r := range rules {
-		fmt.Fprintf(b, "  - context: %s\n", r.Context)
-		if r.Mode != "" {
-			// The shorthand says what it grants: the mode's verbs on
-			// every resource, the same summary the lines below give
-			// the enumerated form.
-			if r.Mode == "ro" {
-				b.WriteString("    mode: ro (every resource of the stable API: get, list, watch)\n")
+	rules, targets := cfg.K8s, cfg.K8sTargets()
+	for i, rule := range rules {
+		fmt.Fprintf(b, "  - context: %s\n", rule.Context)
+		if len(rule.Resources) == 0 {
+			// The mode shorthand, or the context's verbs with resources
+			// omitted. Every entry of the expansion carries the form's
+			// verbs; the first one's are the form's.
+			if rule.Mode != "" {
+				fmt.Fprintf(b, "    mode: %s (%s on every resource of the stable API — every namespace and the cluster's root alike; no subresource is included)\n", rule.Mode, strings.Join(targets[i].Resources[0].Verbs, ", "))
 			} else {
-				b.WriteString("    mode: rw (every resource of the stable API: every verb)\n")
+				fmt.Fprintf(b, "    all resources (%s on every resource of the stable API — every namespace and the cluster's root alike; no subresource is included)\n", strings.Join(targets[i].Resources[0].Verbs, ", "))
 			}
-			continue
 		}
-		for _, res := range r.Resources {
-			fmt.Fprintf(b, "    - %s: %s\n", renderResource(res), strings.Join(res.Verbs, ", "))
+		for _, res := range targets[i].Resources {
+			fmt.Fprintf(b, "    - %s: %s\n", renderResource(res.Group, res.Resource, res.Namespace, res.Scope), strings.Join(res.Verbs, ", "))
 		}
 	}
 }
 
-func renderResource(r v3.ResourceRule) string {
-	group := r.Group
+func renderResource(group, resource, namespace, scope string) string {
 	if group == "" {
 		group = "core"
 	}
 	switch {
-	case r.Scope == "cluster":
-		return group + " " + r.Resource + " (cluster-scoped)"
-	case r.Namespace == "*":
-		return group + " " + r.Resource + " in * (all namespaces)"
+	case scope == "cluster":
+		return group + " " + resource + " (cluster-scoped)"
+	case namespace == "*":
+		return group + " " + resource + " in * (all namespaces)"
 	default:
-		return group + " " + r.Resource + " in " + r.Namespace
+		return group + " " + resource + " in " + namespace
 	}
 }
 

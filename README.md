@@ -109,6 +109,8 @@ k8s:
         verbs: [get]          # kubectl logs, including -f
   - context: ops              # or the mode shorthand instead of resources
     mode: rw                  # every resource of the stable API, every verb
+  - context: read             # or the context verbs with resources omitted
+    verbs: [get, list, watch] # every resource of the stable API, reading
 aws:
   - profile: dev
     roleArn: arn:aws:iam::123456789012:role/sb-dev    # optional
@@ -147,7 +149,7 @@ What a context resolves to — the server URL, TLS verification, and auth settin
 
 `resources` enumerate every grant: `group` (required; `""` is the core API group), `resource`, `namespace` (all namespaces with `*`; omitted is the same as `*`) or `scope: cluster` for cluster-scoped resources, and `verbs` (omitted is every verb the resource supports). The supported verbs are `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` for regular resources and `get` for `pods/log` (`kubectl logs`, including `-f` as a `follow=true` GET). A `pods` grant does not inherit to `pods/log`. The shape must match the scope the Kubernetes API gives the resource — a cluster-scoped one (`namespaces`, `nodes`, rbac's `clusterroles`) takes `scope: cluster`, a namespaced one a `namespace` — and sb decides that only for the stable API's resources; anything else is rejected when the config loads.
 
-A context takes `mode` instead of `resources`: `mode: ro` grants read — `get`, `list`, `watch` — on every resource of the stable API, `mode: rw` every verb on each of them; both cover every namespace and the cluster's root alike. `mode` and `resources` are mutually exclusive in one context. No mode covers a subresource — `pods/log` needs its own `resources` rule.
+A context takes `mode` or `verbs` instead of `resources`: `mode: ro` grants read — `get`, `list`, `watch` — on every resource of the stable API, `mode: rw` every verb on each of them, and `verbs` at the context level (with `resources` omitted) those verbs on each — all of them when `verbs` is omitted too, the `mode: rw` grant. All of them cover every namespace and the cluster's root alike. `mode`, `verbs`, and `resources` never mix in one context; a null or absent key is the same omission, and an empty `resources: []` list is rejected. No mode or context verbs cover a subresource — `pods/log` needs its own `resources` rule.
 
 Requests are classified as the Kubernetes API server classifies them: the group, resource, subresource, verb, and namespace are matched against the rules, and what no rule covers — unknown paths, other subresources, impersonation headers, upgrade — is rejected before the upstream. Non-resource requests are limited to the fixed discovery paths (`/api`, `/apis`, core `/api/v1`, group discovery, openapi, and the version endpoint) as GET.
 

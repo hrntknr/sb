@@ -44,14 +44,17 @@ type SSHRule struct {
 	Access string
 }
 
-// K8sRule is the policy for one kubeconfig context: either the
-// Resources enumerated on it, or the Mode shorthand — "ro"/"rw"
-// covering every resource of the stable API (reads, or everything).
-// Mode and Resources are mutually exclusive: a rule is one or the
-// other, never both.
+// K8sRule is the policy for one kubeconfig context. It is one of three
+// forms: the mode shorthand (Mode "ro"/"rw" — every resource of the
+// stable API, reads or everything), the all-resources form (Verbs at
+// the context level, Resources omitted — every resource of the stable
+// API with those verbs, all of them when Verbs is omitted too), or
+// the enumerated form (Resources). The forms are mutually exclusive:
+// a rule carries one, never two.
 type K8sRule struct {
 	Context   string
 	Mode      string
+	Verbs     []string
 	Resources []ResourceRule
 }
 
@@ -119,6 +122,7 @@ type sshRule struct {
 type k8sRule struct {
 	Context   string        `yaml:"context"`
 	Mode      string        `yaml:"mode"`
+	Verbs     []string      `yaml:"verbs"`
 	Resources []k8sResource `yaml:"resources"`
 }
 
@@ -320,14 +324,33 @@ func buildK8s(d k8sRule) (K8sRule, error) {
 	if d.Mode != "" && d.Mode != "ro" && d.Mode != "rw" {
 		return K8sRule{}, fmt.Errorf("invalid mode %q (want ro or rw)", d.Mode)
 	}
-	// The mode shorthand and the resources form are mutually exclusive:
-	// the shorthand's grant is every resource at once, a resource form
-	// next to it would promise the same thing twice.
-	if d.Mode != "" && len(d.Resources) > 0 {
+	// The rule is one of three forms, and the keys do not mix: the mode
+	// shorthand is a closed form (the mode itself is the grant), the
+	// context verbs belong to the all-resources form, and the resources
+	// to the enumerated one. A key written next to another — an empty
+	// list included — is the conflict; a null or absent key is the
+	// same omission.
+	if d.Mode != "" && d.Resources != nil {
 		return K8sRule{}, errors.New("mode and resources are mutually exclusive")
 	}
-	if d.Mode == "" && len(d.Resources) == 0 {
-		return K8sRule{}, errors.New("resources is required (or set mode: ro or mode: rw)")
+	if d.Mode != "" && d.Verbs != nil {
+		return K8sRule{}, errors.New("mode and verbs are mutually exclusive")
+	}
+	if d.Verbs != nil && d.Resources != nil {
+		return K8sRule{}, errors.New("verbs and resources are mutually exclusive")
+	}
+	if d.Resources != nil && len(d.Resources) == 0 {
+		return K8sRule{}, errors.New("resources is empty: list the resource rules, or omit resources to grant all of them")
+	}
+	// The enumerated form: each rule is built as written. The
+	// all-resources form carries the context's verbs (nil with
+	// nothing else: the bare context, every verb — the mode: rw
+	// grant); the mode shorthand carries none (the mode is the
+	// grant), so it validates nothing here.
+	if d.Verbs != nil {
+		if err := validateContextVerbs(d.Verbs); err != nil {
+			return K8sRule{}, err
+		}
 	}
 	resources := make([]ResourceRule, 0, len(d.Resources))
 	for i, r := range d.Resources {
@@ -337,7 +360,25 @@ func buildK8s(d k8sRule) (K8sRule, error) {
 		}
 		resources = append(resources, rule)
 	}
-	return K8sRule{Context: d.Context, Mode: d.Mode, Resources: resources}, nil
+	return K8sRule{Context: d.Context, Mode: d.Mode, Verbs: d.Verbs, Resources: resources}, nil
+}
+
+// validateContextVerbs checks the verbs of the all-resources form: what
+// they grant is every resource of the stable API — each of them a
+// regular one, no subresource among them — so the verbs are the seven,
+// none other, without duplicates.
+func validateContextVerbs(verbs []string) error {
+	seen := make(map[string]bool, len(verbs))
+	for _, verb := range verbs {
+		if !slices.Contains(regularResourceVerbs, verb) {
+			return fmt.Errorf("unsupported verb %q for every resource (supported: %s)", verb, strings.Join(regularResourceVerbs, ", "))
+		}
+		if seen[verb] {
+			return fmt.Errorf("duplicate verb %q", verb)
+		}
+		seen[verb] = true
+	}
+	return nil
 }
 
 func buildResource(d k8sResource) (ResourceRule, error) {

@@ -23,21 +23,44 @@ func (c Config) SSHTargets() sshproxy.Targets {
 }
 
 // K8sTargets converts the k8s rules to proxy targets: the context with
-// the resources granted on it, each as one proxy resource. A rule in
-// the mode shorthand converts to a grant on every resource of the
-// stable API — at the scope shape the resource's own scope table entry
-// gives it, "*" for a namespaced one, "cluster" for a cluster-scoped
-// one — with the mode's verbs: ro reads, rw everything.
+// the resources granted on it, each as one proxy resource. A rule in a
+// mode or with resources omitted converts to a grant on every resource
+// of the stable API — the mode's or the context's verbs (all of them
+// when omitted) — at the scope shape the resource's own scope table
+// entry gives it, "*" for a namespaced one, "cluster" for a
+// cluster-scoped one.
 func (c Config) K8sTargets() k8sproxy.Targets {
 	targets := make(k8sproxy.Targets, 0, len(c.K8s))
 	for _, rule := range c.K8s {
 		var resources []k8sproxy.Resource
-		if rule.Mode == "ro" || rule.Mode == "rw" {
-			// The mode shorthand: every resource of the stable API, at
-			// the scope shape the map gives it, with the mode's verbs.
-			verbs := regularResourceVerbs
-			if rule.Mode == "ro" {
+		if len(rule.Resources) > 0 {
+			// The enumerated form: each rule as written.
+			resources = make([]k8sproxy.Resource, 0, len(rule.Resources))
+			for _, resource := range rule.Resources {
+				resources = append(resources, k8sproxy.Resource{
+					Group:     resource.Group,
+					Resource:  resource.Resource,
+					Namespace: resource.Namespace,
+					Scope:     resource.Scope,
+					Verbs:     resource.Verbs,
+				})
+			}
+		} else {
+			// The mode shorthand, or the all-resources form: every
+			// resource of the stable API with that form's verbs (all
+			// of them when the context's verbs is omitted) — the
+			// mode's are fixed by itself.
+			var verbs []string
+			switch rule.Mode {
+			case "ro":
 				verbs = readResourceVerbs
+			case "rw":
+				verbs = regularResourceVerbs
+			default:
+				verbs = rule.Verbs
+				if len(verbs) == 0 {
+					verbs = regularResourceVerbs // omitted is all of them
+				}
 			}
 			for _, r := range k8sproxy.AllResources() {
 				res := k8sproxy.Resource{
@@ -51,17 +74,6 @@ func (c Config) K8sTargets() k8sproxy.Targets {
 					res.Namespace = "*"
 				}
 				resources = append(resources, res)
-			}
-		} else {
-			resources = make([]k8sproxy.Resource, 0, len(rule.Resources))
-			for _, resource := range rule.Resources {
-				resources = append(resources, k8sproxy.Resource{
-					Group:     resource.Group,
-					Resource:  resource.Resource,
-					Namespace: resource.Namespace,
-					Scope:     resource.Scope,
-					Verbs:     resource.Verbs,
-				})
 			}
 		}
 		targets = append(targets, k8sproxy.Target{

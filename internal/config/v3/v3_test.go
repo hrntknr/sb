@@ -221,6 +221,42 @@ func TestLoadValid(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:   "k8s mode with null resources",
+			config: "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources:\n",
+			check: func(t *testing.T, cfg Config) {
+				// A null resources is the same omission as an absent
+				// one: the mode form, no conflict.
+				if cfg.K8s[0].Mode != "rw" || len(cfg.K8s[0].Resources) != 0 {
+					t.Errorf("K8s[0] = %+v, want mode rw with resources omitted (null is the absence)", cfg.K8s[0])
+				}
+			},
+		},
+		{
+			name:   "k8s context verbs",
+			config: "version: 3\nk8s:\n  - context: dev\n    verbs: [get, list, watch]\n",
+			check: func(t *testing.T, cfg Config) {
+				// The all-resources form: the context's verbs carried
+				// as written, no resources, no mode.
+				if cfg.K8s[0].Mode != "" || len(cfg.K8s[0].Resources) != 0 {
+					t.Errorf("K8s[0] = %+v, want no mode and no resources", cfg.K8s[0])
+				}
+				if !reflect.DeepEqual(cfg.K8s[0].Verbs, []string{"get", "list", "watch"}) {
+					t.Errorf("K8s[0].Verbs = %v, want [get list watch]", cfg.K8s[0].Verbs)
+				}
+			},
+		},
+		{
+			name:   "k8s bare context",
+			config: "version: 3\nk8s:\n  - context: dev\n",
+			check: func(t *testing.T, cfg Config) {
+				// A context with nothing else: the all-resources form
+				// with every verb — the same grant as mode: rw.
+				if cfg.K8s[0].Mode != "" || len(cfg.K8s[0].Verbs) != 0 || len(cfg.K8s[0].Resources) != 0 {
+					t.Errorf("K8s[0] = %+v, want the bare context (the mode: rw grant)", cfg.K8s[0])
+				}
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -408,7 +444,13 @@ func TestLoadInvalid(t *testing.T) {
 		{"ssh port zero", "version: 3\nssh:\n  - host: github.com\n    port: 0\n    access: full\n", "invalid port 0"},
 		{"ssh port out of range", "version: 3\nssh:\n  - host: github.com\n    port: 70000\n    access: full\n", "invalid port 70000"},
 		{"k8s empty context", "version: 3\nk8s:\n  - context: \"\"\n    resources: []\n", "context is required"},
-		{"k8s missing resources", "version: 3\nk8s:\n  - context: dev\n", "resources is required"},
+		{"k8s mode and empty resources", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources: []\n", "mode and resources are mutually exclusive"},
+		{"k8s mode and verbs", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    verbs: [get]\n", "mode and verbs are mutually exclusive"},
+		{"k8s verbs and resources", "version: 3\nk8s:\n  - context: dev\n    verbs: [get]\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "verbs and resources are mutually exclusive"},
+		{"k8s empty resources list", "version: 3\nk8s:\n  - context: dev\n    resources: []\n", "resources is empty"},
+		{"k8s empty resources list with verbs", "version: 3\nk8s:\n  - context: dev\n    verbs: [get]\n    resources: []\n", "verbs and resources are mutually exclusive"},
+		{"k8s context verbs unsupported", "version: 3\nk8s:\n  - context: dev\n    verbs: [get, list, watch, deletecollection]\n", `unsupported verb "deletecollection" for every resource`},
+		{"k8s context verbs duplicate", "version: 3\nk8s:\n  - context: dev\n    verbs: [get, get]\n", `duplicate verb "get"`},
 		{"k8s empty resource", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \"\"\n        resource: \"\"\n        namespace: default\n        verbs: [get]\n", "resource is required"},
 		{"k8s missing group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - resource: pods\n        namespace: default\n        verbs: [get]\n", `group is required (use group: "" for the core API group)`},
 		{"k8s whitespace group", "version: 3\nk8s:\n  - context: dev\n    resources:\n      - group: \" \"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", `invalid group " "`},
@@ -676,42 +718,58 @@ var (
 	examplePairRe = regexp.MustCompile("(?s)v2:\n\n```yaml\n(.*?)\n```\n\nbecomes:\n\nv3:\n\n```yaml\n(.*?)\n```")
 )
 
-// TestK8sTargetsModeExpansion covers the shorthand's conversion: a mode
-// rule becomes a grant on every resource of the stable API, at the scope
-// shape the resource's own scope table entry gives it — "*" for a
-// namespaced one, "cluster" for a cluster-scoped one — with the mode's
-// verbs: ro reads, rw everything. The list the expansion runs on keeps
-// its order, and nothing the scope table decides is left out.
-func TestK8sTargetsModeExpansion(t *testing.T) {
-	ro := Config{K8s: []K8sRule{{Context: "dev", Mode: "ro"}}}
-	rw := Config{K8s: []K8sRule{{Context: "dev", Mode: "rw"}}}
-	roResources := ro.K8sTargets()[0].Resources
-	rwResources := rw.K8sTargets()[0].Resources
-	all := k8sproxy.AllResources()
-	if len(roResources) != len(all) {
-		t.Fatalf("mode: ro expands to %d resources, want %d (every resource of the stable API)", len(roResources), len(all))
+// TestK8sTargetsAllResourcesForm covers the all-resources forms — the
+// mode shorthand (ro reads, rw everything), the context verbs, and the
+// bare context (every verb) — and what each of them expands to: a grant
+// on every resource of the stable API, at the scope shape the resource's
+// own scope table entry gives it — "*" for a namespaced one, "cluster"
+// for a cluster-scoped one. The comparison list is the independent
+// stableResources table, not the scope map the expansion runs on, so a
+// scope the map decided differently would show up here.
+func TestK8sTargetsAllResourcesForm(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   Config
+		verbs []string
+	}{
+		{"mode ro", Config{K8s: []K8sRule{{Context: "dev", Mode: "ro"}}}, readResourceVerbs},
+		{"mode rw", Config{K8s: []K8sRule{{Context: "dev", Mode: "rw"}}}, regularResourceVerbs},
+		{"context verbs", Config{K8s: []K8sRule{{Context: "dev", Verbs: []string{"get", "list", "watch"}}}}, []string{"get", "list", "watch"}},
+		{"bare context", Config{K8s: []K8sRule{{Context: "dev"}}}, regularResourceVerbs},
 	}
-	if len(rwResources) != len(all) {
-		t.Fatalf("mode: rw expands to %d resources, want %d", len(rwResources), len(all))
-	}
-	for i, r := range all {
-		roRule, rwRule := roResources[i], rwResources[i]
-		if roRule.Group != r.Group || roRule.Resource != r.Resource {
-			t.Fatalf("resource %d = %s/%s, want %s/%s (the expansion keeps the list's order)", i, roRule.Group, roRule.Resource, r.Group, r.Resource)
-		}
-		if r.ClusterScoped {
-			if roRule.Scope != "cluster" || roRule.Namespace != "" {
-				t.Errorf("%s/%s = %+v, want scope cluster", r.Group, r.Resource, roRule)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resources := tt.cfg.K8sTargets()[0].Resources
+			// The comparison list is the independent stableResources
+			// table, not the scope map the expansion runs on: what
+			// that map misses, or maps to a different scope, the
+			// expansion would grant without the shape the reference
+			// gives the resource.
+			if len(resources) != len(stableResources) {
+				t.Fatalf("the form expands to %d resources, want %d (every resource of the stable API; the independent list decides)", len(resources), len(stableResources))
 			}
-		} else if roRule.Namespace != "*" || roRule.Scope != "" {
-			t.Errorf("%s/%s = %+v, want namespace \"*\"", r.Group, r.Resource, roRule)
-		}
-		if !reflect.DeepEqual(roRule.Verbs, readResourceVerbs) {
-			t.Errorf("%s/%s ro verbs = %v, want %v", r.Group, r.Resource, roRule.Verbs, readResourceVerbs)
-		}
-		if !reflect.DeepEqual(rwRule.Verbs, regularResourceVerbs) {
-			t.Errorf("%s/%s rw verbs = %v, want %v", r.Group, r.Resource, rwRule.Verbs, regularResourceVerbs)
-		}
+			byGroupResource := make(map[string]k8sproxy.Resource, len(resources))
+			for _, res := range resources {
+				byGroupResource[res.Group+"/"+res.Resource] = res
+			}
+			for _, r := range stableResources {
+				res, ok := byGroupResource[r.group+"/"+r.resource]
+				if !ok {
+					t.Errorf("%s/%s missing from the expansion", r.group, r.resource)
+					continue
+				}
+				if r.cluster {
+					if res.Scope != "cluster" || res.Namespace != "" {
+						t.Errorf("%s/%s = %+v, want scope cluster", r.group, r.resource, res)
+					}
+				} else if res.Namespace != "*" || res.Scope != "" {
+					t.Errorf("%s/%s = %+v, want namespace \"*\"", r.group, r.resource, res)
+				}
+				if !reflect.DeepEqual(res.Verbs, tt.verbs) {
+					t.Errorf("%s/%s verbs = %v, want %v", r.group, r.resource, res.Verbs, tt.verbs)
+				}
+			}
+		})
 	}
 }
 

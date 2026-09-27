@@ -56,7 +56,7 @@ v2 config is not accepted (see docs/migration.md)
 This is deliberate. v2's restrictions cannot be converted automatically without changing what they mean:
 
 - An **ssh** `commands` list cannot become a v3 restriction: sb cannot prove any restriction from a free-form shell string, so any conversion would silently grant more than v2 did.
-- A **k8s** `mode` cannot become a v3 rule: `rw` cannot be expressed at all, and silently turning `rw` into read-only would change the grant without notice.
+- A **k8s** `mode` rule converts by hand: v2 applied the mode inside the `namespace` (or, omitted, to every namespace *and* cluster-scoped requests), while a v3 mode covers every resource of the stable API in every namespace and at the cluster's root — a mechanical conversion would change what the rule grants, and the same name means a different grant.
 
 Because sb refuses to guess, the conversion is manual: convert each entry below, decide what it should mean in v3, and let `sb config check` confirm the result.
 
@@ -69,7 +69,7 @@ Because sb refuses to guess, the conversion is manual: convert each entry below,
 | `container.mounts`: `"source:target"` strings | `mounts`: entries with `source`, `target`, `readOnly` |
 | `container.environments`: `KEY=VALUE` list, bare `KEY` inherits | `container.environment`: a map of `KEY: {inherit: true}` or `KEY: {value: bar}` |
 | `ssh`: `host` + `commands` | `host`, `user`, `port`, `access` |
-| `k8s`: `context` + `mode` + `namespace` | `context` + `resources` (`group`, `resource`, `namespace` or `scope`, `verbs`) |
+| `k8s`: `context` + `mode` + `namespace` | `context` + `mode` (`ro`/`rw`) or `resources` (`group`, `resource`, `namespace` or `scope`, `verbs`) |
 | `aws`: unchanged except `mode` values | same as v2, with `mode: r` renamed to `mode: ro` |
 
 Unknown fields are rejected: every key must be a v3 key. Names, permissions, support ranges, and conflicts are checked when the config loads.
@@ -115,9 +115,9 @@ Review each host: a v2 `commands` rule that felt limited now becomes an explicit
 
 ## k8s: `mode` → `mode`, or enumerated `resources`
 
-v2 granted `r`/`rw` on a context. v3 keeps the form as `mode: ro` (read) and `mode: rw` (every verb) — granted on every resource of the stable API, in every namespace and at the cluster\'s root alike — and adds the explicit form: `resources` enumerates the verbs on each resource you name. `mode` and `resources` are mutually exclusive in one context.
+v2 granted `r`/`rw` on a context. v3 keeps the form as `mode: ro` (read) and `mode: rw` (every verb) — granted on every resource of the stable API, in every namespace and at the cluster's root alike — and adds the explicit form: `resources` enumerates the verbs on each resource you name. `mode` and `resources` are mutually exclusive in one context.
 
-With `namespace: default` set, v2 granted only the namespaced requests in `default`; with `namespace` omitted, it granted namespaced requests in *every* namespace *and* cluster-scoped requests — exactly what the v3 modes grant. The conversion is manual because the narrower grant is per resource:
+With `namespace: default` set, v2 granted only the namespaced requests in `default`; with `namespace` omitted, it granted namespaced requests in *every* namespace *and* cluster-scoped requests — exactly what the v3 modes grant. The conversion is manual because the grant sits differently in v3: the namespace moves from one field on the rule to a field on each resource, and the resources, subresources, and verbs differ — a v3 rule names its resource, takes `namespace: "*"` or `scope: cluster` for the scope, and its verbs are enumerated, while a v3 mode covers every resource at once and no subresource at all:
 
 | v2 | v3 |
 | --- | --- |
@@ -205,7 +205,7 @@ Rules:
 
 - `group` is required; `group: ""` is the core API group and is written explicitly.
 - `namespace` or `scope: cluster` (cluster-scoped resources): `namespace: "*"` and an omitted `namespace` are the same all-namespaces grant. An omitted `verbs` is every verb the resource supports — `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` for regular resources, `get` for `pods/log` (`kubectl logs` including `-f`).
-- `mode: ro` reads and `mode: rw` grants every verb on every resource of the stable API; `mode` and `resources` are mutually exclusive in one context.
+- `mode: ro` reads and `mode: rw` grants every verb on every resource of the stable API; `verbs` at the context level — with `resources` omitted, or omitted entirely: the `mode: rw` grant — grants those verbs on each of them. `mode`, `verbs`, and `resources` never mix in one context; a null or absent key is the same omission, and an empty `resources: []` list is rejected.
 - Unknown verbs, unknown subresources, and anything beyond that set are rejected at load.
 
 ## k8s: the issued kubeconfig is read-only

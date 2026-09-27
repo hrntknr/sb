@@ -67,7 +67,12 @@ aws:
 		"    - core pods in default: get, list, watch\n",
 		"    - core namespaces (cluster-scoped): get\n",
 		"  - context: ops\n",
-		"    mode: rw (every resource of the stable API: every verb)\n",
+		"    mode: rw (get, list, watch, create, update, patch, delete on every resource of the stable API — every namespace and the cluster's root alike; no subresource is included)\n",
+		// the actual permission set K8sTargets generates — the same
+		// grant the proxy will enforce, one resource at a time
+		"    - core bindings in * (all namespaces): get, list, watch, create, update, patch, delete\n",
+		"    - core componentstatuses (cluster-scoped): get, list, watch, create, update, patch, delete\n",
+		"    - apps deployments in * (all namespaces): get, list, watch, create, update, patch, delete\n",
 		"aws:\n  - profile: dev\n    roleArn: arn:aws:iam::123456789012:role/sb-dev\n    regions: eu-west-1\n",
 		"    dynamodb: ro\n    sts: rw\n",
 		"container:\n  runtime: docker\n  image: ghcr.io/hrntknr/sh:full\n",
