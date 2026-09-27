@@ -1,6 +1,7 @@
 package session
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -557,6 +558,33 @@ func TestStateDirRefusesAWiderDir(t *testing.T) {
 	}
 }
 
+// TestSyncFailureStopsTheCreation covers the creation's own boundary: a
+// directory sync that fails makes the whole thing fail — the caller
+// gets the failure, not a tree whose entries might not be on disk. The
+// creation stops at it: nothing of what builds on the missing tree
+// exists, so nothing goes on to use it.
+func TestSyncFailureStopsTheCreation(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	real := syncDirEntry
+	defer func() { syncDirEntry = real }()
+	syncDirEntry = func(dir string) error { return errSyncStopped }
+	if _, err := SessionsDir(); err == nil || !errors.Is(err, errSyncStopped) {
+		t.Fatalf("SessionsDir() = %v, want the sync's failure", err)
+	}
+	// The creation stopped at the failure: the sessions dir does not
+	// exist, and nothing of the tree was created past it. The caller
+	// may not go on to build or use what is not there.
+	if _, err := os.Stat(filepath.Join(state, "sb", "sessions")); !os.IsNotExist(err) {
+		t.Fatalf("sessions dir exists past the sync's failure: %v", err)
+	}
+}
+
+// errSyncStopped is the failure the test injects into the directory
+// sync: the creation's stop, not the sync's own error text.
+var errSyncStopped = errors.New("sync stopped for the test")
+
 // TestStateDirRefusesAWrongOwner covers the state dir's own directory:
 // an <XDG_STATE_HOME>/sb that exists as another user's (uid 1 here) is
 // refused — what sb writes under it would sit in another user's tree,
@@ -707,6 +735,91 @@ func TestSweepRetriesWithThePersistedSettlement(t *testing.T) {
 	}
 	if _, err := os.Stat(issueDir); !os.IsNotExist(err) {
 		t.Fatalf("issue dir survived the second sweep: %v", err)
+	}
+}
+
+// TestStopSessionSettlesBeforeTheRemoval pins the settlement's order
+// against the removal: the listing finds the session's containers, the
+// settlement goes to the record, and only then does the removal
+// destroy them. The rm the runtime receives is held in flight (the
+// slow path), and the record is read directly while it is: what the
+// read finds is what was on the disk before the destruction. Were the
+// settlement persisted after the rm — or not persisted at all — the
+// record would still carry the creation's unknown result, and the
+// read would find nothing settled.
+func TestStopSessionSettlesBeforeTheRemoval(t *testing.T) {
+	fakeruntime.Install(t, t.TempDir())
+	dir := testSessionsDir(t)
+
+	// An unsettled record and its container in the runtime's state:
+	// the listing would find it, so the settlement could confirm it.
+	// The lock first (as the owner would take it), then the record:
+	// Acquire refuses a name whose record it cannot reclaim.
+	lock := mustAcquire(t, dir, "orphan")
+	issueDir, err := NewIssueDir("sidOrphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSaveRecord(t, dir, Record{Name: "orphan", ID: "sidOrphan", Runtime: "docker", IssueDir: issueDir})
+	addStateLine(t, "cidOrphan sb.session.id=sidOrphan\n")
+
+	// The removal is in flight while the slow path exists: the rm has
+	// the call, the containers are not dropped yet.
+	slow := filepath.Join(t.TempDir(), "rm-slow")
+	if err := os.WriteFile(slow, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_FAKE_RM_SLOW", slow)
+
+	// The stop runs in a goroutine of its own: it does not return
+	// until the rm answers, so what follows waits for the call.
+	stopped := make(chan error, 1)
+	go func() { stopped <- StopSession(dir, "orphan", lock, true, false) }()
+
+	// Wait for the rm: the runtime received the call. It answers
+	// within the slow path, so the removal is still in flight.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, err := os.ReadFile(os.Getenv("SB_TEST_CALLS_LOG"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "\nrm -f ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the rm never appeared in the calls log")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The record, read directly while the rm has the call: the
+	// settlement is on the disk, before the destruction. What the
+	// removal's own listing found — the evidence the settlement is
+	// built on — is what is left of it.
+	rec, err := LoadRecord(dir, "orphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.CreationSettled {
+		t.Fatal("the settlement was not on disk while the rm had the call")
+	}
+
+	// Let the rm answer: the removal completes, and the stop returns.
+	if err := os.Remove(slow); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-stopped; err != nil {
+		t.Fatalf("StopSession: %v", err)
+	}
+
+	// The session is fully stopped: its record and its containers
+	// are gone.
+	if _, err := LoadRecord(dir, "orphan"); err == nil {
+		t.Fatal("record survived the stop")
+	}
+	if state := stateText(t); strings.Contains(state, "sidOrphan") {
+		t.Fatalf("container survived the stop: %q", state)
 	}
 }
 

@@ -241,6 +241,7 @@ var stableResources = []struct {
 	{"admissionregistration.k8s.io", "validatingadmissionpolicybindings", true},
 	{"apiextensions.k8s.io", "customresourcedefinitions", true},
 	{"apiregistration.k8s.io", "apiservices", true},
+	{"authentication.k8s.io", "selfsubjectreviews", true},
 	{"authentication.k8s.io", "tokenreviews", true},
 	{"authorization.k8s.io", "localsubjectaccessreviews", false},
 	{"authorization.k8s.io", "selfsubjectaccessreviews", true},

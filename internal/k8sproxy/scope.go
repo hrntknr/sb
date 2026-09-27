@@ -57,7 +57,8 @@ var resourceScopes = map[string]map[string]bool{
 		"apiservices": true,
 	},
 	"authentication.k8s.io": {
-		"tokenreviews": true,
+		"selfsubjectreviews": true,
+		"tokenreviews":       true,
 	},
 	"authorization.k8s.io": {
 		"localsubjectaccessreviews": false,

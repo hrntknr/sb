@@ -50,6 +50,8 @@ Whatever ends the run — the container's exit, a signal, or a proxy failure —
 
 A killed sb reclaims nothing synchronously. The next startup sweeps the sessions whose locks no longer protect them — orphaned by a kill or a crash — and reclaims what they left: their containers are stopped and removed by the session label, the issued credentials deleted, the records dropped. A live session is never touched.
 
+The records and locks live in the state directory — `$XDG_STATE_HOME/sb`, or `$HOME/.local/state/sb` without it — created 0700 and verified this user's own. They outlive the runs: a host restart wipes the runtime directory (where the issued credentials live), not these, so the next startup still finds what the last one left behind. `sb run` and `sb exec` must therefore see the same state directory: pointed at different ones, `sb exec` finds no record to target, and the next startup cannot sweep what the last one left.
+
 Notes:
 
 - The credentials are mounted under `/root`; a container that runs as a non-root user must be able to read `/root`.

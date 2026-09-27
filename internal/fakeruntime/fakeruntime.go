@@ -90,6 +90,9 @@ const fakeScript = `#!/bin/sh
 #   SB_FAKE_CREATE_SLOW      while this path exists the creation is in
 #                            flight: the call does not answer (a creation
 #                            the runtime has not committed yet)
+#   SB_FAKE_RM_SLOW           while this path exists the removal is in
+#                            flight: the call does not answer yet (a
+#                            removal the runtime has not finished)
 #   SB_FAKE_PIPE_CHILD      while this path exists the CLI answers, exits,
 #                            and leaves a child holding its stdio (a runtime
 #                            whose grandchildren keep the pipes open past
@@ -150,6 +153,11 @@ rm)
 	# rm -f <id>...: drop the containers from the state. Mutations are
 	# serialized the way the real runtime serializes them: concurrent
 	# removals of disjoint labels do not lose updates.
+	# While SB_FAKE_RM_SLOW exists the removal is in flight: the CLI has
+	# the call, the containers are not dropped yet.
+	if [ -e "${SB_FAKE_RM_SLOW:-}" ]; then
+		while [ -e "$SB_FAKE_RM_SLOW" ]; do sleep 0.05; done
+	fi
 	if [ -e "${SB_FAKE_RM_LINGER:-}" ]; then
 		# Answers without removing: the containers stay behind the call,
 		# and the listing after it still finds them.

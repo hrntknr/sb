@@ -104,9 +104,26 @@ func stateBaseDir() (string, error) {
 // The verification is on the path itself, not what it points at: a
 // symlink there is its owner's, not sb's, and whoever owns it can
 // replace it afterwards.
+//
+// The creation goes one directory at a time, shallowest first, and each
+// creation's entry in its parent is synced to the disk before the next
+// one: without that, a host failure right after a creation could lose
+// the entry — the whole tree sb is about to build under it — while
+// the process that made it was told it succeeded. A sync that fails
+// stops the creation: the caller gets the failure, not a tree that
+// might not be there.
 func secureMkdir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	missing, err := missingDirs(dir)
+	if err != nil {
 		return err
+	}
+	for _, p := range missing {
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			return err
+		}
+		if err := syncDirEntry(filepath.Dir(p)); err != nil {
+			return err
+		}
 	}
 	info, err := os.Lstat(dir)
 	if err != nil {
@@ -123,6 +140,47 @@ func secureMkdir(dir string) error {
 		return fmt.Errorf("session dir %s: mode is %o, want 0700", dir, info.Mode().Perm())
 	}
 	return nil
+}
+
+// missingDirs walks up from dir collecting the directories that do not
+// exist yet, shallowest first: what is there already is not sb's to
+// create, and the first existing ancestor is where the walk stops —
+// what is above it existed before sb and is not sb's to sync either.
+func missingDirs(dir string) ([]string, error) {
+	var deepest []string // deepest first as walked up
+	for d := dir; ; {
+		if _, err := os.Lstat(d); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		deepest = append(deepest, d)
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	shallow := make([]string, len(deepest))
+	for i, d := range deepest {
+		shallow[len(deepest)-1-i] = d
+	}
+	return shallow, nil
+}
+
+// syncDirEntry syncs a directory's entries to what the disk holds, and
+// is the seam the tests hook: a sync that fails is what the tests make
+// happen, checking the creation stops there and the caller gets the
+// failure. It is the directory the entry was added to that is synced:
+// the child is on the disk by the mkdir, what is not yet is the parent's
+// record of it.
+var syncDirEntry = func(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // ownerOf returns the uid owning info's path; ok is false where the
@@ -148,7 +206,7 @@ func SessionsDir() (string, error) {
 		return "", err
 	}
 	sessions := filepath.Join(dir, "sessions")
-	if err := os.MkdirAll(sessions, 0o700); err != nil {
+	if err := secureMkdir(sessions); err != nil {
 		return "", err
 	}
 	return sessions, nil
@@ -164,7 +222,7 @@ func NewIssueDir(sessionID string) (string, error) {
 		return "", err
 	}
 	issue := filepath.Join(dir, "issues", sessionID)
-	if err := os.MkdirAll(issue, 0o700); err != nil {
+	if err := secureMkdir(issue); err != nil {
 		return "", err
 	}
 	return issue, nil

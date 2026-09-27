@@ -38,6 +38,16 @@ func WriteFileAtomic(path string, mode os.FileMode, content []byte) error {
 	if err := unix.Renameat(dirfd, name, dirfd, base); err != nil {
 		return fmt.Errorf("rename %s: %w", base, err)
 	}
+	// The rename's entry in the directory is not durable yet: the file
+	// content reached the disk, but the directory entry naming it did
+	// not. A host failure right here could lose the entry — with it
+	// the record, while what the record's creation covered reached the
+	// runtime's own disk — so the write is not successful until the
+	// directory's entries are on disk too. It fails here, the caller
+	// keeps what it had: a missing or stale file, not a half-rename.
+	if err := syncDir(dirfd); err != nil {
+		return fmt.Errorf("sync %s: %w", dir, err)
+	}
 	return nil
 }
 
@@ -85,4 +95,12 @@ func randomSuffix() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// syncDir syncs a directory's entries to what the disk holds, and is
+// the seam the tests hook: a sync that fails is what the tests make
+// happen, checking that the failure is the caller's and not the
+// writing's.
+var syncDir = func(dirfd int) error {
+	return unix.Fsync(dirfd)
 }
