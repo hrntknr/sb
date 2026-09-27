@@ -10,7 +10,16 @@ import (
 	"github.com/hrntknr/sb/internal/util"
 )
 
-var errConflictingRoles = errors.New("aws: matching profiles have different roleArn values")
+var (
+	// errConflictingRoles reports matching rules that disagree on the role:
+	// a roleArn mixed with omissions, or two different roleArn values.
+	// The rule order does not matter.
+	errConflictingRoles = errors.New("matching rules disagree on roleArn (all must omit it, or all must set the same one)")
+	// errMissingProfiles reports a rule whose profile pattern matches no
+	// profile that exists in the source credentials: it would grant
+	// nothing, so the policy naming it is a startup error.
+	errMissingProfiles = errors.New("matches no profile in the source credentials")
+)
 var roleARN = regexp.MustCompile(`^arn:(aws|aws-us-gov):iam::[0-9]{12}:role/[A-Za-z0-9_+=,.@/-]+$`)
 
 func ValidRoleARN(value string) bool { return roleARN.MatchString(value) }
@@ -77,10 +86,6 @@ var servicesJSON []byte
 
 var allowedOperations, serviceEndpoints = parseServices()
 
-func ValidService(service Service) bool {
-	return ValidServiceName(service.Name) && (service.Mode == "r" || service.Mode == "rw")
-}
-
 // ValidServiceName reports whether name is an AWS service sb can forward:
 // covered by the embedded service reference with a fixed or {region} host
 // and a protocol sb proxies (JSON, Query, or EC2 POST).
@@ -91,18 +96,27 @@ func ValidServiceName(name string) bool {
 }
 
 // assumedRole returns the role ARN to assume for a profile from matching
-// targets. Matching targets must agree on the role. An empty role means no
-// role is assumed and the source profile's own credentials are used.
+// targets. An omission is one role selection: matching targets must agree —
+// all omit it, or all set the same one — and disagreeing ones are an error
+// whatever their order. An empty role means no role is assumed and the
+// source profile's own credentials are used.
 func assumedRole(targets []Target, profile string) (string, error) {
-	role := ""
+	role, omitted := "", false
 	for _, target := range targets {
 		if !util.Match(target.Profile, profile) {
+			continue
+		}
+		if target.RoleARN == "" {
+			omitted = true
 			continue
 		}
 		if role != "" && role != target.RoleARN {
 			return "", errConflictingRoles
 		}
 		role = target.RoleARN
+	}
+	if omitted && role != "" {
+		return "", errConflictingRoles
 	}
 	return role, nil
 }

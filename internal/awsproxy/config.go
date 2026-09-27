@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/hrntknr/sb/internal/util"
 	"gopkg.in/ini.v1"
 )
@@ -72,10 +70,15 @@ func profiles() ([]string, map[string]string, error) {
 	return result, regions, nil
 }
 
-// SyncConfig issues downstream-only credentials and follows source profile
-// changes, keeping each existing profile's credentials stable across rewrites.
+// SyncConfig issues the session's AWS credentials under dir once: it
+// expands the policy's profile patterns to the profiles that exist in
+// the source credentials, checks the matching rules agree on the role,
+// and issues the downstream-only credentials — all fixed for the
+// session. It signals the issuance's own result through ready (nil: the
+// issuance succeeded), and then holds the session open until the run
+// ends or the stop begins: a source change lands next session.
 func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan<- error) error {
-	// result reports the setup's own outcome through ready, so the
+	// result reports the issuance's own outcome through ready, so the
 	// start waiting on it learns about a failed setup: without it the
 	// caller would wait forever for an issuance that never began.
 	result := func(err error) error {
@@ -84,49 +87,18 @@ func (p *Proxy) SyncConfig(ctx context.Context, port int, dir string, ready chan
 		}
 		return err
 	}
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
+	if err := p.syncOnce(port, dir); err != nil {
 		return result(err)
 	}
-	defer watcher.Close()
-	for _, path := range sourceFiles() {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			return result(err)
-		}
-		if err := watcher.Add(filepath.Dir(path)); err != nil {
-			return result(err)
-		}
-	}
-	err = p.syncOnce(port, dir)
 	if ready != nil {
-		ready <- err
+		// The initial issuance's own result, not just its completion.
+		ready <- nil
 	}
-	if err != nil {
-		return err
-	}
-	// The loop's stop: the proxy's own stop state (BeginStop), or the
-	// run ending, whichever comes first.
-	stop := p.stopContext(ctx)
-	for {
-		select {
-		case <-stop.Done():
-			return nil
-		case event := <-watcher.Events:
-			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
-				continue
-			}
-			for _, path := range sourceFiles() {
-				if filepath.Clean(event.Name) == filepath.Clean(path) {
-					if err := p.syncOnce(port, dir); err != nil {
-						slog.Warn("aws config sync failed; keeping previous config", "error", err)
-					}
-					break
-				}
-			}
-		case err := <-watcher.Errors:
-			return err
-		}
-	}
+	// The session is fixed: nothing follows the source, and nothing
+	// reissues. Wait for the end — the run's (ctx) or the stop's,
+	// whichever comes first.
+	<-p.stopContext(ctx).Done()
+	return nil
 }
 
 func (p *Proxy) syncOnce(port int, dir string) error {
@@ -143,6 +115,14 @@ func (p *Proxy) syncOnce(port int, dir string) error {
 		names, regions, err = profiles()
 		if err != nil {
 			return err
+		}
+		// A rule that matches no existing profile would grant nothing:
+		// the target it names does not exist, so the policy naming it is
+		// a startup error.
+		for _, target := range targets {
+			if !slices.ContainsFunc(names, func(name string) bool { return util.Match(target.Profile, name) }) {
+				return fmt.Errorf("aws: profile %q %w", target.Profile, errMissingProfiles)
+			}
 		}
 	}
 	keys := map[string]issuedKey{}
@@ -195,5 +175,3 @@ func (p *Proxy) syncOnce(port int, dir string) error {
 	p.mu.Unlock()
 	return nil
 }
-
-func (p *Proxy) Refresh(port int, dir string) error { return p.syncOnce(port, dir) }

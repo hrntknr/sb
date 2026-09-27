@@ -72,9 +72,9 @@ func startProxyBounded(t *testing.T, ctx context.Context, cfg v3.Config, opts op
 }
 
 // TestStartProxyFailureStopsTheOtherSide covers the failed start: one
-// side's issuance fails while the other side's loop still follows its
-// source. Without the stop, the surviving loop would reissue what the
-// failure removed; the start returns only once both sides stopped.
+// side's issuance fails while the other side's issuance still holds its
+// session open. Without the stop, the surviving session would follow its
+// source; the start returns only once both sides stopped.
 func TestStartProxyFailureStopsTheOtherSide(t *testing.T) {
 	awsSource, kubeconfigPath := startProxyTestEnv(t)
 	// The k8s side's source is corrupt: its initial issuance fails, the
@@ -91,8 +91,8 @@ func TestStartProxyFailureStopsTheOtherSide(t *testing.T) {
 		t.Fatal("startProxy() with a corrupt upstream kubeconfig; want a failure")
 	}
 
-	// The aws side's loop would follow this change while it lives: with
-	// the start returned, it must be dead — the change reissues nothing.
+	// The aws side's session is fixed: a source change would reissue
+	// nothing here — nothing follows it within the session.
 	if err := os.WriteFile(awsSource, []byte("[profile dev]\nregion = us-east-1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -183,13 +183,14 @@ func TestStartProxyK8sSourceReadFailureIsReported(t *testing.T) {
 	}
 }
 
-// TestStartProxyAWSWatcherSetupFailureIsReported covers the aws side's
-// watcher setup failing: the source config path's parent exists as a file.
-// The setup's own failure must reach the start — without it, the start
-// hangs waiting for a ready that never comes.
-func TestStartProxyAWSWatcherSetupFailureIsReported(t *testing.T) {
+// TestStartProxyAWSSourceReadFailureIsReported covers the aws side's
+// source read failing: the config file's parent exists as a file, so the
+// profiles the initial issuance reads fail on it. The read's own
+// failure must be the start's result: a start that waits for a ready
+// that never comes would hang instead.
+func TestStartProxyAWSSourceReadFailureIsReported(t *testing.T) {
 	_, kubeconfigPath := startProxyTestEnv(t)
-	// The k8s source stays working: the aws side's setup is the failure.
+	// The k8s source stays working: the aws side's read is the failure.
 	writeK8sSource(t, kubeconfigPath)
 	blocker := t.TempDir()
 	blockerFile := filepath.Join(blocker, "blocker")
@@ -198,15 +199,22 @@ func TestStartProxyAWSWatcherSetupFailureIsReported(t *testing.T) {
 	}
 	t.Setenv("AWS_CONFIG_FILE", filepath.Join(blockerFile, "config"))
 
+	// One aws rule: the aws side's initial issuance reads the source
+	// profiles, so the read's failure is the start's result.
+	cfg := v3.Config{AWS: []v3.AWSRule{{
+		Profile:  "dev",
+		RoleARN:  "arn:aws:iam::123456789012:role/dev",
+		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
+	}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	issueDir := t.TempDir()
-	_, err := startProxyBounded(t, ctx, v3.Config{}, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
+	_, err := startProxyBounded(t, ctx, cfg, options{sshListen: ":0", k8sListen: ":0", awsListen: ":0"}, "localhost", issueDir)
 	if err == nil {
-		t.Fatal("startProxy() with a failing watcher setup; want a failure")
+		t.Fatal("startProxy() with a failing source read; want a failure")
 	}
 	if !strings.Contains(err.Error(), "not a directory") {
-		t.Fatalf("startProxy() = %v; want the watcher setup's own failure", err)
+		t.Fatalf("startProxy() = %v; want the source read's own failure", err)
 	}
 	for _, name := range []string{".ssh", ".kube", ".aws"} {
 		if _, statErr := os.Stat(filepath.Join(issueDir, name)); !os.IsNotExist(statErr) {
@@ -279,7 +287,7 @@ func TestStartProxyAWSCancelledDuringReadyWait(t *testing.T) {
 	cfg := v3.Config{AWS: []v3.AWSRule{{
 		Profile:  "dev",
 		RoleARN:  "arn:aws:iam::123456789012:role/dev",
-		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "r"}},
+		Services: []awsproxy.Service{{Name: "dynamodb", Mode: "ro"}},
 	}}}
 	sourcePath := os.Getenv("AWS_CONFIG_FILE")
 	if err := os.Remove(sourcePath); err != nil {

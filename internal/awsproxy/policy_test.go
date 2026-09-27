@@ -11,7 +11,7 @@ func TestReadOnlyAccessServicePermissions(t *testing.T) {
 		{"ec2", "ec2:SearchTransitGatewayRoutes", true},
 		{"ec2", "ec2:CreateVpc", false},
 		{"dynamodb", "dynamodb:BatchGetItem", true},
-		{"dynamodb", "dynamodb:ExecuteStatement", false}, // PartiQL write actions are not all read-only, so `r` rejects it.
+		{"dynamodb", "dynamodb:ExecuteStatement", false}, // PartiQL write actions are not all read-only, so `ro` rejects it.
 		{"dynamodb", "dynamodb:DescribeTable", false},    // Requires the replication actions, not all read-only.
 		{"dynamodb", "dynamodb:PartiQLSelect", false},
 		{"dynamodb", "dynamodb:SearchVectors", false}, // No operation mapping in AWS's reference yet.
@@ -40,9 +40,9 @@ func TestReadOnlyAccessServicePermissions(t *testing.T) {
 		{"kinesis", "kinesis:UnknownOperation", false},
 	} {
 		t.Run(tt.action, func(t *testing.T) {
-			targets := []Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: tt.service, Mode: "r"}}}}
+			targets := []Target{{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Services: []Service{{Name: tt.service, Mode: "ro"}}}}
 			if got := allows(targets, "dev", "us-east-1", tt.action); got != tt.want {
-				t.Errorf("r allows(%s) = %v, want %v", tt.action, got, tt.want)
+				t.Errorf("ro allows(%s) = %v, want %v", tt.action, got, tt.want)
 			}
 		})
 	}
@@ -87,8 +87,75 @@ func TestReadWriteAllowsCredentialIssuingOperations(t *testing.T) {
 	}
 }
 
+// TestAssumedRoleRulesAreOrderIndependent covers the duplicate rules: an
+// omitted roleArn is one selection, so rules matching one profile — a
+// wildcard and an individual name — agree only when all omit it or all
+// set the same one, whatever their order.
+func TestAssumedRoleRulesAreOrderIndependent(t *testing.T) {
+	const (
+		roleA = "arn:aws:iam::123456789012:role/a"
+		roleB = "arn:aws:iam::123456789012:role/b"
+	)
+	for _, tt := range []struct {
+		name     string
+		targets  []Target
+		wantErr  bool
+		wantRole string
+	}{
+		{name: "agree on the same roleArn", wantRole: roleA, targets: []Target{
+			{Profile: "dev", RoleARN: roleA}, {Profile: "*", RoleARN: roleA}}},
+		{name: "agree on omitting it", wantRole: "", targets: []Target{
+			{Profile: "dev"}, {Profile: "*"}}},
+		{name: "a roleArn mixed with an omission", wantErr: true, targets: []Target{
+			{Profile: "dev", RoleARN: roleA}, {Profile: "*"}}},
+		{name: "an omission mixed with a roleArn", wantErr: true, targets: []Target{
+			{Profile: "*"}, {Profile: "dev", RoleARN: roleA}}},
+		{name: "different roleArn values", wantErr: true, targets: []Target{
+			{Profile: "dev", RoleARN: roleA}, {Profile: "*", RoleARN: roleB}}},
+		{name: "different roleArn values reversed", wantErr: true, targets: []Target{
+			{Profile: "*", RoleARN: roleB}, {Profile: "dev", RoleARN: roleA}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			role, err := assumedRole(tt.targets, "dev")
+			switch {
+			case tt.wantErr && err == nil:
+				t.Fatalf("assumedRole(%v) = %q, want a conflict", tt.targets, role)
+			case tt.wantErr:
+			case err != nil:
+				t.Fatalf("assumedRole(%v) = %v, want %q", tt.targets, err, tt.wantRole)
+			case role != tt.wantRole:
+				t.Fatalf("assumedRole(%v) = %q, want %q", tt.targets, role, tt.wantRole)
+			}
+		})
+	}
+}
+
+// TestAgreeingRulesMergePermissionsAsUnion covers agreeing rules: when
+// every rule matching a profile agrees on the role, the permissions are
+// the union of the grants — one rule's regions and services do not
+// remove the other's.
+func TestAgreeingRulesMergePermissionsAsUnion(t *testing.T) {
+	targets := []Target{
+		{Profile: "dev", RoleARN: "arn:aws:iam::123456789012:role/dev", Regions: []string{"eu-*"}, Services: []Service{{Name: "dynamodb", Mode: "ro"}}},
+		{Profile: "*", RoleARN: "arn:aws:iam::123456789012:role/dev", Regions: []string{"us-*"}, Services: []Service{{Name: "ec2", Mode: "rw"}}},
+	}
+	for _, tt := range []struct {
+		region, action string
+		want           bool
+	}{
+		{"eu-west-1", "dynamodb:GetItem", true},        // the individual rule: ro in eu-*
+		{"us-east-1", "ec2:TerminateInstances", true},  // the wildcard rule: rw in us-*
+		{"us-east-1", "dynamodb:GetItem", false},       // the individual rule's region does not match
+		{"eu-west-1", "ec2:TerminateInstances", false}, // the wildcard rule's region does not match
+	} {
+		if got := allows(targets, "dev", tt.region, tt.action); got != tt.want {
+			t.Errorf("allows(%s, %s) = %v, want %v", tt.region, tt.action, got, tt.want)
+		}
+	}
+}
+
 func TestReadOnlyOperationsAllowList(t *testing.T) {
-	// The embedded list must agree with the per-request `r` verdicts: allowed
+	// The embedded list must agree with the per-request `ro` verdicts: allowed
 	// operations are members, everything else (writes, unknown operations,
 	// operations without an action mapping) is not.
 	for _, tt := range []struct {
