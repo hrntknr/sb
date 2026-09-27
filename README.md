@@ -20,7 +20,7 @@ $ sb proxy --output $tmp &
 $ docker run -it --rm --net host -v $tmp/.ssh:/root/.ssh -v $tmp/.kube:/root/.kube -v $tmp/.aws:/root/.aws ghcr.io/hrntknr/sh:full
 ```
 
-The config must be the v3 form (`version: 3`); converting a v2 config is manual — see [Migrating from v2 to v3](docs/migration.md).
+The config must be the v3 form (`version: 3`); a v2 config is rejected.
 
 ## Running containers: `sb run`
 
@@ -75,7 +75,7 @@ $ sb exec --name default -w /work -- pwd
 
 ## Configuration
 
-The config is the v3 form: it starts with `version: 3`, and everything in it is checked — unknown fields, invalid permissions, and empty required values are rejected at load, and the same binary does not silently accept a v2 config. Converting from v2 is manual; see [Migrating from v2 to v3](docs/migration.md).
+The config is the v3 form: it starts with `version: 3`, and everything in it is checked — unknown fields, invalid permissions, and empty required values are rejected at load, and the same binary does not silently accept a v2 config.
 
 By default the config is read from `$XDG_CONFIG_HOME/sb/config.yaml` (typically `~/.config/sb/config.yaml` on Linux). Use `--config` to point at any path.
 

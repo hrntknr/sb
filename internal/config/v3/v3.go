@@ -1,6 +1,5 @@
 // Package v3 loads the sb v3 policy config. A v3 config starts with
-// version: 3; v2 config is rejected without interpretation instead of
-// being silently carried over. See docs/migration.md for conversion.
+// version: 3; a v2 config is rejected without interpretation.
 package v3
 
 import (
@@ -629,15 +628,6 @@ func loadConfDir(dir string, files *[]loadedDoc) error {
 	return nil
 }
 
-// parseErr wraps a yaml decoding error; strict decoding failures point at
-// the migration guide (v2 config is not accepted).
-func parseErr(err error) error {
-	if errors.As(err, new(*yaml.TypeError)) {
-		return fmt.Errorf("parse config: %w\n(v2 config is not accepted; see docs/migration.md)", err)
-	}
-	return fmt.Errorf("parse config: %w", err)
-}
-
 func loadFile(path string) (document, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -647,7 +637,7 @@ func loadFile(path string) (document, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&doc); err != nil && !errors.Is(err, io.EOF) {
-		return document{}, parseErr(err)
+		return document{}, fmt.Errorf("parse config: %w", err)
 	}
 	// A file is exactly one yaml document: a second document, even a
 	// valid or v2-formatted one, is rejected instead of silently ignored.
@@ -656,10 +646,10 @@ func loadFile(path string) (document, error) {
 		if err2 == nil {
 			return document{}, errors.New("parse config: multiple yaml documents (only one document per file)")
 		}
-		return document{}, parseErr(err2)
+		return document{}, fmt.Errorf("parse config: %w", err2)
 	}
 	if doc.Version == nil {
-		return document{}, errors.New("version is required: sb reads v3 config only (version: 3); v2 config is not accepted (see docs/migration.md)")
+		return document{}, errors.New("version: 3 is required")
 	}
 	if *doc.Version != 3 {
 		return document{}, fmt.Errorf("unsupported version %d (want 3)", *doc.Version)

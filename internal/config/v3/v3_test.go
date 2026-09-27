@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -422,8 +421,8 @@ func TestLoadInvalid(t *testing.T) {
 		wantIn string
 	}{
 		// v2 config: no version, old structure, or v2 values.
-		{"v2 missing version", "ssh:\n  - host: github.com\n", "version is required"},
-		{"v2 README config", "ssh:\n  - host: github.com\n    commands:\n      - cat\nk8s:\n  - context: dev\n    mode: rw\n    namespace: default\n", "v2 config is not accepted"},
+		{"v2 missing version", "ssh:\n  - host: github.com\n", "version: 3 is required"},
+		{"v2 README config", "ssh:\n  - host: github.com\n    commands:\n      - cat\nk8s:\n  - context: dev\n    mode: rw\n    namespace: default\n", "field commands not found"},
 		{"v2 commands field", "version: 3\nssh:\n  - host: github.com\n    commands: [cat]\n", "field commands not found"},
 		{"k8s invalid mode value", "version: 3\nk8s:\n  - context: dev\n    mode: read\n    resources: []\n", `invalid mode "read" (want ro or rw)`},
 		{"k8s mode and resources", "version: 3\nk8s:\n  - context: dev\n    mode: rw\n    resources:\n      - group: \"\"\n        resource: pods\n        namespace: default\n        verbs: [get]\n", "mode and resources are mutually exclusive"},
@@ -652,7 +651,7 @@ func TestLoadConfD(t *testing.T) {
 		writeFile(t, path, "version: 3\nssh:\n  - host: github.com\n    access: full\n")
 		writeFile(t, filepath.Join(dir, "conf.d", "work.yaml"), "ssh:\n  - host: work.example\n    access: full\n")
 		_, err := Load(path)
-		if err == nil || !strings.Contains(err.Error(), "version is required") || !strings.Contains(err.Error(), "conf.d/work.yaml") {
+		if err == nil || !strings.Contains(err.Error(), "version: 3 is required") || !strings.Contains(err.Error(), "conf.d/work.yaml") {
 			t.Fatalf("Load() error = %v, want version-required error mentioning conf.d/work.yaml", err)
 		}
 	})
@@ -712,14 +711,6 @@ func TestLoadMountAmbiguity(t *testing.T) {
 	})
 }
 
-// The yaml blocks in docs/migration.md, and the conversion examples'
-// two sides: each example is a v2 block, the "becomes:" separator, and
-// the v3 conversion.
-var (
-	yamlBlockRe   = regexp.MustCompile("(?s)```yaml\n(.*?)\n```")
-	examplePairRe = regexp.MustCompile("(?s)v2:\n\n```yaml\n(.*?)\n```\n\nbecomes:\n\nv3:\n\n```yaml\n(.*?)\n```")
-)
-
 // TestK8sTargetsAllResourcesForm covers the all-resources forms — the
 // mode shorthand (ro reads, rw everything), the context verbs, and the
 // bare context (every verb) — and what each of them expands to: a grant
@@ -774,57 +765,6 @@ func TestK8sTargetsAllResourcesForm(t *testing.T) {
 		})
 	}
 }
-
-// The conversion examples in docs/migration.md: the v3 sides must load
-// through the config loader exactly as the doc shows them, and the v2
-// sides must be rejected — the same rejection the doc tells the reader
-// to expect. The complete example at the top loads as-is.
-func TestMigrationDocExamples(t *testing.T) {
-	// The doc is at the repository root: the package sits three levels
-	// under it (internal/config/v3).
-	doc, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "migration.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	content := string(doc)
-
-	// The complete example at the top: it loads as-is.
-	blocks := yamlBlockRe.FindAllStringSubmatch(content, -1)
-	if len(blocks) == 0 {
-		t.Fatal("no yaml blocks in docs/migration.md")
-	}
-	if _, err := loadDocYAML(t, blocks[0][1], ""); err != nil {
-		t.Fatalf("the complete example: Load() error = %v", err)
-	}
-
-	// Each conversion example: the v3 side loads (the doc shows the
-	// section; the version header the complete example carries is
-	// added for it), and the v2 side is rejected.
-	pairs := examplePairRe.FindAllStringSubmatch(content, -1)
-	if len(pairs) != 6 {
-		t.Fatalf("found %d conversion examples in docs/migration.md; want 6 — update this count when the doc changes", len(pairs))
-	}
-	for i, pair := range pairs {
-		if _, err := loadDocYAML(t, pair[1], "version: 3\n"); err == nil {
-			t.Fatalf("example %d: the v2 side loaded; want it rejected (v2 is not a v3 config)", i+1)
-		}
-		if _, err := loadDocYAML(t, pair[2], "version: 3\n"); err != nil {
-			t.Fatalf("example %d: the v3 side: Load() error = %v", i+1, err)
-		}
-	}
-}
-
-// loadDocYAML loads yaml as a config: header is prepended, so a doc's
-// section loads the way the complete example does.
-func loadDocYAML(t *testing.T, yaml, header string) (Config, error) {
-	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("HOME", dir) // the examples mount from ~; keep the expansion in the test
-	path := filepath.Join(dir, "config.yaml")
-	writeFile(t, path, header+yaml)
-	return Load(path)
-}
-
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
