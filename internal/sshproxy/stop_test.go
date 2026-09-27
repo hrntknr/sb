@@ -567,18 +567,33 @@ func (s sessionStream) Close() error                { return s.write.Close() }
 
 // channelDataConn adapts the session channel's data streams to a net.Conn
 // for the inner client's handshake: the same transport the user's ssh
-// client speaks through, with the channel's streams carrying it. The ssh
-// library closes the transport from more than one of its own goroutines
-// (the handshake's cut, the teardown) — the close is once, so the
-// channel's own writers are not raced.
+// client speaks through, with the channel's streams carrying it. A net.Conn
+// is safe for concurrent use: the ssh library writes the transport from
+// one of its own goroutines (a request in flight) while another tears the
+// connection down (the transport's death closes it, the handshake's cut
+// stops it) — and both land on the session channel's stdin, whose write and
+// close the ssh library does not synchronize (Write reads the channel's
+// sentEOF while CloseWrite writes it). The write side is serialized here:
+// the close is once, and Write and Close never overlap.
 type channelDataConn struct {
 	sessionStream
+	writeMu   sync.Mutex
 	closeOnce sync.Once
+}
+
+func (c *channelDataConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.write.Write(p)
 }
 
 func (c *channelDataConn) Close() error {
 	var err error
-	c.closeOnce.Do(func() { err = c.write.Close() })
+	c.closeOnce.Do(func() {
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		err = c.write.Close()
+	})
 	return err
 }
 
@@ -587,6 +602,71 @@ func (*channelDataConn) RemoteAddr() net.Addr             { return channelAddr("
 func (*channelDataConn) SetDeadline(time.Time) error      { return nil }
 func (*channelDataConn) SetReadDeadline(time.Time) error  { return nil }
 func (*channelDataConn) SetWriteDeadline(time.Time) error { return nil }
+
+// gatedWrite is the write side of the serialization test: a Write that
+// waits inside until released, and a Close that signals when it ran.
+type gatedWrite struct {
+	entered chan struct{}
+	release chan struct{}
+	closed  chan struct{}
+}
+
+func (w *gatedWrite) Write(p []byte) (int, error) {
+	w.entered <- struct{}{}
+	<-w.release
+	return len(p), nil
+}
+
+func (w *gatedWrite) Close() error {
+	close(w.closed)
+	return nil
+}
+
+// TestChannelDataConnHoldsTheCloseOff covers the adapter's net.Conn
+// contract: the ssh library writes the transport from one of its own
+// goroutines (a request in flight) while another tears the connection down
+// (the transport's death closes it, the handshake's cut stops it) — and
+// both land on the session channel's stdin, whose write and close the ssh
+// library does not synchronize (Write reads the channel's sentEOF while
+// CloseWrite writes it). The adapter serializes them: a Close fired while
+// a Write is in flight is held off until the Write ends.
+func TestChannelDataConnHoldsTheCloseOff(t *testing.T) {
+	write := &gatedWrite{
+		entered: make(chan struct{}, 1),
+		release: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	conn := &channelDataConn{sessionStream: sessionStream{read: strings.NewReader(""), write: write}}
+
+	// A Write in flight: it holds the write side and waits inside the
+	// write, holding the close off with it.
+	written := make(chan struct{}, 1)
+	go func() {
+		if _, err := conn.Write([]byte("payload")); err != nil {
+			t.Error(err)
+		}
+		written <- struct{}{}
+	}()
+	<-write.entered
+
+	// A Close fired while the Write is in flight: it may not enter the
+	// write side until the Write ends. Without the serialization, the
+	// close runs here — the write and the close overlap, and what the
+	// ssh library leaves unsynchronized races.
+	go func() { _ = conn.Close() }()
+	select {
+	case <-write.closed:
+		t.Fatal("the close ran while a write was in flight")
+	case <-time.After(time.Second):
+		// the close was held off: the write ends first
+	}
+
+	// The Write ends, the Close proceeds: the write side is one, and the
+	// close is once.
+	close(write.release)
+	<-written
+	<-write.closed
+}
 
 // TestBeginStopCutsTheAuthenticatedSessions covers the stop's reach with
 // the real ssh structures: a downstream client authenticated against the
