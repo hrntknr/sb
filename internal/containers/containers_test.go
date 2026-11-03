@@ -18,6 +18,7 @@ func TestArgs(t *testing.T) {
 		envs     []string
 		tty      bool
 		mounts   []string
+		devices  []string
 		image    string
 		init     bool
 		userArgs []string
@@ -111,6 +112,21 @@ func TestArgs(t *testing.T) {
 				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
 		},
 		{
+			name:     "devices come after mounts and before the image",
+			runtime:  Docker,
+			host:     "192.168.1.5",
+			tty:      true,
+			mounts:   []string{"/home/me/.claude:/root/.claude"},
+			devices:  []string{"/dev/kvm"},
+			image:    "ghcr.io/hrntknr/sh:full",
+			userArgs: []string{"zsh", "-l"},
+			want: []string{"run", "--rm", "--cidfile", "/tmp/sb/cid",
+				"-v", "/tmp/sb/.ssh:/root/.ssh", "-v", "/tmp/sb/.kube:/root/.kube", "-v", "/tmp/sb/.aws:/root/.aws",
+				"-v", "/home/me/.claude:/root/.claude",
+				"--device", "/dev/kvm",
+				"-i", "-t", "ghcr.io/hrntknr/sh:full", "zsh", "-l"},
+		},
+		{
 			name:    "no args runs the image default",
 			runtime: Docker,
 			host:    "192.168.1.5",
@@ -123,12 +139,35 @@ func TestArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.image, tt.init, tt.userArgs)
+			got := Args(tt.runtime, tt.host, "/tmp/sb", tt.cname, tt.network, tt.envs, tt.tty, tt.mounts, tt.devices, tt.image, tt.init, tt.userArgs)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Args() = %v, want %v", got, tt.want)
 			}
 		})
 	}
+}
+
+func TestKVMDevices(t *testing.T) {
+	t.Run("existing device is returned", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "kvm")
+		if err := os.WriteFile(path, nil, 0o666); err != nil {
+			t.Fatal(err)
+		}
+		original := kvmPath
+		kvmPath = path
+		defer func() { kvmPath = original }()
+		if got := KVMDevices(); !reflect.DeepEqual(got, []string{path}) {
+			t.Errorf("KVMDevices() = %v, want [%s]", got, path)
+		}
+	})
+	t.Run("missing device returns nil", func(t *testing.T) {
+		original := kvmPath
+		kvmPath = filepath.Join(t.TempDir(), "missing")
+		defer func() { kvmPath = original }()
+		if got := KVMDevices(); got != nil {
+			t.Errorf("KVMDevices() = %v, want nil", got)
+		}
+	})
 }
 
 func TestExecArgs(t *testing.T) {

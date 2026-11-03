@@ -106,7 +106,11 @@ func runContainer(cmd *cobra.Command, opts options, name, network string, init b
 	go func() { proxyErr <- proxy.Wait() }()
 
 	tty := term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))
-	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, name, network, cfg.Container.Environments, tty, cfg.Container.Mounts, image, init, userArgs)...)
+	devices := containers.KVMDevices()
+	if len(devices) > 0 {
+		slog.Info("passing devices", "devices", devices)
+	}
+	child := exec.Command(rt.Binary(), containers.Args(rt, host, dir, name, network, cfg.Container.Environments, tty, cfg.Container.Mounts, devices, image, init, userArgs)...)
 	child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := child.Start(); err != nil {
 		stop()

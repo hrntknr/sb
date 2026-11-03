@@ -146,13 +146,13 @@ func Parse(name string) (Runtime, error) {
 // network, when non-empty, are passed to the runtime as --name and
 // --network. envs are environment variables (KEY=VALUE, or just KEY to
 // inherit from sb's own environment). mounts are extra "source:target"
-// volumes. image is inserted before userArgs, which form the container
-// command. init, when set, passes --init so the command runs under an
-// init process as PID 1 that forwards signals and reaps zombies, which
-// the user's command (a shell, node, ...) would not do on its own. The
-// runtime records the container ID in a cidfile under dir, for
-// ForceRemove.
-func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts []string, image string, init bool, userArgs []string) []string {
+// volumes. devices are host device paths passed with --device. image is
+// inserted before userArgs, which form the container command. init, when
+// set, passes --init so the command runs under an init process as PID 1
+// that forwards signals and reaps zombies, which the user's command (a
+// shell, node, ...) would not do on its own. The runtime records the
+// container ID in a cidfile under dir, for ForceRemove.
+func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, mounts, devices []string, image string, init bool, userArgs []string) []string {
 	args := []string{"run", "--rm", "--cidfile", cidFile(dir)}
 	if init {
 		args = append(args, "--init")
@@ -177,12 +177,26 @@ func Args(r Runtime, host, dir, name, network string, envs []string, tty bool, m
 	for _, mount := range mounts {
 		args = append(args, "-v", mount)
 	}
+	for _, device := range devices {
+		args = append(args, "--device", device)
+	}
 	args = append(args, "-i")
 	if tty {
 		args = append(args, "-t")
 	}
 	return append(append(args, image), userArgs...)
 }
+
+// KVMDevices returns the host's KVM device for passthrough when it
+// exists, and nil otherwise (no KVM on the host, or a non-Linux host).
+func KVMDevices() []string {
+	if _, err := os.Stat(kvmPath); err == nil {
+		return []string{kvmPath}
+	}
+	return nil
+}
+
+var kvmPath = "/dev/kvm"
 
 // ExecArgs builds the runtime CLI arguments that run command inside the
 // container named name — the --name value of `sb run`, which every runtime

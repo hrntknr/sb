@@ -50,6 +50,7 @@ Notes:
 - A host firewall (firewalld, ufw) can block container-to-host traffic; if `kubectl`/`ssh` inside the container fail with "connection refused" or time out, pass `--network host` (docker/podman).
 - apple container needs a one-time setup so containers can reach the Mac: `sudo container system dns create host.container.internal --localhost 203.0.113.113`.
 - The container runs without an init process by default; pass `--init` to run the command under an init process as PID 1 that forwards signals and reaps zombie processes.
+- When the host has `/dev/kvm`, it is passed to the container with `--device /dev/kvm` so nested virtualization works.
 - Rootless podman needs 5.3+ for `host.containers.internal` with the default pasta network; otherwise pass `--network host`.
 
 
