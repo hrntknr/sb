@@ -51,6 +51,7 @@ Notes:
 - apple container needs a one-time setup so containers can reach the Mac: `sudo container system dns create host.container.internal --localhost 203.0.113.113`.
 - The container runs without an init process by default; pass `--init` to run the command under an init process as PID 1 that forwards signals and reaps zombie processes.
 - When the host has `/dev/kvm`, it is passed to the container with `--device /dev/kvm` so nested virtualization works.
+- With rootless podman, `/dev/kvm` may still be unopenable in the container: the user namespace maps only your own uid/gid and subids, so `kvm` group membership does not apply inside and a `root:kvm 0660` device appears as `nobody:nogroup` and denies access — `usermod -aG kvm` is not enough. Make the device accessible on the host instead: `sudo chmod 666 /dev/kvm` (until the module reloads), or persist it with a udev rule such as `KERNEL=="kvm", GROUP="kvm", MODE="0666"` in `/etc/udev/rules.d/` followed by `sudo udevadm trigger --name-match=kvm`. On a shared host, `KERNEL=="kvm", TAG+="uaccess"` restricts the grant to the seat-logged-in user instead of everyone.
 - Rootless podman needs 5.3+ for `host.containers.internal` with the default pasta network; otherwise pass `--network host`.
 
 
