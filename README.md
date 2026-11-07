@@ -65,6 +65,12 @@ $ sb exec --name dev -- kubectl get pods
 $ sb exec -w /work -- pwd
 ```
 
+`--env-file` (repeatable) reads KEY=VALUE lines from a file and passes them to the command with the runtime's `--env`, keeping secrets out of the command's arguments:
+
+```
+$ sb exec --env-file ~/.config/app/secrets.env -- app serve
+```
+
 The runtime is selected like `sb run` (`container.runtime` or auto-detection); the command's exit code becomes sb's.
 
 

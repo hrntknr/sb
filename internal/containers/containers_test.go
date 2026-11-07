@@ -176,16 +176,18 @@ func TestExecArgs(t *testing.T) {
 		cname   string
 		workdir string
 		tty     bool
+		envs    []string
 		command []string
 		want    []string
 	}{
-		{"tty", "dev", "", true, []string{"zsh", "-l"}, []string{"exec", "-i", "-t", "dev", "zsh", "-l"}},
-		{"no tty", "dev", "", false, []string{"kubectl", "get", "pods"}, []string{"exec", "-i", "dev", "kubectl", "get", "pods"}},
-		{"workdir", "dev", "/work", false, []string{"pwd"}, []string{"exec", "-i", "-w", "/work", "dev", "pwd"}},
+		{"tty", "dev", "", true, nil, []string{"zsh", "-l"}, []string{"exec", "-i", "-t", "dev", "zsh", "-l"}},
+		{"no tty", "dev", "", false, nil, []string{"kubectl", "get", "pods"}, []string{"exec", "-i", "dev", "kubectl", "get", "pods"}},
+		{"workdir", "dev", "/work", false, nil, []string{"pwd"}, []string{"exec", "-i", "-w", "/work", "dev", "pwd"}},
+		{"envs", "dev", "", false, []string{"FOO=bar", "BAZ=qux"}, []string{"pwd"}, []string{"exec", "-i", "--env", "FOO=bar", "--env", "BAZ=qux", "dev", "pwd"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ExecArgs(tt.cname, tt.workdir, tt.tty, tt.command); !reflect.DeepEqual(got, tt.want) {
+			if got := ExecArgs(tt.cname, tt.workdir, tt.tty, tt.envs, tt.command); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ExecArgs() = %v, want %v", got, tt.want)
 			}
 		})

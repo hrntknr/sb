@@ -201,14 +201,19 @@ var kvmPath = "/dev/kvm"
 // ExecArgs builds the runtime CLI arguments that run command inside the
 // container named name — the --name value of `sb run`, which every runtime
 // accepts as the container identifier for exec. workdir, when non-empty,
-// sets the working directory (-w/--workdir).
-func ExecArgs(name, workdir string, tty bool, command []string) []string {
+// sets the working directory (-w/--workdir). envs are KEY=VALUE entries
+// passed with --env, which every runtime accepts on exec; later entries
+// for the same key override earlier ones.
+func ExecArgs(name, workdir string, tty bool, envs []string, command []string) []string {
 	args := []string{"exec", "-i"}
 	if tty {
 		args = append(args, "-t")
 	}
 	if workdir != "" {
 		args = append(args, "-w", workdir)
+	}
+	for _, env := range envs {
+		args = append(args, "--env", env)
 	}
 	return append(append(args, name), command...)
 }
